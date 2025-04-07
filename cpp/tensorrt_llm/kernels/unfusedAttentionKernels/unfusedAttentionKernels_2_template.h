@@ -779,6 +779,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
     // Head idx.
     int const head_idx = blockIdx.y;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
 
     // Variable sequence length.
     bool const variable_sequence_length = params.tokens_info != nullptr && params.cu_seq_lens != nullptr;
@@ -800,10 +803,6 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     int const rotated_head_dim_offset = first_half ? params.half_rotary_dim : -params.half_rotary_dim;
     // Make sure there are multiple of tokens_per_block otherwise syncthreads will lead to deadlocks.
     int const tokens_loop_end = int((params.token_num + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
-#endif
 
     // Mainloop.
     for (int global_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
