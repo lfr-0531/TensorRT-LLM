@@ -74,6 +74,20 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
             topk_values.float(), dim=-1)
 
 
+class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        topk_values, topk_indices = torch.topk(router_logits,
+                                               k=self.top_k,
+                                               dim=-1)
+        return topk_indices.to(torch.int32), torch.sigmoid(topk_values.float())
+
+
 # TODO: re-enable this once the custom op is working.
 # class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 
