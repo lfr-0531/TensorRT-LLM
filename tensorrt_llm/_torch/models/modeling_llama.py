@@ -358,8 +358,7 @@ class LlamaDecoderLayer(DecoderLayer):
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-        else:
-            # Next layer's layernorm
+        elif self.next_layer_layernorm:
             hidden_states, residual = self.next_layer_layernorm(
                 hidden_states, residual)
 
