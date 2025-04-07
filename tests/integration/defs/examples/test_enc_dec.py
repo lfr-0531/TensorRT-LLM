@@ -16,7 +16,8 @@
 import pytest
 from defs.common import (convert_weights, quantize_data, venv_check_call,
                          venv_mpi_check_call)
-from defs.conftest import (get_device_count, skip_fp8_pre_ada, skip_post_blackwell)
+from defs.conftest import (get_device_count, skip_fp8_pre_ada,
+                           skip_post_blackwell)
 from defs.trt_test_alternative import check_call
 
 
