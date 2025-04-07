@@ -205,16 +205,16 @@ class LlamaDecoderLayer(DecoderLayer):
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
 
-        is_llama4 = config.model_type == "llama4_text"
+        self.is_llama4 = config.model_type == "llama4_text"
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
             aux_stream=aux_stream,
-            use_gptj_style_rope=is_llama4,
+            use_gptj_style_rope=self.is_llama4,
         )
 
-        if is_llama4:
+        if self.is_llama4:
             is_mlp_layer = (layer_idx +
                             1) % config.interleave_moe_layer_step != 0
         else:
@@ -222,12 +222,12 @@ class LlamaDecoderLayer(DecoderLayer):
             is_mlp_layer = True
 
         if is_mlp_layer:
-            if is_llama4:
+            if self.is_llama4:
                 inter_size = config.intermediate_size_mlp
             else:
                 inter_size = config.intermediate_size
 
-            self.feed_forward = GatedMLP(
+            mlp = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=inter_size,
                 # Llama4 has no mlp_bias field.
@@ -235,6 +235,11 @@ class LlamaDecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 config=model_config,
             )
+
+            if self.is_llama4:
+                self.feed_forward = mlp
+            else:
+                self.mlp = mlp
 
             # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
             # )
@@ -312,7 +317,8 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.feed_forward(
+        feed_forward = self.feed_forward if self.is_llama4 else self.mlp
+        hidden_states = feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
