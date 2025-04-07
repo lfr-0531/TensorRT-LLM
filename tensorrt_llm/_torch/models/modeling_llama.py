@@ -191,7 +191,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: int,
-        aux_stream: torch.cuda.Stream,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
@@ -214,7 +214,14 @@ class LlamaDecoderLayer(DecoderLayer):
             use_gptj_style_rope=is_llama4,
         )
 
-        if (layer_idx + 1) % config.interleave_moe_layer_step != 0:
+        if is_llama4:
+            is_mlp_layer = (layer_idx +
+                            1) % config.interleave_moe_layer_step != 0
+        else:
+            # llama3 doesn't have config.interleave_moe_layer_step in its config.
+            is_mlp_layer = True
+
+        if is_mlp_layer:
             if is_llama4:
                 inter_size = config.intermediate_size_mlp
             else:

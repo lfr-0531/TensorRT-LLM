@@ -186,9 +186,7 @@ class Attention(nn.Module):
             if self.pos_embd_params is None and position_ids is not None:
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                     dim=-1)
-                q, k = self.rotary_emb(
-                    position_ids,
-                    [q.contiguous(), k.contiguous()], attn_metadata)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
                 qkv = torch.concat([q, k, v], dim=-1)
 
             out_scale = None
@@ -206,9 +204,7 @@ class Attention(nn.Module):
                                 dim=-1)
 
             if self.pos_embd_params is None and position_ids is not None:
-                q, k = self.rotary_emb(
-                    position_ids,
-                    [q.contiguous(), k.contiguous()], attn_metadata)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
 
             attn_output = self.attn.forward(q.contiguous(),
                                             k.contiguous(),

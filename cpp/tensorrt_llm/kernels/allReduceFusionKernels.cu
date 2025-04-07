@@ -596,24 +596,24 @@ bool use_fp32_acc()
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
 {
-#define DISPATCH1(TEMP_0, TEMP_1, TEMP_2, TEMP_3, TEMP_4)                                                              \
+#define DISPATCH1(Dtype, NRanks, ResidualOut, NormOut, QuantOut)                                                       \
     if (fp32_acc)                                                                                                      \
     {                                                                                                                  \
-        return allreduce_fusion_kernel_launcher<TEMP_0, TEMP_1, TEMP_2, TEMP_3, TEMP_4, true>(params);                 \
+        return allreduce_fusion_kernel_launcher<Dtype, NRanks, ResidualOut, NormOut, QuantOut, true>(params);          \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        return allreduce_fusion_kernel_launcher<TEMP_0, TEMP_1, TEMP_2, TEMP_3, TEMP_4, false>(params);                \
+        return allreduce_fusion_kernel_launcher<Dtype, NRanks, ResidualOut, NormOut, QuantOut, false>(params);         \
     }
 
-#define DISPATCH0(TEMP_1, TEMP_2, TEMP_3, TEMP_4)                                                                      \
-    if (params.nranks == TEMP_1 && params.dtype == nvinfer1::DataType::kHALF)                                          \
+#define DISPATCH0(NRanks, ResidualOut, NormOut, QuantOut)                                                              \
+    if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kHALF)                                          \
     {                                                                                                                  \
-        DISPATCH1(half, TEMP_1, TEMP_2, TEMP_3, TEMP_4);                                                               \
+        DISPATCH1(half, NRanks, ResidualOut, NormOut, QuantOut);                                                       \
     }                                                                                                                  \
-    else if (params.nranks == TEMP_1 && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kBF16)                                     \
     {                                                                                                                  \
-        DISPATCH1(__nv_bfloat16, TEMP_1, TEMP_2, TEMP_3, TEMP_4);                                                      \
+        DISPATCH1(__nv_bfloat16, NRanks, ResidualOut, NormOut, QuantOut);                                              \
     }
 
     TLLM_CHECK(params.allreduce_in && params.residual_in && params.rms_gamma);
