@@ -22,7 +22,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
-from ..speculative import SpecMetadata
+from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model, support_pp)
 
