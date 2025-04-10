@@ -619,6 +619,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
         super().__init__(model_config)
 
         config = model_config.pretrained_config
+        self.is_llama4 = config.model_type == "llama4_text"
         self.dtype = config.torch_dtype
 
         self.fc = Linear(config.hidden_size * 3,
@@ -667,9 +668,11 @@ class Eagle3LlamaDraftModel(DecoderModel):
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
                                                 attn_metadata=attn_metadata)
-
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
+        if self.is_llama4:
+            hidden_states_to_save = hidden_states
+        else:
+            hidden_states, hidden_states_to_save = self.norm(
+                hidden_states, residual)
         assert isinstance(spec_metadata, Eagle3SpecMetadata)
         spec_metadata.hidden_states.append(hidden_states_to_save)
         return hidden_states
