@@ -19,31 +19,28 @@ def get_lm_head_and_norm(base_model):
     return lm_head_weight, norm_weight
 
 def split_qkv(config, qkv_weights):
+    # q = layer.attention.wq.weight.view(40, 128, 10240)
+    # k = layer.attention.wk.weight.view(8, 128, 10240)
+    # v = layer.attention.wv.weight.view(8, 128, 10240)
+    # linear_qkv = torch.cat((q, k, v), dim=0).view(7168, 10240)
     num_heads = config["num_attention_heads"]
     num_key_value_heads = config["num_key_value_heads"]
     head_dim = config["hidden_size"] // num_heads
-    q_size = (num_heads * head_dim) // len(qkv_weights)
-    kv_size = (num_key_value_heads * head_dim) // len(qkv_weights)
-    q_weights, k_weights, v_weights = [], [], []
-    for qkv_weight in qkv_weights:
-        q_weight = qkv_weight[:q_size, :]
-        k_weight = qkv_weight[q_size:q_size+kv_size, :]
-        v_weight = qkv_weight[q_size+kv_size:, :]
-        q_weights.append(q_weight)
-        k_weights.append(k_weight)
-        v_weights.append(v_weight)
+    q_size = num_heads * head_dim
+    kv_size = num_key_value_heads * head_dim
+    qkv_weights = torch.concat(qkv_weights, dim=0)
+    q_weights = qkv_weights[:q_size, :]
+    k_weights = qkv_weights[q_size:q_size+kv_size, :]
+    v_weights = qkv_weights[q_size+kv_size:, :]
     return q_weights, k_weights, v_weights
 
 def split_gate_up(config, gate_up_weights):
-    intermediate_size=config["intermediate_size_mlp"] // len(gate_up_weights)
-    gate_weights, up_weights = [], []
-    for gate_up_weight in gate_up_weights:
-        gate_weight = gate_up_weight[:intermediate_size, :]
-        up_weight = gate_up_weight[intermediate_size:, :]
-        gate_weights.append(gate_weight)
-        up_weights.append(up_weight)
+    intermediate_size=config["intermediate_size_mlp"]
+    gate_up_weights = torch.concat(gate_up_weights, dim=0)
+    gate_weights = gate_up_weights[:intermediate_size, :]
+    up_weights = gate_up_weights[intermediate_size:, :]
     return gate_weights, up_weights
-
+    
 if __name__ == '__main__':
     pt_dir = '/home/scratch.yeyu_hw/shared_files/omni-128e-eagle3'
     pt_files = [f'{pt_dir}/rank_{i}.pt' for i in range(8)]
@@ -101,13 +98,13 @@ if __name__ == '__main__':
         if isinstance(all_params[k], list):
             if 'linear_qkv' in k:
                 q_weights, k_weights, v_weights = split_qkv(config, all_params[k])
-                eagle_params["midlayer.self_attn.q_proj.weight"] = torch.concat(q_weights, dim=tp_tensors[k])
-                eagle_params["midlayer.self_attn.k_proj.weight"] = torch.concat(k_weights, dim=tp_tensors[k])
-                eagle_params["midlayer.self_attn.v_proj.weight"] = torch.concat(v_weights, dim=tp_tensors[k])
+                eagle_params["midlayer.self_attn.q_proj.weight"] = q_weights
+                eagle_params["midlayer.self_attn.k_proj.weight"] = k_weights
+                eagle_params["midlayer.self_attn.v_proj.weight"] = v_weights
             elif 'linear_fc1' in k:
                 gate_weights, up_weights = split_gate_up(config, all_params[k])
-                eagle_params["midlayer.mlp.gate_proj.weight"] = torch.concat(gate_weights, dim=tp_tensors[k])
-                eagle_params["midlayer.mlp.up_proj.weight"] = torch.concat(up_weights, dim=tp_tensors[k])
+                eagle_params["midlayer.mlp.gate_proj.weight"] = gate_weights
+                eagle_params["midlayer.mlp.up_proj.weight"] = up_weights
             else:
                 eagle_params[v] = torch.concat(all_params[k], dim=tp_tensors[k])
         else:
