@@ -12,14 +12,12 @@ from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..speculative import (get_num_spec_layers, get_spec_decoder,
-                           get_spec_resource_manager)
+from ..speculative import (get_num_spec_layers, get_spec_decoder)
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
 from .guided_decoder import GuidedDecoderResourceManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
-                           PyTorchModelEngine)
+from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import KVCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -264,25 +262,17 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         return None
 
 
-def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
-                                mapping, pytorch_backend_config,
-                                executor_config, ctx_chunk_config, model_engine,
+def create_py_executor_instance(dist, resources, mapping,
+                                pytorch_backend_config, executor_config,
+                                ctx_chunk_config, model_engine,
                                 draft_model_engine, start_worker):
+    kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
+
+    # decoder for speculative decoding
     spec_config = model_engine.spec_config
-    resources = {
-        KV_CACHE_MANAGER_KEY: kv_cache_manager
-    } if kv_cache_manager is not None else {}
-
-    if draft_kv_cache_manager is not None:
-        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-
     if spec_config is not None:
-        spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size * 2)
         spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                         spec_config=spec_config)
-        if spec_resource_manager is not None:
-            resources["spec_resource_manager"] = spec_resource_manager
     else:
         spec_decoder = None
 
