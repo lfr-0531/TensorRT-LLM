@@ -1,3 +1,4 @@
+import copy
 import datetime
 import functools
 import gc
@@ -1710,7 +1711,7 @@ class PyExecutor:
 
             new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
                 draft_batch, outputs)
-            previous_batch = (draft_batch.copy(), new_tensors_device,
+            previous_batch = (copy.copy(draft_batch), new_tensors_device,
                               new_tensors_host, decoder_event)
 
             def _process_decoded_tokens(draft_batch):
@@ -1756,8 +1757,10 @@ class PyExecutor:
                 if not new_requests:
                     return
                 draft_batch.generation_requests = new_requests
-                previous_batch = (draft_batch.copy(), new_tensors_device,
+                previous_batch = (copy.copy(draft_batch), new_tensors_device,
                                   new_tensors_host, decoder_event)
+            self._update_requests(previous_batch[0], previous_batch[2],
+                                  previous_batch[3])
 
         except Exception as e:
             traceback.print_exc()
