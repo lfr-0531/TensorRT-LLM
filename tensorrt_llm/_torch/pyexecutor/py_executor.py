@@ -1708,9 +1708,12 @@ class PyExecutor:
 
             self._update_request_states(draft_batch)
 
-            self._decode(draft_batch, outputs)
+            new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
+                draft_batch, outputs)
+            previous_batch = (draft_batch.copy(), new_tensors_device,
+                              new_tensors_host, decoder_event)
 
-            def _process_decoded_tokens():
+            def _process_decoded_tokens(draft_batch):
                 new_requests = []
                 for req in chain(draft_batch.context_requests,
                                  draft_batch.generation_requests):
@@ -1724,11 +1727,7 @@ class PyExecutor:
 
                 return new_requests
 
-            new_requests = _process_decoded_tokens()
-            if not new_requests:
-                return
-
-            draft_batch.generation_requests = new_requests
+            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
             for _ in range(spec_metadata.max_draft_tokens - 1):
@@ -1736,22 +1735,29 @@ class PyExecutor:
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
+                previous_scheduled_batch, previous_new_tensors_device, previous_new_tensors_host, previous_decoder_event = previous_batch
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
                     self.resource_manager,
+                    new_tensors_device=previous_new_tensors_device,
                     extra_model_inputs=extra_model_inputs)
 
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 self._update_request_states(draft_batch)
-                self._decode(draft_batch, outputs)
-
-                new_requests = _process_decoded_tokens()
+                new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
+                    draft_batch, outputs)
+                self._update_requests(previous_scheduled_batch,
+                                      previous_new_tensors_host,
+                                      previous_decoder_event)
+                new_requests = _process_decoded_tokens(previous_scheduled_batch)
                 if not new_requests:
                     return
                 draft_batch.generation_requests = new_requests
+                previous_batch = (draft_batch.copy(), new_tensors_device,
+                                  new_tensors_host, decoder_event)
 
         except Exception as e:
             traceback.print_exc()
