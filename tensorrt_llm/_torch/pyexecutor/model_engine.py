@@ -882,14 +882,15 @@ class PyTorchModelEngine(ModelEngine):
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
         elif self.is_draft_model and self.use_prepare_draft_tp_inputs:
             inputs['position_ids'][0, inputs['spec_metadata'].gather_ids] += 1
-            inputs['spec_metadata'].gather_ids *= 0 
+            inputs['spec_metadata'].gather_ids *= 0
             num_seqs = inputs['attn_metadata'].num_seqs
-            inputs['attn_metadata']._seq_lens[:num_seqs].fill_(1)
             inputs['attn_metadata']._seq_lens_cuda[:num_seqs].fill_(1)
+            inputs['attn_metadata'].kv_lens_cuda[:num_seqs] += 1
 
         return inputs
-    
-    def _prepare_draft_tp_inputs(self,
+
+    def _prepare_draft_tp_inputs(
+            self,
             scheduled_requests: ScheduledRequests,
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
@@ -899,12 +900,12 @@ class PyTorchModelEngine(ModelEngine):
         num_seqs = len(generation_requests)
         num_tokens = num_seqs
         last_iter_num_tokens = spec_metadata.num_tokens
-        
+
         num_cached_tokens_per_seq = []
         for request in generation_requests:
             past_seen_token_num = request.max_beam_num_tokens
             num_cached_tokens_per_seq.append(past_seen_token_num)
-        
+
         # attention metadata
         attn_metadata.num_contexts = 0
         attn_metadata.kv_cache_params = KVCacheParams(
@@ -912,23 +913,33 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
-        attn_metadata.prepare()
-        
+        attn_metadata._seq_lens[:num_seqs].fill_(1)
+        attn_metadata.kv_lens[:num_seqs] += 1
+        attn_metadata.host_request_types[0:num_seqs].fill_(1)
+        attn_metadata.prepare_kv_cache()
+
         # speculative decoding metadata
         sequence_lengths = [1] * num_seqs
         spec_metadata.num_generations = len(generation_requests)
         spec_metadata.num_tokens = len(generation_requests)
         spec_metadata.seq_lens = sequence_lengths
         spec_metadata.prepare()
-        
+
         inputs = {
-            'attn_metadata': attn_metadata,
-            'input_ids': new_tensors_device["new_tokens_device"][:num_tokens],
-            'position_ids': self.position_ids_cuda[:last_iter_num_tokens].unsqueeze(0),
-            'inputs_embeds': None,
-            'multi_modal_data': None,
-            'mrope_config': None,
-            'spec_metadata': spec_metadata
+            'attn_metadata':
+            attn_metadata,
+            'input_ids':
+            new_tensors_device["new_tokens_device"][:num_tokens],
+            'position_ids':
+            self.position_ids_cuda[:last_iter_num_tokens].unsqueeze(0),
+            'inputs_embeds':
+            None,
+            'multi_modal_data':
+            None,
+            'mrope_config':
+            None,
+            'spec_metadata':
+            spec_metadata
         }
 
         # support attention dp
@@ -953,20 +964,11 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
-
         num_generation_tokens = len(generation_requests)
         self.iter_states['num_ctx_requests'] = 0
         self.iter_states['num_ctx_tokens'] = 0
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         return inputs, None
-
 
     def _prepare_tp_inputs(
             self,
@@ -1681,9 +1683,10 @@ class PyTorchModelEngine(ModelEngine):
                 assert False, f'Unsupport cp_type {cp_type}'
         elif self.is_draft_model and new_tensors_device is not None:
             self.use_prepare_draft_tp_inputs = True
-            return self._prepare_draft_tp_inputs(scheduled_requests, kv_cache_manager,
-                                              attn_metadata, spec_metadata,
-                                              new_tensors_device)
+            return self._prepare_draft_tp_inputs(scheduled_requests,
+                                                 kv_cache_manager,
+                                                 attn_metadata, spec_metadata,
+                                                 new_tensors_device)
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
@@ -1807,7 +1810,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> torch.Tensor:
         inputs = self._preprocess_inputs(inputs)
-        if inputs['spec_metadata'] is not None:
+        if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
         if self.without_logits:
             outputs = self.model_forward(**inputs)
