@@ -3,6 +3,8 @@ from typing import List, Optional, Union
 import deep_gemm
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import nvtx_range
@@ -12,6 +14,56 @@ from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
+
+
+@triton.jit
+def masked_index_copy_kernel(output_ptr, input_ptr, indices_ptr, num_tokens_ptr,
+                             total_num_tokens, dim_size,
+                             BLOCK_SIZE: tl.constexpr):
+    # get program id and block offset
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # calculate token and element index
+    num_tokens = tl.load(num_tokens_ptr)
+    token_idx = offsets // dim_size
+    elem_idx = offsets % dim_size
+    token_valid = token_idx < num_tokens
+    offset_valid = offsets < (total_num_tokens * dim_size)
+    valid = offset_valid & token_valid
+
+    # load input data and index
+    input = tl.load(input_ptr + offsets, mask=valid)
+    index = tl.load(indices_ptr + token_idx, mask=valid)
+
+    # write output
+    output_idx = index * dim_size + elem_idx
+    tl.store(output_ptr + output_idx, input, mask=valid)
+
+
+def triton_masked_index_copy(output, input, indices, num_tokens):
+    assert output.device == input.device == indices.device == num_tokens.device, "All tensors must be on the same device"
+    assert output.dtype == input.dtype, "Output and input must have the same dtype"
+    assert input.ndim == 2, "Input must be a 2D tensor"
+    assert indices.ndim == 1, "Indices must be a 1D tensor"
+    assert num_tokens.shape == (1, ), "Num_tokens must be a tensor of shape [1]"
+
+    total_num_tokens = input.shape[0]
+    dim_size = input.shape[1]
+    total_elems = total_num_tokens * dim_size
+
+    # launch kernel
+    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
+    masked_index_copy_kernel[grid](output,
+                                   input,
+                                   indices,
+                                   num_tokens,
+                                   total_num_tokens,
+                                   dim_size,
+                                   BLOCK_SIZE=1024)
+
+    return output
 
 
 @nvtx_range("[DG] act")
@@ -32,9 +84,10 @@ def indexing(x, mask):
 def copy_after(
     expert_first_token_offset_tensor,
     permuted_data_tensor,
+    permuted_data_tensor_padded,
     base_indices,
-    hidden_size,
 ):
+    # get padded metadata
     token_per_expert = expert_first_token_offset_tensor[
         1:] - expert_first_token_offset_tensor[:-1]
     token_per_expert_padded = (token_per_expert + 127) // 128 * 128
@@ -43,34 +96,20 @@ def copy_after(
                      device='cuda'), torch.cumsum(token_per_expert_padded,
                                                   dim=0)))
 
-    token_num = token_per_expert.sum()
-    total_tokens_padded = token_per_expert_padded.sum()
-    m_indices = torch.repeat_interleave(base_indices,
-                                        token_per_expert_padded,
-                                        dim=0,
-                                        output_size=total_tokens_padded)
-    src_offsets = torch.repeat_interleave(expert_first_token_offset_tensor[:-1],
-                                          token_per_expert,
-                                          dim=0,
-                                          output_size=token_num)
-    dest_starts = torch.repeat_interleave(
-        expert_first_token_offset_tensor_padded[:-1],
-        token_per_expert,
-        dim=0,
-        output_size=token_num)
-    token_j_offset_in_expert = torch.arange(token_num,
-                                            device='cuda') - src_offsets
+    # get dest_indices
+    token_to_expert_map = torch.searchsorted(
+        expert_first_token_offset_tensor[1:], base_indices, right=True)
+    src_offsets = expert_first_token_offset_tensor[token_to_expert_map]
+    dest_starts = expert_first_token_offset_tensor_padded[token_to_expert_map]
+    token_j_offset_in_expert = base_indices - src_offsets
     dest_indices = dest_starts + token_j_offset_in_expert
 
-    permuted_data_tensor_padded = torch.empty(total_tokens_padded,
-                                              hidden_size,
-                                              dtype=permuted_data_tensor.dtype,
-                                              device='cuda')
-    src_indices = torch.arange(dest_indices.shape[0], device='cuda')
-    permuted_data_tensor_padded.index_copy_(0, dest_indices,
-                                            permuted_data_tensor[src_indices])
+    # copy data
+    triton_masked_index_copy(permuted_data_tensor_padded, permuted_data_tensor,
+                             dest_indices,
+                             expert_first_token_offset_tensor[-1:])
 
-    return permuted_data_tensor_padded, m_indices, dest_indices
+    return dest_indices, expert_first_token_offset_tensor_padded
 
 
 @nvtx_range("[DG]")
@@ -141,10 +180,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
-        self.base_indices = torch.arange(self.expert_size_per_partition,
-                                         device="cuda",
-                                         dtype=torch.int32)
-
     @nvtx_range("[DG] forward")
     def forward_chunk(
         self,
@@ -214,15 +249,39 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=use_deepseek_fp8_block_scale,
         )
 
-        permuted_data_tensor_padded, m_indices, dest_indices = copy_after(
+        # TODO: change this hardcode to use the max token number
+        base_indices = torch.arange(65536, device="cuda", dtype=torch.int32)
+
+        permuted_data_tensor_padded = torch.empty(65536,
+                                                  self.hidden_size,
+                                                  dtype=self.dtype,
+                                                  device='cuda')
+
+        dest_indices, expert_first_token_offset_tensor_padded = copy_after(
             expert_first_token_offset_tensor,
             permuted_data_tensor,
-            self.base_indices,
-            self.hidden_size,
+            permuted_data_tensor_padded,
+            base_indices,
         )
 
-        if permuted_data_tensor_padded.numel() == 0:
+        # get m_indices
+        m_indices = torch.searchsorted(
+            expert_first_token_offset_tensor_padded[1:],
+            base_indices,
+            right=True,
+            out_int32=True)
+
+        # TODO: remove this check
+        total_tokens_padded = expert_first_token_offset_tensor_padded[-1].item()
+        if total_tokens_padded == 0:
             return torch.zeros_like(x)
+
+        # TODO: remove these slices
+        m_indices = m_indices[0:total_tokens_padded]
+        permuted_data_tensor_padded = permuted_data_tensor_padded[
+            0:total_tokens_padded]
+        dest_indices = dest_indices[0:expert_first_token_offset_tensor[-1]]
+
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
             permuted_data_tensor_padded)
         h1 = deepgemm_fp8_group_blockwise_gemm_ref(
