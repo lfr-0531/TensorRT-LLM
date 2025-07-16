@@ -575,9 +575,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         scale_name = self._get_scale_name(weights)
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
                                          module.tp_rank, module.tp_mode)
-        # if get_sm_version == 100:
-        #     weight, weight_scale = resmooth_to_fp8_e8m0(module.weight, weight_scale)
-        #     copy_weight(module.weight, weight)
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -597,8 +594,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         v_scale = load_weight_shard(weights[2][scale_name], module.tp_size,
                                     module.tp_rank, module.tp_mode)
         fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale))
-        # if get_sm_version == 100:
-        #     fused_weight, fused_fp8_block_scale = resmooth_to_fp8_e8m0(fused_weight, fused_fp8_block_scale)
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_fp8_block_scale)
 
@@ -614,8 +609,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
         fused_scale = torch.cat([left_scale, right_scale], dim=0)
-        # if get_sm_version == 100:
-        #     fused_weight, fused_scale = resmooth_to_fp8_e8m0(fused_weight, fused_scale)
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
