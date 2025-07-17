@@ -66,6 +66,58 @@ def triton_masked_index_copy(output, input, indices, num_tokens):
     return output
 
 
+@triton.jit
+def masked_index_gather_kernel(output_ptr, input_ptr, indices_ptr,
+                               num_tokens_ptr, dim_size,
+                               BLOCK_SIZE: tl.constexpr):
+    # get program id and block offset
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # compute mask and pointers
+    num_tokens = tl.load(num_tokens_ptr)
+    valid = offsets < num_tokens * dim_size
+    token_idx = offsets // dim_size
+    elem_idx = offsets % dim_size
+
+    # load gather indices and input data
+    gather_indices = tl.load(indices_ptr + token_idx,
+                             mask=valid)  # Shape [BLOCK_SIZE]
+    input_offsets = gather_indices * dim_size + elem_idx
+    input_vals = tl.load(input_ptr + input_offsets, mask=valid)
+
+    # load from input and store to output
+    tl.store(output_ptr + offsets, input_vals, mask=valid)
+
+
+@torch.no_grad()
+def triton_masked_index_gather(output, input, indices, num_tokens):
+    # initial checks
+    assert output.ndim == 2, "Output must be a 2D tensor"
+    assert input.ndim == 2, "Input must be a 2D tensor"
+    assert indices.ndim == 1, "Indices must be a 1D tensor"
+    assert num_tokens.shape == (1, ), "Num_tokens must be a tensor of shape [1]"
+
+    total_elems = output.numel()
+    dim_size = output.shape[1]
+
+    # Check contiguity
+    assert output.is_contiguous(), "Output tensor must be contiguous"
+    assert input.is_contiguous(), "Input tensor must be contiguous"
+    assert indices.is_contiguous(), "Indices tensor must be contiguous"
+
+    # launch kernel
+    grid = lambda meta: (triton.cdiv(total_elems, meta['BLOCK_SIZE']), )
+    masked_index_gather_kernel[grid](output,
+                                     input,
+                                     indices,
+                                     num_tokens,
+                                     dim_size,
+                                     BLOCK_SIZE=1024)
+    return output
+
+
 @nvtx_range("[DG] act")
 @torch.compile(dynamic=True)
 def swiglu_fused_moe(x):
@@ -271,17 +323,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             right=True,
             out_int32=True)
 
-        # TODO: remove this check
-        total_tokens_padded = expert_first_token_offset_tensor_padded[-1].item()
-        if total_tokens_padded == 0:
-            return torch.zeros_like(x)
-
-        # TODO: remove these slices
-        m_indices = m_indices[0:total_tokens_padded]
-        permuted_data_tensor_padded = permuted_data_tensor_padded[
-            0:total_tokens_padded]
-        dest_indices = dest_indices[0:expert_first_token_offset_tensor[-1]]
-
         act_input_fp8, act_input_sf = fp8_utils.per_token_cast_to_fp8_e8m0(
             permuted_data_tensor_padded)
         h1 = deepgemm_fp8_group_blockwise_gemm_ref(
@@ -301,7 +342,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             m_indices=m_indices,
         )
 
-        permuted_data_tensor[0:dest_indices.shape[0]].copy_(h3[dest_indices])
+        triton_masked_index_gather(permuted_data_tensor, h3, dest_indices,
+                                   expert_first_token_offset_tensor_padded[-1:])
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
             None,  # biases
