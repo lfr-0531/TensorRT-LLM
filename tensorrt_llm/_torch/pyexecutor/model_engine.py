@@ -23,8 +23,8 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
-                                 local_mpi_size, nvtx_range, release_gc,
-                                 torch_dtype_to_str, trace_func)
+                                 local_mpi_size, mpi_barrier, nvtx_range,
+                                 release_gc, torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -164,6 +164,8 @@ def prefetch_files(file_names: List[str]):
                         len(local_file_names))
     with multiprocessing.Pool(processes=max_processes) as pool:
         pool.map(_prefetch_one_file, local_file_names)
+    # Ensure that all ranks have finished prefetching before loading weights
+    mpi_barrier()
 
 
 def load_weights(checkpoint_dir: str):
