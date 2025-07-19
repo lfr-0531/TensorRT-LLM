@@ -134,16 +134,16 @@ def indexing(x, mask):
     return x[mask > 0, :].contiguous()
 
 
-@nvtx_range("[DG] copy after permute")
-@torch.compile(dynamic=True)
+@nvtx_range("[DG] preprocess_after_permute")
 def preprocess_after_permute(expert_first_token_offset_tensor,
                              permuted_data_tensor):
     # get tokens per expert
     masked_m = expert_first_token_offset_tensor[
         1:] - expert_first_token_offset_tensor[:-1]
-    base_indices = torch.arange(0, permuted_data_tensor.shape[0], device='cuda')
     token_to_expert_map = torch.searchsorted(
-        expert_first_token_offset_tensor[1:], base_indices, right=True)
+        expert_first_token_offset_tensor[1:],
+        torch.arange(permuted_data_tensor.shape[0], device='cuda'),
+        right=True)
     return masked_m.to(torch.int32), token_to_expert_map
 
 
