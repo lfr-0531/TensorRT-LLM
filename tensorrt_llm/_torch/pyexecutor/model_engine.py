@@ -164,8 +164,6 @@ def prefetch_files(file_names: List[str]):
                         len(local_file_names))
     with multiprocessing.Pool(processes=max_processes) as pool:
         pool.map(_prefetch_one_file, local_file_names)
-    # Ensure that all ranks have finished prefetching before loading weights
-    mpi_barrier()
 
 
 def load_weights(checkpoint_dir: str):
