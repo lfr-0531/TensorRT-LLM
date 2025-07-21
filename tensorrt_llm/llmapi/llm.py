@@ -863,6 +863,7 @@ class _TrtLLM(BaseLLM):
 
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
+
         if self.args.guided_decoding_backend == 'xgrammar':
             self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
@@ -989,6 +990,7 @@ class _TorchLLM(BaseLLM):
                 self.args.peft_cache_config)
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
+
         if self.args.guided_decoding_backend == 'xgrammar':
             self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
@@ -1006,6 +1008,7 @@ class _TorchLLM(BaseLLM):
 
         if self._on_trt_backend:
             self._executor_config.normalize_log_probs = self.args.normalize_log_probs
+        self._executor_config.sparse_attention_config = self.args.sparse_attention_config
         self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         self._executor_config.max_beam_width = self.args.max_beam_width
         if self.args.cache_transceiver_config is not None:

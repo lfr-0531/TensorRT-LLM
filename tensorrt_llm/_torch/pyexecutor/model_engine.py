@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
+from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -260,6 +261,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        sparse_attention_config: Optional[SparseAttentionConfig] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
     ):
@@ -278,6 +280,7 @@ class PyTorchModelEngine(ModelEngine):
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self.sparse_attention_config = sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
@@ -355,7 +358,8 @@ class PyTorchModelEngine(ModelEngine):
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
 
-        self.attn_backend = get_attention_backend(attn_backend)
+        self.attn_backend = get_attention_backend(
+            attn_backend, sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -789,7 +793,8 @@ class PyTorchModelEngine(ModelEngine):
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_paged_context_mla=enable_paged_context_mla,
-                cache_indirection=cache_indirection)
+                cache_indirection=cache_indirection,
+                sparse_attention_config=self.sparse_attention_config)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -806,7 +811,8 @@ class PyTorchModelEngine(ModelEngine):
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_paged_context_mla=enable_paged_context_mla,
-            cache_indirection=cache_indirection)
+            cache_indirection=cache_indirection,
+            sparse_attention_config=self.sparse_attention_config)
 
         return self.attn_metadata
 
@@ -1010,6 +1016,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            sparse_attention_config=self.sparse_attention_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
