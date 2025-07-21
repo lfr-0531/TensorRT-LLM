@@ -28,6 +28,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
+from ..attention_backend.sparse.rocket import RocketKVCacheManager
 from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
@@ -358,7 +359,8 @@ class KvCacheCreator:
                 tokens_per_block=executor_config.tokens_per_block
             ) if is_vswa else None
 
-            kv_cache_manager = KVCacheManager(
+            # NOTE: workaround for debug
+            kv_cache_manager = RocketKVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -369,10 +371,10 @@ class KvCacheCreator:
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                spec_config=spec_config,
-                max_num_tokens=executor_config.max_num_tokens,
-                model_config=binding_model_config,
-                max_beam_width=executor_config.max_beam_width,
+                # spec_config=spec_config,
+                # max_num_tokens=executor_config.max_num_tokens,
+                # model_config=binding_model_config,
+                # max_beam_width=executor_config.max_beam_width,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

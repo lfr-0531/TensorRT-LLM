@@ -214,6 +214,8 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+    sparse_attention_config = executor_config.sparse_attention_config
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
@@ -237,6 +239,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
             guided_decoding_config=executor_config.guided_decoding_config,
             lora_config=lora_config,
             checkpoint_loader=executor_config.checkpoint_loader,
@@ -372,7 +375,6 @@ def create_py_executor(
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
         drafter = get_spec_drafter(model_engine, spec_resource_manager)
-
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
@@ -391,7 +393,8 @@ def create_py_executor(
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
-
+    # TODO: bugs here for rocket sparse attention, cannot estimate kv cache size when seq_len=1
+    estimating_kv_cache = False
     if estimating_kv_cache:
         assert kv_cache_creator is not None
         with mem_monitor.observe_creation_stage(

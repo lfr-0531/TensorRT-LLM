@@ -87,6 +87,51 @@ class CudaGraphConfig(BaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+class SparseAttentionBaseConfig(BaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "Rocket": RocketSparseAttentionConfig,
+        }
+
+        config_class = config_classes.get("algorithm")
+        if config_class is None:
+            raise ValueError(f"Invalid decoding type: {decoding_type}")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
 
 class MoeConfig(BaseModel):
     """
@@ -759,6 +804,10 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     UserProvidedDecodingConfig,
 ]]
 
+SparseAttentionConfig: TypeAlias = Optional[Union[
+    RocketSparseAttentionConfig,
+]]
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(BaseModel, PybindMirror):
@@ -1066,6 +1115,10 @@ class BaseLlmArgs(BaseModel):
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
         default=None, description="Cache transceiver config.")
+
+    # sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None, description="Sparse attention config.")
 
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
@@ -1805,6 +1858,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.")
+
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None, description="Sparse attention config.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")

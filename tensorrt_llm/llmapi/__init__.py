@@ -12,7 +12,7 @@ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       UserProvidedDecodingConfig, RocketSparseAttentionConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -53,4 +53,5 @@ __all__ = [
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
+    'RocketSparseAttentionConfig',
 ]

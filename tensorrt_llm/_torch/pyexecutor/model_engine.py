@@ -28,6 +28,7 @@ from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
+from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -258,6 +259,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        sparse_attention_config: Optional[SparseAttentionConfig] = None,
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
@@ -277,6 +279,8 @@ class PyTorchModelEngine(ModelEngine):
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self.is_sparse_attention = sparse_attention_config is not None
+        self.sparse_attention_config = sparse_attention_config
         self.is_draft_model = is_draft_model
 
         self.in_warmup = False
@@ -356,7 +360,7 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
-        self.attn_backend = get_attention_backend(attn_backend)
+        self.attn_backend = get_attention_backend(attn_backend, sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -948,6 +952,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            sparse_attention_config=self.sparse_attention_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
@@ -2027,6 +2032,18 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.max_draft_len)
         else:
             spec_metadata = None
+
+        if self.is_sparse_attention:
+            sparse_attn_kwargs = {}
+            assert self.sparse_attention_config is not None
+            if self.sparse_attention_config.algorithm == "rocket":
+                sparse_attn_kwargs = {
+                    'window_size': self.sparse_attention_config.window_size,
+                    'kernel_size': self.sparse_attention_config.kernel_size,
+                }
+            else:
+                sparse_attn_kwargs = {}
+            attn_metadata.update_sparse_attn_param(**sparse_attn_kwargs)
 
         moe_load_balancer = None
         if hasattr(self, 'moe_load_balancer'):
