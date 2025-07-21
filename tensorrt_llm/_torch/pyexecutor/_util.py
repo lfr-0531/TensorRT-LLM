@@ -1,6 +1,5 @@
 import os
 import random
-from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
@@ -17,6 +16,7 @@ from tensorrt_llm.lora_helper import (LoraConfig,
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
@@ -38,6 +38,21 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
+def get_kv_cache_manager_cls(model_config: ModelConfig,
+                             executor_config: ExecutorConfig):
+    config = model_config.pretrained_config
+    sparse_attn_config = executor_config.sparse_attention_config
+    if is_mla(config):
+        return KVCacheManager
+    elif is_nemotron_hybrid(config):
+        return MambaHybridCacheManager
+    else:
+        if sparse_attn_config is not None:
+            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        else:
+            return KVCacheManager
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -52,45 +67,8 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._executor_config.kv_cache_config.max_tokens
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
-
-    @staticmethod
-    def _get_cache_size_per_token(model_config: ModelConfig,
-                                  mapping: Mapping) -> int:
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
-
-        config = model_config.pretrained_config
-
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
-        if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
-
-        mla = is_mla(config)
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-
-        kv_factor = 2
-        if mla:
-            # MLA has kv_lora_rank and qk_rope_head_dim
-            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-            kv_factor = 1
-        else:
-            _head_dim = getattr(config, 'head_dim', None)
-            if not isinstance(_head_dim, int):
-                _head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = _head_dim * num_key_value_heads // tp_size
-
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
-        # K and V
-        mem_per_token *= kv_factor
-        return mem_per_token
+        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
+            model_engine.model.model_config, executor_config)
 
     def _get_free_gpu_memory_fraction(self) -> float:
         fraction = self._executor_config.kv_cache_config.free_gpu_memory_fraction
@@ -102,12 +80,12 @@ class KvCacheCreator:
                         alloc_kv_tokens: int) -> int:
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
-        kv_size_per_token = self._get_cache_size_per_token(
-            model_config, mapping)
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
+            model_config, self._executor_config, mapping)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._get_cache_size_per_token(
-                draft_model_config, mapping)
+            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                draft_model_config, self._executor_config, mapping)
 
         available_kv_mem = (total_gpu_memory - peak_memory +
                             alloc_kv_tokens * kv_size_per_token) * fraction
@@ -189,6 +167,12 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
@@ -281,6 +265,7 @@ class KvCacheCreator:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         spec_config = executor_config.speculative_config
+        sparse_attn_config = executor_config.sparse_attention_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -300,7 +285,7 @@ class KvCacheCreator:
         num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -330,8 +315,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
-
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.ssm_state_size,
                 config.conv_kernel,
@@ -365,7 +349,7 @@ class KvCacheCreator:
                 tokens_per_block=executor_config.tokens_per_block
             ) if is_vswa else None
 
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -381,6 +365,7 @@ class KvCacheCreator:
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
                 is_draft=model_engine.is_draft_model,
+                sparse_attn_config=sparse_attn_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
