@@ -10,9 +10,10 @@ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        DynamicBatchConfig, EagleDecodingConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       RocketSparseAttentionConfig, SchedulerConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig, RocketSparseAttentionConfig)
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession

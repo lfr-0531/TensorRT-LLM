@@ -1,8 +1,9 @@
 from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, AttentionMetadata
+from .sparse.rocket import (RocketVanillaAttention,
+                            RocketVanillaAttentionMetadata)
 from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
 from .vanilla import VanillaAttention, VanillaAttentionMetadata
-from .sparse.rocket import RocketVanillaAttention, RocketVanillaAttentionMetadata
 
 __all__ = [
     "AttentionMetadata",
