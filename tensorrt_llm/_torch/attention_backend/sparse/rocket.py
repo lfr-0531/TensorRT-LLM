@@ -90,7 +90,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         return k_out[:, :, :, :seq_len//page_size]
 
-    def predict_kv_indices_for_write(self,
+    def single_request_sparse_kv_predict(self,
                                     q: Optional[Tensor],
                                     k: Optional[Tensor],
                                     v: Optional[Tensor],
@@ -163,7 +163,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         return selected_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
 
-    def predict_kv_indices_for_calc(self, 
+    def single_request_sparse_attn_predict(self, 
                                    q: Tensor,
                                    k: Optional[Tensor],
                                    v: Optional[Tensor],

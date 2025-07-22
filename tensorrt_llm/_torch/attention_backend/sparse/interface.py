@@ -52,7 +52,7 @@ class VanillaSparseAttention(VanillaAttention):
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
     @abstractmethod
-    def predict_kv_indices_for_calc(self, 
+    def single_request_sparse_attn_predict(self, 
                                    q: Tensor,
                                    k: Optional[Tensor],
                                    v: Optional[Tensor],
@@ -63,7 +63,7 @@ class VanillaSparseAttention(VanillaAttention):
         pass
 
     @abstractmethod
-    def predict_kv_indices_for_write(self,
+    def single_request_sparse_kv_predict(self,
                                     q: Optional[Tensor],
                                     k: Optional[Tensor],
                                     v: Optional[Tensor],
@@ -73,13 +73,26 @@ class VanillaSparseAttention(VanillaAttention):
                                     **kwargs) -> Optional[Tensor]:
         pass
 
-    def attention_forward(self,
+    def single_request_sparse_attn_forward(self,
                                 q: Tensor,
-                                key_states: Tensor,
-                                value_states: Tensor,
+                                calc_indices: Optional[Tensor],
+                                cache_idx: int,
+                                target_seq_len: int,
+                                kv_cache_tensor: Tensor,
                                 attention_mask: AttentionMask,
                                 metadata: SparseAttentionMetadata,
                                 **kwargs) -> Tensor:
+
+        key_states = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
+        value_states = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
+        
+        if calc_indices is not None:
+            # Gather the selected indices
+            key_states = key_states.gather(2, calc_indices.unsqueeze(-1).expand(-1, -1, -1, key_states.size(-1)))
+            value_states = value_states.gather(2, calc_indices.unsqueeze(-1).expand(-1, -1, -1, value_states.size(-1)))
+        
+        key_states, value_states = key_states[:, :, :target_seq_len, :], value_states[:, :, :target_seq_len, :]
+        
         import math
         
         bsz, num_heads, q_len, head_dim = q.shape
@@ -124,39 +137,30 @@ class VanillaSparseAttention(VanillaAttention):
         
         return attn_output
 
-    def _update_kv_cache(self,
-                        k: Optional[Tensor],
-                        v: Optional[Tensor],
-                        kv_cache_tensor: Tensor,
-                        write_indices: Tensor,
-                        cache_idx: int,
-                        metadata: Optional[SparseAttentionMetadata] = None) -> Tuple[Tensor, Tensor]:
+    def update_sparse_kv_cache(self,
+                               k: Optional[Tensor],
+                               v: Optional[Tensor],
+                               kv_cache_tensor: Tensor,
+                               past_seen_token: int,
+                               kv_indices: Tensor,
+                               cache_idx: int,
+                               metadata: Optional[SparseAttentionMetadata] = None) -> Tuple[Tensor, Tensor]:
+        # Select tokens from input using returned indices
+        k_selected = k.gather(2, kv_indices) if len(kv_indices) > 0 else k
+        v_selected = v.gather(2, kv_indices) if len(kv_indices) > 0 else v
+        
+        # Calculate cache write positions
+        cache_write_indices = torch.arange(past_seen_token, past_seen_token + k_selected.size(2), device=k.device)
+        
         k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
         v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
 
         if k is not None and v is not None:
             access_type = self._access_type[k.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(2, write_indices,
-                                                      k.view(dtype=access_type))
-            v_out.view(dtype=access_type).index_copy_(2, write_indices,
-                                                      v.view(dtype=access_type))
-
-        return k_out, v_out
-
-    def _gather_kv_states(self,
-                         kv_cache_tensor: Tensor,
-                         calc_indices: Tensor,
-                         cache_idx: int,
-                         seq_len: int) -> Tuple[Tensor, Tensor]:
-        k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
-        v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
-        
-        if calc_indices is not None:
-            # Gather the selected indices
-            k_out = k_out.gather(2, calc_indices.unsqueeze(-1).expand(-1, -1, -1, k_out.size(-1)))
-            v_out = v_out.gather(2, calc_indices.unsqueeze(-1).expand(-1, -1, -1, v_out.size(-1)))
-        
-        return k_out[:, :, :seq_len, :], v_out[:, :, :seq_len, :]
+            k_out.view(dtype=access_type).index_copy_(2, cache_write_indices,
+                                                      k_selected.view(dtype=access_type))
+            v_out.view(dtype=access_type).index_copy_(2, cache_write_indices,
+                                                      v_selected.view(dtype=access_type))
 
     def _single_request_forward(self,
                                q: Tensor,
@@ -193,31 +197,18 @@ class VanillaSparseAttention(VanillaAttention):
             assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
         # Predict indices for attention calculation
-        calc_indices = self.predict_kv_indices_for_calc(
+        attn_indices = self.single_request_sparse_attn_predict(
             q, k, v, metadata, past_seen_token, cache_idx, **kwargs)
-        
-        # Gather key and value states for attention
-        key_states, value_states = self._gather_kv_states(
-            kv_cache_tensor, calc_indices, cache_idx, target_seq_len)
 
         # Apply sparse attention calculation
-        attn_output = self.attention_forward(
-            q, key_states, value_states, attention_mask, metadata, **kwargs)
+        attn_output = self.single_request_sparse_attn_forward(q, attn_indices, cache_idx, target_seq_len, kv_cache_tensor, attention_mask, metadata, **kwargs)
 
         # Predict indices for writing to KV cache
-        input_kv_indices = self.predict_kv_indices_for_write(
+        kv_indices = self.single_request_sparse_kv_predict(
             q, k, v, metadata, past_seen_token, cache_idx, **kwargs)
 
-        # Update KV cache
         if k is not None and v is not None:
-            # Select tokens from input using returned indices
-            k_selected = k.gather(2, input_kv_indices) if len(input_kv_indices) > 0 else k
-            v_selected = v.gather(2, input_kv_indices) if len(input_kv_indices) > 0 else v
-            
-            # Calculate cache write positions
-            cache_write_indices = torch.arange(past_seen_token, past_seen_token + k_selected.size(2), device=k.device)
-            
-            self._update_kv_cache(k_selected, v_selected, kv_cache_tensor, cache_write_indices, cache_idx, metadata)
+            self.update_sparse_kv_cache(k, v, kv_cache_tensor, past_seen_token, kv_indices, cache_idx, metadata)
 
         return attn_output.squeeze(0)
 
