@@ -17,6 +17,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
+from ..attention_backend.sparse import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
 from .config import PyTorchConfig
@@ -28,7 +29,6 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from ..attention_backend.sparse.rocket import RocketKVCacheManager
 from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
@@ -278,6 +278,7 @@ class KvCacheCreator:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         spec_config = executor_config.speculative_config
+        sparse_attn_config = executor_config.sparse_attention_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -359,8 +360,11 @@ class KvCacheCreator:
                 tokens_per_block=executor_config.tokens_per_block
             ) if is_vswa else None
 
-            # NOTE: workaround for debug
-            kv_cache_manager = RocketKVCacheManager(
+            kv_cache_manager_class = KVCacheManager
+            if sparse_attn_config is not None:
+                kv_cache_manager_class = get_sparse_attn_kv_cache_manager(
+                    sparse_attn_config)
+            kv_cache_manager = kv_cache_manager_class(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -375,7 +379,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
-                sparse_attn_config=executor_config.sparse_attention_config,
+                sparse_attn_config=sparse_attn_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
