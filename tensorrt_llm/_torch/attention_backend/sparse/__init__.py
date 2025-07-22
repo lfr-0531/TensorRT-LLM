@@ -1,10 +1,5 @@
-from .interface import VanillaSparseAttention, SparseAttentionMetadata
-from .rocket import RocketVanillaAttention, RocketVanillaAttentionMetadata, RocketKVCacheManager
+from .utils import get_sparse_attn_kv_cache_manager
 
 __all__ = [
-    'VanillaSparseAttention',
-    'SparseAttentionMetadata',
-    'RocketVanillaAttention',
-    'RocketVanillaAttentionMetadata',
-    'RocketKVCacheManager',
+    "get_sparse_attn_kv_cache_manager",
 ]

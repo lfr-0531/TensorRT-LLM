@@ -87,13 +87,14 @@ class CudaGraphConfig(BaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+
 class SparseAttentionBaseConfig(BaseModel):
     """
     Configuration for sparse attention.
     """
     algorithm: Literal["rocket"] = Field(
         default="rocket", description="The algorithm for sparse attention.")
-    
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
@@ -103,7 +104,7 @@ class SparseAttentionBaseConfig(BaseModel):
 
         config_class = config_classes.get("algorithm")
         if config_class is None:
-            raise ValueError(f"Invalid decoding type: {decoding_type}")
+            raise ValueError(f"Invalid algorithm")
 
         return config_class(**data)
 
@@ -117,6 +118,7 @@ class SparseAttentionBaseConfig(BaseModel):
         """
         return True
 
+
 class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
     """
     Configuration for rocket sparse attention.
@@ -125,6 +127,11 @@ class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
         default=None, description="The kernel size for snap KV.")
+    topr: Optional[int] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -132,6 +139,7 @@ class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
 
 class MoeConfig(BaseModel):
     """
