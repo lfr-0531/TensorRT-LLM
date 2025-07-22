@@ -371,10 +371,11 @@ class KvCacheCreator:
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
-                # spec_config=spec_config,
-                # max_num_tokens=executor_config.max_num_tokens,
-                # model_config=binding_model_config,
-                # max_beam_width=executor_config.max_beam_width,
+                spec_config=spec_config,
+                max_num_tokens=executor_config.max_num_tokens,
+                model_config=binding_model_config,
+                max_beam_width=executor_config.max_beam_width,
+                sparse_attn_config=executor_config.sparse_attention_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

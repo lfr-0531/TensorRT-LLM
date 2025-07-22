@@ -290,6 +290,9 @@ def create_py_executor(
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
 
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        executor_config.tokens_per_block = model_engine.max_num_tokens
+
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:

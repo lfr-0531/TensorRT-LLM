@@ -23,12 +23,12 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
-from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -360,7 +360,8 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
-        self.attn_backend = get_attention_backend(attn_backend, sparse_attn_config=sparse_attention_config)
+        self.attn_backend = get_attention_backend(
+            attn_backend, sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -952,7 +953,6 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
-            sparse_attention_config=self.sparse_attention_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
@@ -2032,18 +2032,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.max_draft_len)
         else:
             spec_metadata = None
-
-        if self.is_sparse_attention:
-            sparse_attn_kwargs = {}
-            assert self.sparse_attention_config is not None
-            if self.sparse_attention_config.algorithm == "rocket":
-                sparse_attn_kwargs = {
-                    'window_size': self.sparse_attention_config.window_size,
-                    'kernel_size': self.sparse_attention_config.kernel_size,
-                }
-            else:
-                sparse_attn_kwargs = {}
-            attn_metadata.update_sparse_attn_param(**sparse_attn_kwargs)
 
         moe_load_balancer = None
         if hasattr(self, 'moe_load_balancer'):

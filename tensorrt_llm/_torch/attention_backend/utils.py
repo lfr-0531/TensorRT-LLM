@@ -1,30 +1,37 @@
 from typing import Optional, Type
 
+from ...llmapi.llm_args import SparseAttentionConfig
 from ...models.modeling_utils import QuantConfig
 from . import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
-from ...llmapi.llm_args import SparseAttentionConfig
 
 
-def get_attention_backend(backend_name: str, sparse_attn_config=None) -> Type[AttentionBackend]:
+def get_attention_backend(backend_name: str,
+                          sparse_attn_config=None) -> Type[AttentionBackend]:
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             from .sparse.rocket import RocketVanillaAttention
             if sparse_attn_config.algorithm == "rocket":
                 return RocketVanillaAttention
             else:
-                raise ValueError(f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}")
+                raise ValueError(
+                    f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}"
+                )
         return VanillaAttention
     elif backend_name == "TRTLLM":
         if sparse_attn_config is not None:
-            raise ValueError(f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}")
+            raise ValueError(
+                f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}"
+            )
         return TrtllmAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_attn_config is not None:
-            raise ValueError(f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}")
+            raise ValueError(
+                f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}"
+            )
         return FlashInferAttention
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
@@ -52,7 +59,7 @@ def create_attention(
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
-    sparse_attention_config: Optional[SparseAttentionConfig] = None
+    sparse_attention_config: Optional[SparseAttentionConfig] = None,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -87,4 +94,5 @@ def create_attention(
         mla_params=mla_params,
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
+        sparse_attention_config=sparse_attention_config,
     )
