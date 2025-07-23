@@ -13,6 +13,7 @@ except ImportError:
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
+from .sparse import (get_vanilla_sparse_attn_backend, get_vanilla_sparse_attn_metadata)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -59,11 +60,19 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.sparse_metadata = get_vanilla_sparse_attn_metadata(
+            self.sparse_attention_config)
+
     def prepare(self) -> None:
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids) if self.kv_cache_manager is not None else None
+
+        if self.sparse_metadata is not None:
+            self.sparse_metadata.prepare()
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -85,6 +94,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         super().__init__(layer_idx,
@@ -95,9 +105,29 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                          **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
+        self.sparse_attn = get_vanilla_sparse_attn_backend(
+            sparse_attention_config, layer_idx, num_heads, head_dim,
+            num_kv_heads, quant_config, q_scaling)
 
-    def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
-                                        cache_idx, cache_position):
+    def _single_request_update_kv_cache(self,
+                                        k,
+                                        v,
+                                        kv_cache_tensor,
+                                        seq_len,
+                                        cache_idx,
+                                        past_seen_token,
+                                        sparse_kv_indices=None):
+        if sparse_kv_indices is not None:
+            k = k.gather(2, sparse_kv_indices)
+            v = v.gather(2, sparse_kv_indices)
+            cache_position = torch.arange(past_seen_token,
+                                          past_seen_token + k.size(2),
+                                          device=k.device)
+        else:
+            cache_position = torch.arange(past_seen_token,
+                                          seq_len,
+                                          device=k.device)
+
         k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
         v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
 
@@ -108,17 +138,89 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             v_out.view(dtype=access_type).index_copy_(1, cache_position,
                                                       v.view(dtype=access_type))
 
-        return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
+        return k_out[:, :seq_len, :, :], v_out[:, :
+                                               seq_len, :, :], cache_position
 
-    def _single_request_forward(self,
-                                q,
-                                k,
-                                v,
-                                attention_mask: AttentionMask,
-                                kv_cache_tensor,
-                                past_seen_token,
-                                cache_idx,
-                                attention_window_size: Optional[int] = None):
+    def single_request_attn_forward(self,
+                                    q,
+                                    key_states,
+                                    value_states,
+                                    attention_mask,
+                                    attention_window_size,
+                                    seq_len,
+                                    cache_position,
+                                    past_seen_token,
+                                    sparse_indices=None,
+                                    **kwargs):
+        bsz, num_heads, q_len, head_dim = q.shape
+
+        key_states = key_states.transpose(1, 2).to(q.dtype)
+        value_states = value_states.transpose(1, 2).to(q.dtype)
+
+        if sparse_indices is not None:
+            # Gather the selected indices
+            key_states = key_states.gather(
+                2,
+                sparse_indices.unsqueeze(-1).expand(-1, -1, -1,
+                                                    key_states.size(-1)))
+            value_states = value_states.gather(
+                2,
+                sparse_indices.unsqueeze(-1).expand(-1, -1, -1,
+                                                    value_states.size(-1)))
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Attention Mask
+        is_causal = False
+        attn_mask = None
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            # Create custom sliding window mask as sdpa doesn't natively support it.
+            if attention_window_size is not None:
+                attn_mask = generate_sliding_window_mask(
+                    bsz, seq_len, cache_position, q.device,
+                    attention_window_size)
+            elif past_seen_token == 0:
+                is_causal = True
+            elif q_len != 1:
+                # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
+                attn_mask = generate_causal_mask(bsz, seq_len, cache_position,
+                                                 q.device)
+        elif attention_mask == PredefinedAttentionMask.FULL:
+            pass
+        else:
+            raise ValueError("Unexpected attention mask type")
+
+        # Apply scaling
+        qk_scale = None
+        if self.q_scaling is not None:
+            qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
+
+        # Standard scaled dot-product attention
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            key_states,
+            value_states,
+            is_causal=is_causal,
+            attn_mask=attn_mask,
+            scale=qk_scale,
+        )
+
+        attn_output = attn_output.squeeze(0)
+        return attn_output
+
+    def _single_request_forward(
+        self,
+        q,
+        k,
+        v,
+        attention_mask: AttentionMask,
+        kv_cache_tensor,
+        past_seen_token,
+        cache_idx,
+        metadata: VanillaAttentionMetadata,
+        attention_window_size: Optional[int] = None,
+    ):
 
         bsz = 1
         q_len = q.size(0)
@@ -143,53 +245,20 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                     v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
-        cache_position = torch.arange(past_seen_token,
-                                      target_seq_len,
-                                      device=q.device)
+        if self.sparse_attn is not None:
+            sparse_indices = self.sparse_attn.single_request_sparse_attn_predict(
+                q, k, v, metadata, past_seen_token, cache_idx)
+            sparse_kv_indices = self.sparse_attn.single_request_sparse_kv_predict(
+                q, k, v, metadata, past_seen_token, cache_idx)
 
-        key_states, value_states = self._single_request_update_kv_cache(
-            k, v, kv_cache_tensor, target_seq_len, cache_idx, cache_position)
+        key_states, value_states, cache_position = self._single_request_update_kv_cache(
+            k, v, kv_cache_tensor, target_seq_len, cache_idx, past_seen_token,
+            sparse_kv_indices)
 
-        key_states = key_states.transpose(1, 2).to(q.dtype)
-        value_states = value_states.transpose(1, 2).to(q.dtype)
+        attn_output = self.single_request_attn_forward(
+            q, key_states, value_states, attention_mask, attention_window_size,
+            target_seq_len, cache_position, past_seen_token, sparse_indices)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # Attention Mask
-        is_causal = False
-        attn_mask = None
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
-            # Create custom sliding window mask as sdpa doesn't natively support it.
-            if attention_window_size is not None:
-                attn_mask = generate_sliding_window_mask(
-                    bsz, target_seq_len, cache_position, q.device,
-                    attention_window_size)
-            elif past_seen_token == 0:
-                is_causal = True
-            elif q_len != 1:
-                # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
-                attn_mask = generate_causal_mask(bsz, target_seq_len,
-                                                 cache_position, q.device)
-        elif attention_mask == PredefinedAttentionMask.FULL:
-            pass
-        else:
-            raise ValueError("Unexpected attention mask type")
-
-        qk_scale = None
-        if self.q_scaling is not None:
-            qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            key_states,
-            value_states,
-            is_causal=is_causal,
-            attn_mask=attn_mask,
-            scale=qk_scale,
-        )
-
-        attn_output = attn_output.squeeze(0)
         return attn_output
 
     @staticmethod
@@ -314,7 +383,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                past_seen_token, cache_idx, attention_window_size)
+                past_seen_token, cache_idx, metadata, attention_window_size)
             attn_outputs.append(attn_output)
 
             offset += seq_len

@@ -6,11 +6,6 @@ from torch import Tensor
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend import AttentionBackend
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionMask, PredefinedAttentionMask)
-from tensorrt_llm._torch.attention_backend.vanilla import (
-    VanillaAttentionMetadata, generate_causal_mask, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig as KvCacheConfigCpp
@@ -19,19 +14,34 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .interface import VanillaSparseAttention
+
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 
-class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :,
+                                  None, :, :].expand(batch, num_key_value_heads,
+                                                     n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen,
+                                 head_dim)
 
-    def __repr__(self):
-        base_repr = super().__repr__()
-        return base_repr
 
+class RocketVanillaAttention(VanillaSparseAttention):
+    """
+    RocketKV sparse attention implementation.
 
-class RocketVanillaAttention(AttentionBackend[RocketVanillaAttentionMetadata]):
-
-    Metadata = RocketVanillaAttentionMetadata
+    This implementation focuses on KV cache index management:
+    - Context phase: Only write indices (no calc indices needed)
+    - Generation phase: Both calc and write indices with RocketKV selection
+    """
 
     _access_type = {
         1: torch.int8,
@@ -55,6 +65,7 @@ class RocketVanillaAttention(AttentionBackend[RocketVanillaAttentionMetadata]):
                          num_kv_heads=num_kv_heads,
                          quant_config=quant_config,
                          q_scaling=q_scaling,
+                         sparse_attention_config=sparse_attention_config,
                          **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.topr = sparse_attention_config.topr
@@ -64,43 +75,32 @@ class RocketVanillaAttention(AttentionBackend[RocketVanillaAttentionMetadata]):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
-                                        cache_idx, cache_position):
-        k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(
-            0)  # (1, num_heads, seq_len, head_dim)
-        v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(
-            0)  # (1, num_heads, seq_len, head_dim)
-
-        if k is not None and v is not None:
-            access_type = self._access_type[k.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(
-                2, cache_position, k.view(dtype=access_type)
-            )  # (1, num_heads, seq_len, head_dim) why it's index 2
-            v_out.view(dtype=access_type).index_copy_(2, cache_position,
-                                                      v.view(dtype=access_type))
-
-        return k_out[:, :, :seq_len, :], v_out[:, :, :seq_len, :]
-
     def _single_request_update_kt_cache(self, k, kt_cache_tensor, seq_len,
                                         cache_idx, cache_position):
-        k_out = kt_cache_tensor[cache_idx, :, :, :].unsqueeze(
-            0)  # (1, num_kv_heads, head_dim, num_page)
+        """Update KT cache for RocketKV algorithm."""
+        # TODO: fix this cache index
+        k_out = kt_cache_tensor[0, :, :, :].unsqueeze(
+            0)  # (1, num_kv_heads, head_dim + head_dim, num_page)
 
+        # k: (1, num_kv_heads, seq_len, head_dim)
         if k is not None:
             padding_len = self.page_size - (
                 (k.size(2) - 1) % self.page_size + 1)
-            k_min = torch.cat([
-                k,
-                torch.full((k.size(0), k.size(1), padding_len, k.size(3)),
-                           float('inf'),
-                           device=k.device,
-                           dtype=k.dtype)
-            ],
-                              dim=2)
-            k_min = k_min.reshape(k_min.size(0), k_min.size(1),
-                                  k_min.size(2) // self.page_size,
-                                  self.page_size,
-                                  k_min.size(3)).amin(dim=-2).transpose(-1, -2)
+            k_min = torch.cat(
+                [
+                    k,
+                    torch.full((k.size(0), k.size(1), padding_len, k.size(3)),
+                               float('inf'),
+                               device=k.device,
+                               dtype=k.dtype)
+                ],
+                dim=2)  # (1, num_kv_heads, seq_len+padding_len, head_dim)
+            k_min = k_min.reshape(
+                k_min.size(0), k.size(1),
+                k_min.size(2) // self.page_size, self.page_size, k_min.size(3)
+            ).amin(dim=-2).transpose(
+                -1, -2
+            )  # (1, num_kv_heads, num_pages, head_dim)->(1, num_kv_heads, head_dim, num_pages)
             k_max = torch.cat([
                 k,
                 torch.full((k.size(0), k.size(1), padding_len, k.size(3)),
@@ -109,7 +109,7 @@ class RocketVanillaAttention(AttentionBackend[RocketVanillaAttentionMetadata]):
                            dtype=k.dtype)
             ],
                               dim=2)
-            k_max = k_max.reshape(k_max.size(0), k_max.size(1),
+            k_max = k_max.reshape(k_max.size(0), k.size(1),
                                   k_max.size(2) // self.page_size,
                                   self.page_size,
                                   k_max.size(3)).amax(dim=-2).transpose(-1, -2)
@@ -125,269 +125,183 @@ class RocketVanillaAttention(AttentionBackend[RocketVanillaAttentionMetadata]):
 
         return k_out[:, :, :, :seq_len // self.page_size]
 
-    def _single_request_forward(self, q, k, v, attention_mask: AttentionMask,
-                                kv_cache_tensor, kt_cache_tensor,
-                                past_seen_token, cache_idx):
+    def single_request_sparse_kv_predict(self, q: Optional[Tensor],
+                                         k: Optional[Tensor],
+                                         v: Optional[Tensor],
+                                         metadata: "VanillaAttentionMetadata",
+                                         past_seen_token: int, cache_idx: int,
+                                         **kwargs) -> Optional[Tensor]:
+        """
+        Predict KV indices for writing new key/value pairs.
 
-        bsz = 1
-        q_len = q.size(0)
-        # print(q.shape, k.shape, v.shape)
-        is_decode = (q_len == 1)
+        Returns the actual indices to use from the input k,v tensors.
+        For RocketKV:
+        - Context phase: Returns SnapKV selected indices from input sequence
+        - Generation phase: Returns all indices (sequential)
+        """
+        if k is None or v is None:
+            return None
 
-        # Query
-        q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Generation phase: Use all tokens
+        if k.size(2) == 1:
+            shape = (k.size(0), k.size(1), 1, k.size(-1))
+            return torch.zeros(shape, device=k.device, dtype=torch.int64)
 
-        # Key and Value
-        target_seq_len = past_seen_token
-        # print(f'past_seen_token: {past_seen_token}')
-        if k is not None and v is not None:
-            kv_len = k.size(0)
-            k = k.view(bsz, kv_len, self.num_kv_heads,
-                       self.head_dim).transpose(1, 2)
-            v = v.view(bsz, kv_len, self.num_kv_heads,
-                       self.head_dim).transpose(1, 2)
+        # Context phase: Use SnapKV selection
+        selected_indices = self._get_snapkv_indices(q, k)
 
-            if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
-            ):
-                qc = self.quant_config
-                if qc.layer_quant_mode.has_fp8_kv_cache():
-                    assert kv_cache_tensor.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache_tensor.dtype}"
-                    k = k.to(torch.float8_e4m3fn)
-                    v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
-
-        if not is_decode:
-            q_obs = q[:, :, -self.
-                      window_size:]  # (1, num_heads, window_size, head_dim)
-            k_pre = repeat_kv(
-                k[:, :, :-self.window_size], self.num_key_value_groups
-            )  # (1, num_heads, seq_len-window_size, num_kv_heads, head_dim)
-            # print(q.shape, k.shape, q_obs.shape, k_pre.shape)
-            score = torch.matmul(q_obs, k_pre.transpose(-1, -2)) / math.sqrt(
-                self.head_dim
-            )  # (1, num_heads, window_size, seq_len-window_size)
-            score = torch.nn.functional.softmax(score, dim=-1).sum(
-                dim=-2)  # (1, num_heads, window_size)
-            score = score.view(bsz, self.num_kv_heads,
-                               self.num_key_value_groups,
-                               -1).sum(dim=2)  # (1, num_kv_heads, window_size)
-            # print(score.shape, kernel_size)
-            score = torch.nn.functional.max_pool1d(score,
-                                                   kernel_size=self.kernel_size,
-                                                   padding=self.kernel_size //
-                                                   2,
-                                                   stride=1)
-            indices = score.topk(self.prompt_budget - self.window_size,
-                                 dim=-1).indices.sort().values
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-            k_compress = k[:, :, :-self.window_size].gather(dim=2,
-                                                            index=indices)
-            v_compress = k[:, :, :-self.window_size].gather(dim=2,
-                                                            index=indices)
-            k_snap = torch.cat([k_compress, k[:, :, -self.window_size:]], dim=2)
-            v_snap = torch.cat([v_compress, v[:, :, -self.window_size:]], dim=2)
-
-            target_seq_len += k_snap.size(2)
-            kt_cache_position = torch.arange(
-                math.ceil(past_seen_token / self.page_size),
-                math.ceil(target_seq_len / self.page_size),
-                device=q.device)
-
-            self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
-                                                 target_seq_len, self.page_size,
-                                                 cache_idx, kt_cache_position)
-
-            cache_position = torch.arange(past_seen_token,
-                                          target_seq_len,
-                                          device=q.device)
-
-            self._single_request_update_kv_cache(k_snap, v_snap,
-                                                 kv_cache_tensor,
-                                                 target_seq_len, cache_idx,
-                                                 cache_position)
-            key_states, value_states = k, v
-        else:
-            target_seq_len += k.size(2)
-            # print(f'target_seq_len: {target_seq_len}')
-
-            # Update cache positions
-            kt_cache_position = torch.arange(
-                math.ceil(past_seen_token / self.page_size),
-                math.ceil(target_seq_len / self.page_size),
-                device=q.device)
-            cache_position = torch.arange(past_seen_token,
-                                          target_seq_len,
-                                          device=q.device)
-
-            # Update KT cache and get KT states
-            kt_states = self._single_request_update_kt_cache(
-                k, kt_cache_tensor, target_seq_len, cache_idx,
-                kt_cache_position)
-
-            # Update KV cache and get key/value states
-            key_states, value_states = self._single_request_update_kv_cache(
-                k, v, kv_cache_tensor, target_seq_len, cache_idx,
-                cache_position)
-
-            # Helper functions for sparse attention
-            def _gather(t: Tensor, dim: int, i: Tensor) -> Tensor:
-                dim += (dim < 0) * t.ndim
-                return t.gather(
-                    dim,
-                    i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1:]))
-
-            @torch.compile(disable=not torch.cuda.is_available())
-            def _scaled_softmax(x: Tensor, divscale: Tensor | float,
-                                dim: int) -> Tensor:
-                return torch.softmax(x / divscale, dim=dim)
-
-            # Reshape query for multi-head processing
-            qi = q.view(bsz, self.num_kv_heads,
-                        self.num_heads // self.num_kv_heads, q_len,
-                        self.head_dim)
-            qi_abs = torch.abs(qi)
-
-            # print(f'qi.shape: {qi.shape}')
-            # Top-r selection on query features
-            i1 = torch.topk(qi_abs.sum(dim=2, keepdim=True), self.topr,
-                            dim=-1).indices
-            # print(f'i1.shape: {i1.shape}, i1: {i1}')
-            qi_hat = _gather(qi, -1, i1)
-            # print(f'qi_hat.shape: {qi_hat.shape}')
-
-            # Generate signed indices for key-token matching
-            i1_sign = torch.where(
-                qi_hat.sum(dim=2, keepdim=True) > 0, i1 + self.head_dim,
-                i1).transpose(-1, -2)
-
-            # Gather key tokens and compute attention scores
-            # print(f'i1_sign.shape: {i1_sign.shape}')
-            # print(f'kt_states.shape: {kt_states.shape}')
-            kt_hat = _gather(kt_states.unsqueeze(2), -2, i1_sign)
-            # print(f'after gather, kt_hat.shape: {kt_hat.shape}')
-            qk_hat = qi_hat @ kt_hat
-            # print(f'qk_hat.shape: {qk_hat.shape}')
-            qk_hat = qk_hat.repeat_interleave(
-                self.page_size, dim=-1)[:, :, :, :, :target_seq_len]
-            # print(f'after repeat, qk_hat.shape: {qk_hat.shape}')
-            # Compute scaling factor for attention scores
-            scale = torch.sqrt(self.head_dim *
-                               torch.abs(qi_hat).sum(dim=-1, keepdim=True) /
-                               qi_abs.sum(dim=-1, keepdim=True))
-
-            # Apply scaled softmax
-            s_hat = _scaled_softmax(qk_hat, scale, dim=-1)
-
-            # Top-k selection on attention scores
-            topk = min(self.topk, target_seq_len)
-            # print(f's_hat.shape: {s_hat.shape}, topk: {topk}')
-            i2 = torch.topk(s_hat.sum(dim=2), topk, dim=-1).indices
-            iKV = i2[..., 0, :, None]
-
-            # Gather final key and value states
-            key_states = _gather(key_states, -2, iKV)
-            value_states = _gather(value_states, -2, iKV)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # Attention Mask
-        is_causal = False
-        attn_mask = None
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
-            if past_seen_token == 0:
-                is_causal = True
-            elif q_len != 1:
-                # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
-                attn_mask = generate_causal_mask(bsz, target_seq_len,
-                                                 cache_position, q.device)
-        elif attention_mask == PredefinedAttentionMask.FULL:
-            pass
-        else:
-            raise ValueError("Unexpected attention mask type")
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            key_states,
-            value_states,
-            is_causal=is_causal,
-            attn_mask=attn_mask,
-        )
-
-        attn_output = attn_output.squeeze(
-            0)  # (1, num_heads, seq_len, head_dim)
-        return attn_output
-
-    def forward(self,
-                q: torch.Tensor,
-                k: Optional[torch.Tensor],
-                v: Optional[torch.Tensor],
-                metadata: RocketVanillaAttentionMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-                **kwargs) -> torch.Tensor:
-        if metadata.kv_cache_manager is None:
-            # NOTE: WAR for no kv cache attn e.g. BERT,
-            # try to separate the kv cache estimation path from no kv cache attn.
-            num_heads = self.num_heads
-            num_kv_heads = self.num_kv_heads
-            return RocketVanillaAttention.no_kv_cache_forward(
-                q=q,
-                k=k,
-                v=v,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                metadata=metadata,
-                attention_mask=attention_mask)
-
-        past_seen_tokens = metadata.kv_cache_manager.past_seen_tokens
-        cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
-        ]
-        kv_cache_tensor = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        k_snap = k.gather(2, selected_indices)
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
-        q_len = q.size(0)
+        target_seq_len = past_seen_token + k_snap.size(2)
+        kt_cache_position = torch.arange(
+            math.ceil(past_seen_token / self.page_size),
+            math.ceil(target_seq_len / self.page_size),
+            device=q.device)
+        self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
+                                             target_seq_len, cache_idx,
+                                             kt_cache_position)
 
-        assert len(cache_indices) == metadata.seq_lens.nelement()
+        return selected_indices
 
-        offset = 0
-        offset_kv = 0
-        attn_outputs = []
-        for i, (seq_len, seq_len_kv) in enumerate(
-                zip(metadata.seq_lens, metadata.seq_lens_kv)):
-            # print(f'seq_len: {seq_len}, seq_len_kv: {seq_len_kv}, metadata.seq_lens: {metadata.seq_lens}, metadata.seq_lens_kv: {metadata.seq_lens_kv}')
-            single_q = q[offset:offset + seq_len]
-            single_k = k[
-                offset_kv:offset_kv +
-                seq_len_kv] if k is not None and seq_len_kv != 0 else None
-            single_v = v[
-                offset_kv:offset_kv +
-                seq_len_kv] if k is not None and seq_len_kv != 0 else None
-            if i < metadata.num_contexts:
-                past_seen_token = 0
-                past_seen_tokens.append(past_seen_token)
-            else:
-                past_seen_token = past_seen_tokens[i]
-            cache_idx = cache_indices[i]
+    def _get_snapkv_indices(self, q: Tensor, k: Tensor) -> Tensor:
+        """Get SnapKV selected indices from the input sequence for context phase."""
+        bsz = 1
+        seq_len = k.size(2)
 
-            attn_output = self._single_request_forward(
-                single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                kt_cache_tensor, past_seen_token, cache_idx)
-            attn_outputs.append(attn_output)
-            if i < metadata.num_contexts:
-                past_seen_tokens[i] = self.prompt_budget
-            else:
-                past_seen_tokens[i] += 1
+        if seq_len <= self.prompt_budget:
+            return torch.arange(
+                seq_len,
+                device=k.device).unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(
+                    bsz, self.num_kv_heads, -1, self.head_dim)
 
-            offset += seq_len
-            offset_kv += seq_len_kv
+        # Use last window_size tokens as observation
+        q_obs = q[:, :, -self.
+                  window_size:]  # (1, num_kv_heads, window_size, head_dim)
+        k_pre = repeat_kv(k[:, :, :-self.window_size], self.num_key_value_groups
+                          )  # (1, num_heads, seq_len-window_size, head_dim)
 
-        attn_output = torch.cat(attn_outputs, dim=1)
-        attn_output = attn_output.transpose(0, 1).contiguous()
-        attn_output = attn_output.view(q_len, -1)
+        # Compute attention scores
+        score = torch.matmul(q_obs, k_pre.transpose(-1, -2)) / math.sqrt(
+            self.head_dim)
+        score = torch.nn.functional.softmax(score, dim=-1).sum(dim=-2)
+        score = score.view(bsz, self.num_kv_heads, self.num_key_value_groups,
+                           -1).sum(dim=2)
+        score = torch.nn.functional.max_pool1d(score,
+                                               kernel_size=self.kernel_size,
+                                               padding=self.kernel_size // 2,
+                                               stride=1)
 
-        return attn_output
+        # Select top important tokens from prefix
+        prefix_len = seq_len - self.window_size
+        selected_prefix_indices = score.topk(self.prompt_budget -
+                                             self.window_size,
+                                             dim=-1).indices.sort().values
+
+        # Combine selected prefix indices with window indices
+        window_indices = torch.arange(
+            prefix_len, seq_len,
+            device=k.device).unsqueeze(0).unsqueeze(0).expand(
+                bsz, self.num_kv_heads, -1)
+        selected_indices = torch.cat([selected_prefix_indices, window_indices],
+                                     dim=-1)
+
+        return selected_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+
+    def single_request_sparse_attn_predict(self, q: Tensor, k: Optional[Tensor],
+                                           v: Optional[Tensor],
+                                           metadata: "VanillaAttentionMetadata",
+                                           past_seen_token: int, cache_idx: int,
+                                           **kwargs) -> Optional[Tensor]:
+        """
+        Predict KV cache indices for attention calculation.
+
+        For RocketKV:
+        - Context phase: Returns None (no calc indices needed, use full attention)
+        - Generation phase: Returns RocketKV selected indices for sparse attention
+        """
+        if k is None or v is None:
+            return None
+
+        # Context phase: No calc indices needed (use full attention)
+        if q.size(2) > 1:
+            return None
+
+        # Get RocketKV selected indices
+        calc_indices = self._rocketkv_selection(q, k, metadata, past_seen_token,
+                                                cache_idx)
+        return calc_indices
+
+    def _rocketkv_selection(self, q: Tensor, k: Tensor,
+                            metadata: "VanillaAttentionMetadata",
+                            past_seen_token: int, cache_idx: int) -> Tensor:
+        """Implement RocketKV's two-stage selection process for generation phase."""
+        bsz = 1
+        q_len = q.size(2)
+
+        # Helper functions
+        def _gather(t: Tensor, dim: int, i: Tensor) -> Tensor:
+            dim += (dim < 0) * t.ndim
+            return t.gather(
+                dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1:]))
+
+        @torch.compile(disable=not torch.cuda.is_available())
+        def _scaled_softmax(x: Tensor, divscale: Tensor | float,
+                            dim: int) -> Tensor:
+            return torch.softmax(x / divscale, dim=dim)
+
+        # Get KT cache for key-token matching
+        kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
+            self.layer_idx)
+        target_seq_len = past_seen_token + 1  # +1 for current token
+
+        # Update KT cache
+        kt_cache_position = torch.arange(
+            math.ceil(past_seen_token / self.page_size),
+            math.ceil(target_seq_len / self.page_size),
+            device=q.device)
+        kt_states = self._single_request_update_kt_cache(
+            k, kt_cache_tensor, target_seq_len, cache_idx, kt_cache_position)
+
+        # Reshape query for multi-head processing
+        qi = q.view(bsz, self.num_kv_heads, self.num_heads // self.num_kv_heads,
+                    q_len, self.head_dim)
+        qi_abs = torch.abs(qi)
+
+        # Top-r selection on query features
+        i1 = torch.topk(qi_abs.sum(dim=2, keepdim=True), self.topr,
+                        dim=-1).indices
+        qi_hat = _gather(qi, -1, i1)
+
+        # print(f'qi_hat.shape: {qi_hat.shape}')
+
+        # Generate signed indices for key-token matching
+        i1_sign = torch.where(
+            qi_hat.sum(dim=2, keepdim=True) > 0, i1 + self.head_dim,
+            i1).transpose(-1, -2)
+
+        # Gather key tokens and compute attention scores
+        kt_hat = _gather(kt_states.unsqueeze(2), -2, i1_sign)
+        # print(f'kt_hat.shape: {kt_hat.shape}')
+        qk_hat = qi_hat @ kt_hat
+        # print(f'qk_hat.shape: {qk_hat.shape}')
+        qk_hat = qk_hat.repeat_interleave(self.page_size,
+                                          dim=-1)[:, :, :, :, :target_seq_len]
+        # print(f'target_seq_len={target_seq_len}, qk_hat.shape: {qk_hat.shape}')
+        # Compute scaling factor for attention scores
+        scale = torch.sqrt(self.head_dim *
+                           torch.abs(qi_hat).sum(dim=-1, keepdim=True) /
+                           qi_abs.sum(dim=-1, keepdim=True))
+
+        # Apply scaled softmax
+        s_hat = _scaled_softmax(qk_hat, scale, dim=-1)
+
+        # Top-k selection on attention scores
+        topk = min(self.topk, target_seq_len)
+        i2 = torch.topk(s_hat.sum(dim=2), topk, dim=-1).indices
+        iKV = i2[..., 0, :, None]
+
+        return iKV.squeeze(-1)
 
 
 class RocketKVCacheManager(KVCacheManager):

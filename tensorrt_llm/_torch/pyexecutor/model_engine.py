@@ -360,8 +360,7 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
-        self.attn_backend = get_attention_backend(
-            attn_backend, sparse_attn_config=sparse_attention_config)
+        self.attn_backend = get_attention_backend(attn_backend)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -754,7 +753,8 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
+                enable_paged_context_mla=enable_paged_context_mla,
+                sparse_attention_config=self.sparse_attention_config)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -770,7 +770,8 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla)
+            enable_paged_context_mla=enable_paged_context_mla,
+            sparse_attention_config=self.sparse_attention_config)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -953,6 +954,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            sparse_attention_config=self.sparse_attention_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
