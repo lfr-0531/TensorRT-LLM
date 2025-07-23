@@ -13,7 +13,8 @@ except ImportError:
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
-from .sparse import (get_vanilla_sparse_attn_backend, get_vanilla_sparse_attn_metadata)
+from .sparse import (get_vanilla_sparse_attn_backend,
+                     get_vanilla_sparse_attn_metadata)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -138,8 +139,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             v_out.view(dtype=access_type).index_copy_(1, cache_position,
                                                       v.view(dtype=access_type))
 
-        return k_out[:, :seq_len, :, :], v_out[:, :
-                                               seq_len, :, :], cache_position
+        return cache_position
 
     def single_request_attn_forward(self,
                                     q,
@@ -245,13 +245,19 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                     v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
+        key_states = torch.concat(
+            [kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0), k], dim=1)
+        value_states = torch.concat(
+            [kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0), v], dim=1)
+
+        sparse_indices, sparse_kv_indices = None, None
         if self.sparse_attn is not None:
             sparse_indices = self.sparse_attn.single_request_sparse_attn_predict(
                 q, k, v, metadata, past_seen_token, cache_idx)
             sparse_kv_indices = self.sparse_attn.single_request_sparse_kv_predict(
                 q, k, v, metadata, past_seen_token, cache_idx)
 
-        key_states, value_states, cache_position = self._single_request_update_kv_cache(
+        cache_position = self._single_request_update_kv_cache(
             k, v, kv_cache_tensor, target_seq_len, cache_idx, past_seen_token,
             sparse_kv_indices)
 
