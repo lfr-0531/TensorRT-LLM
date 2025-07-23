@@ -50,7 +50,7 @@ def parse_arguments():
     parser.add_argument(
         "--max_num_tokens",
         type=int,
-        default=10000,
+        default=8192,
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
@@ -82,7 +82,8 @@ def main():
     )
     sparse_attention_config = RocketSparseAttentionConfig(
         window_size=32,
-        kernel_size=63,
+        kernel_size=7,
+        prompt_budget=2048,
     )
     # Model could accept HF model name, a path to local HF model,
     # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.

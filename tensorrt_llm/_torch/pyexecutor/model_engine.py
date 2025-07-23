@@ -279,7 +279,6 @@ class PyTorchModelEngine(ModelEngine):
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        self.is_sparse_attention = sparse_attention_config is not None
         self.sparse_attention_config = sparse_attention_config
         self.is_draft_model = is_draft_model
 
@@ -634,6 +633,9 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == 'star_attention':
             return
 
+        # TODO: current warmup_request is not suitable for rocket kv
+        return
+
         with contextlib.ExitStack() as stack:
             if self._torch_compile_enabled:
 
@@ -953,6 +955,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
+            sparse_attention_config=self.sparse_attention_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             **kwargs)
 
