@@ -66,11 +66,11 @@ def parse_arguments():
     return args
 
 
-example_prompts = [
-    "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
-]
+# example_prompts = [
+#     "Hello, my name is",
+#     "The capital of France is",
+#     "The future of AI is",
+# ]
 
 
 def main():
