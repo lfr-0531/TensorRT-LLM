@@ -119,10 +119,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                         past_seen_token,
                                         sparse_kv_indices=None):
         if sparse_kv_indices is not None:
-            k = k.gather(2, sparse_kv_indices)
-            v = v.gather(2, sparse_kv_indices)
+            k = k.gather(1, sparse_kv_indices)
+            v = v.gather(1, sparse_kv_indices)
             cache_position = torch.arange(past_seen_token,
-                                          past_seen_token + k.size(2),
+                                          past_seen_token + k.size(1),
                                           device=k.device)
         else:
             cache_position = torch.arange(past_seen_token,
@@ -154,19 +154,13 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                     **kwargs):
         bsz, num_heads, q_len, head_dim = q.shape
 
-        key_states = key_states.transpose(1, 2).to(q.dtype)
-        value_states = value_states.transpose(1, 2).to(q.dtype)
-
         if sparse_indices is not None:
             # Gather the selected indices
-            key_states = key_states.gather(
-                2,
-                sparse_indices.unsqueeze(-1).expand(-1, -1, -1,
-                                                    key_states.size(-1)))
-            value_states = value_states.gather(
-                2,
-                sparse_indices.unsqueeze(-1).expand(-1, -1, -1,
-                                                    value_states.size(-1)))
+            key_states = key_states.gather(1, sparse_indices)
+            value_states = value_states.gather(1, sparse_indices)
+
+        key_states = key_states.transpose(1, 2).to(q.dtype)
+        value_states = value_states.transpose(1, 2).to(q.dtype)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -230,11 +224,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # Key and Value
         target_seq_len = past_seen_token
+        kv_len = 0
         if k is not None and v is not None:
             kv_len = k.size(0)
             k = k.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
             v = v.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
-            target_seq_len += kv_len
 
             if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
             ):
@@ -245,10 +239,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                     v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
-        key_states = torch.concat(
-            [kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0), k], dim=1)
-        value_states = torch.concat(
-            [kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0), v], dim=1)
+        key_states = torch.concat([
+            kv_cache_tensor[cache_idx, 0, :past_seen_token, :, :].unsqueeze(0),
+            k
+        ],
+                                  dim=1)
+        value_states = torch.concat([
+            kv_cache_tensor[cache_idx, 1, :past_seen_token, :, :].unsqueeze(0),
+            v
+        ],
+                                    dim=1)
 
         sparse_indices, sparse_kv_indices = None, None
         if self.sparse_attn is not None:
@@ -256,7 +256,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 q, k, v, metadata, past_seen_token, cache_idx)
             sparse_kv_indices = self.sparse_attn.single_request_sparse_kv_predict(
                 q, k, v, metadata, past_seen_token, cache_idx)
+            kv_len = sparse_indices.size(1)
 
+        target_seq_len += kv_len
         cache_position = self._single_request_update_kv_cache(
             k, v, kv_cache_tensor, target_seq_len, cache_idx, past_seen_token,
             sparse_kv_indices)

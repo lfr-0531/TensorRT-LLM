@@ -1,4 +1,5 @@
-from .rocket import RocketKVCacheManager, RocketVanillaAttention
+from .rocket import (RocketKVCacheManager, RocketVanillaAttention,
+                     RocketVanillaAttentionMetadata)
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -52,7 +53,8 @@ def get_vanilla_sparse_attn_metadata(
     if sparse_attn_config is None:
         return None
     if sparse_attn_config.algorithm == "rocket":
-        return None
+        return RocketVanillaAttentionMetadata(
+            sparse_attn_config=sparse_attn_config)
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in vanilla attention metadata: {sparse_attn_config.algorithm}"

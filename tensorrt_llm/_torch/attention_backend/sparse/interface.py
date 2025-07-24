@@ -11,6 +11,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 class SparseAttentionMetadata:
     """Base metadata class for sparse attention algorithms."""
 
+    sparse_attn_config: Optional["SparseAttentionConfig"] = None
+
     def __post_init__(self):
         pass
 

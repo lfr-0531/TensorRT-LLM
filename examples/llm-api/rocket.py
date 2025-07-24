@@ -41,7 +41,7 @@ def parse_arguments():
                         help="The maximum sequence length.")
     parser.add_argument("--max_batch_size",
                         type=int,
-                        default=1,
+                        default=4,
                         help="The maximum batch size.")
     parser.add_argument("--max_new_tokens",
                         type=int,
@@ -57,15 +57,19 @@ def parse_arguments():
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
-    parser.add_argument('--disable_kv_cache_reuse',
-                        default=False,
-                        action='store_true')
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
 
-    parser.add_argument('--num_samples', type=int, default=1)
+    parser.add_argument('--num_samples', type=int, default=3)
 
     args = parser.parse_args()
     return args
+
+
+example_prompts = [
+    "Hello, my name is",
+    "The capital of France is",
+    "The future of AI is",
+]
 
 
 def main():
@@ -76,13 +80,15 @@ def main():
     data = data[:num_samples]
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=not args.disable_kv_cache_reuse,
+        enable_block_reuse=
+        False,  # sparse attention does not support kv cache reuse now
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
     )
     sparse_attention_config = RocketSparseAttentionConfig(
         window_size=32,
         kernel_size=63,
+        prompt_budget=2048,
     )
     # Model could accept HF model name, a path to local HF model,
     # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.
@@ -93,19 +99,15 @@ def main():
               sparse_attention_config=sparse_attention_config,
               max_batch_size=args.max_batch_size,
               max_seq_len=args.max_seq_len,
-              max_num_tokens=args.max_num_tokens)
-
-    # Sample prompts.
-    # prompts = [
-    #     "Hello, my name is",
-    #     "The capital of France is",
-    #     "The future of AI is",
-    # ]
+              max_num_tokens=args.max_num_tokens,
+              cuda_graph_config=None)
 
     prompts = []
+    reference = []
     for sample in data:
         prompts.append(
             {'prompt': sample['input_context'] + sample['input_query']})
+        reference.append(sample['outputs'])
 
     # Create a sampling params.
     sampling_params = SamplingParams(add_special_tokens=False,
@@ -113,9 +115,10 @@ def main():
                                      temperature=0.8,
                                      top_p=0.95)
 
-    for output in llm.generate(prompts, sampling_params):
+    outputs = llm.generate(prompts, sampling_params)
+    for idx, output in enumerate(outputs):
         print(
-            f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}"
+            f'Prompt: {prompts[idx]}, Generated text: {output.outputs[0].text!r}'
         )
 
     # Got output like
