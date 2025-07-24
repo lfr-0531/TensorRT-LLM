@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -80,7 +80,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         """Update KT cache for RocketKV algorithm."""
         # TODO: fix this cache index
         k_out = kt_cache_tensor[0, :, :, :].unsqueeze(
-            0)  # (1, num_kv_heads, head_dim + head_dim, num_page)
+            0)  # (1, num_kv_heads, 2*head_dim, num_pages_per_block)
 
         # k: (1, seq_len, num_kv_heads, head_dim)
         if k is not None:
@@ -124,7 +124,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
             k_out.view(dtype=access_type).index_copy_(
                 -1, cache_position, k_value.view(dtype=access_type))
 
-        return k_out[:, :, :, :seq_len // self.page_size]
+        return k_out[:, :, :, :math.ceil(seq_len / self.page_size)]
 
     def single_request_sparse_kv_predict(self, q: Optional[Tensor],
                                          k: Optional[Tensor],
@@ -227,7 +227,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         """
         if k is None or v is None:
             return None
-        
+
         # all new kv indices needed for attention calculation
         kv_indices = torch.arange(
             past_seen_token, past_seen_token + k.size(1),
@@ -241,7 +241,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         # Get RocketKV selected indices
         calc_indices = self._rocketkv_selection(q, k, metadata, past_seen_token,
                                                 cache_idx)
-        
+
         # decode phase: concat the new kv indices with the kv cache calc indices
         return torch.cat([kv_indices, calc_indices], dim=1)
 
@@ -363,20 +363,61 @@ class RocketKVCacheManager(KVCacheManager):
         self.page_size = sparse_attn_config.page_size
 
         # initialize kt cache
-        kt_cache_shape = (num_layers, max_batch_size, num_kv_heads, head_dim,
-                          math.ceil(max_seq_len / self.page_size))
-        self.kt_cache = torch.cat([
-            torch.full(kt_cache_shape,
-                       float('inf'),
-                       device="cuda",
-                       dtype=torch.bfloat16),
-            torch.full(kt_cache_shape,
-                       float('-inf'),
-                       device="cuda",
-                       dtype=torch.bfloat16)
-        ],
-                                  dim=-2).contiguous()
-        # self.past_seen_tokens = []
+        num_blocks = self.impl.max_num_blocks
+
+        self.kt_cache = {}
+        for layer_idx in range(self.num_local_layers):
+            local_layer_idx = layer_idx
+            num_kv_heads = self.num_kv_heads_per_layer[local_layer_idx]
+
+            kt_cache_shape = (num_blocks, num_kv_heads, head_dim,
+                              math.ceil(max_seq_len / self.page_size))
+
+            self.kt_cache[layer_idx] = torch.cat([
+                torch.full(kt_cache_shape,
+                           float('inf'),
+                           device="cuda",
+                           dtype=torch.bfloat16),
+                torch.full(kt_cache_shape,
+                           float('-inf'),
+                           device="cuda",
+                           dtype=torch.bfloat16)
+            ],
+                                                 dim=-2).contiguous()
+
+        self.active_cache_blocks: Dict[int, List[int]] = {
+        }  # request_id -> list of cache_indices
 
     def get_kt_buffers(self, layer_idx: int):
         return self.kt_cache[layer_idx]
+
+    def prepare_resources(self, scheduled_batch):
+        super().prepare_resources(scheduled_batch)
+
+        for request in scheduled_batch.all_requests():
+            request_id = request.py_request_id
+            if request_id not in self.active_cache_blocks:
+                cache_indices = self.get_cache_indices(request)
+                self.active_cache_blocks[request_id] = cache_indices
+
+                self._clear_kt_cache_blocks(cache_indices)
+
+    def free_resources(self, request):
+        request_id = request.py_request_id
+
+        if request_id in self.active_cache_blocks:
+            cache_indices = self.active_cache_blocks[request_id]
+            self._clear_kt_cache_blocks(cache_indices)
+            del self.active_cache_blocks[request_id]
+
+        super().free_resources(request)
+
+    def _clear_kt_cache_blocks(self, cache_indices: List[int]):
+        for layer_idx in range(self.num_local_layers):
+            kt_cache_tensor = self.kt_cache[layer_idx]
+            for cache_idx in cache_indices:
+                if cache_idx < kt_cache_tensor.shape[0]:
+                    head_dim = kt_cache_tensor.shape[2] // 2
+
+                    kt_cache_tensor[cache_idx, :, :head_dim, :] = float('inf')
+                    kt_cache_tensor[cache_idx, :, head_dim:, :] = float('-inf')

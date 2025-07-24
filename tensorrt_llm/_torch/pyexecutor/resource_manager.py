@@ -130,6 +130,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype

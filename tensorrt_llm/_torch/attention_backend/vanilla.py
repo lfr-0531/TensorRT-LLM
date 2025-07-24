@@ -245,10 +245,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                     v = v.to(torch.float8_e4m3fn)
             assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
-        key_states = torch.concat(
-            [kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0), k], dim=1)
-        value_states = torch.concat(
-            [kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0), v], dim=1)
+        key_states = torch.concat([
+            kv_cache_tensor[cache_idx, 0, :past_seen_token, :, :].unsqueeze(0),
+            k
+        ],
+                                  dim=1)
+        value_states = torch.concat([
+            kv_cache_tensor[cache_idx, 1, :past_seen_token, :, :].unsqueeze(0),
+            v
+        ],
+                                    dim=1)
 
         sparse_indices, sparse_kv_indices = None, None
         if self.sparse_attn is not None:
