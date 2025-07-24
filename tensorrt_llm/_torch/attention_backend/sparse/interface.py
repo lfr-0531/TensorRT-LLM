@@ -98,6 +98,9 @@ class VanillaSparseAttention(VanillaAttention):
             if past_seen_token == 0:
                 is_causal = True
             elif q_len != 1:
+                cache_position = torch.arange(past_seen_token,
+                                              target_seq_len,
+                                              device=q.device)
                 # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
                 attn_mask = generate_causal_mask(bsz, target_seq_len,
                                                  cache_position, q.device)

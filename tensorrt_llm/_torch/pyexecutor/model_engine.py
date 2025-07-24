@@ -756,7 +756,8 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
+                enable_paged_context_mla=enable_paged_context_mla,
+                sparse_attention_config=self.sparse_attention_config)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -772,7 +773,8 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla)
+            enable_paged_context_mla=enable_paged_context_mla,
+            sparse_attention_config=self.sparse_attention_config)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -1300,6 +1302,10 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_ids.append(past_seen_token_num)
+
+                if self.sparse_attention_config is not None:
+                    past_seen_token_num = past_seen_token_num - request.py_prompt_len + attn_metadata.prompt_budget
+
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)

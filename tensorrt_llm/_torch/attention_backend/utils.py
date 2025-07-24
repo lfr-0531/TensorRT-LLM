@@ -80,7 +80,6 @@ def create_attention(
         layer_idx,
         num_heads,
         head_dim,
-        sparse_attention_config,
         num_kv_heads=num_kv_heads,
         quant_config=quant_config,
         q_scaling=q_scaling,

@@ -130,6 +130,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        sparse_attn_config: Optional["SparseAttentionConfig"] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
