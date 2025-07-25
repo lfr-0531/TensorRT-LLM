@@ -66,11 +66,11 @@ def parse_arguments():
     return args
 
 
-# example_prompts = [
-#     "Hello, my name is",
-#     "The capital of France is",
-#     "The future of AI is",
-# ]
+example_prompts = [
+    "John writes 20 pages a day. How long will it take him to write 3 books that are 400 pages each?",
+    "John orders food for a massive restaurant. He orders 1000 pounds of beef for $8 per pound. He also orders twice that much chicken at $3 per pound. How much did everything cost?",
+    "Sally and Bob have made plans to go on a trip at the end of the year. They both decide to work as babysitters and save half of what they've earned for their trip. If Sally makes $6 per day and Bob makes $4 per day, how much money will they both have saved for their trip after a year?",
+]
 
 
 def main():
@@ -100,7 +100,8 @@ def main():
               sparse_attention_config=sparse_attention_config,
               max_batch_size=args.max_batch_size,
               max_seq_len=args.max_seq_len,
-              max_num_tokens=args.max_num_tokens)
+              max_num_tokens=args.max_num_tokens,
+              cuda_graph_config=None)
 
     # Sample prompts.
     # prompts = [
@@ -122,10 +123,11 @@ def main():
                                      temperature=0.8,
                                      top_p=0.95)
 
+    prompts = example_prompts
     outputs = llm.generate(prompts, sampling_params)
     for idx, output in enumerate(outputs):
         print(
-            f'Prompt: {prompts[idx]}, Generated text: {output.outputs[0].text!r}, reference: {reference[idx]}'
+            f'Prompt: {prompts[idx]}, Generated text: {output.outputs[0].text!r}'
         )
     # Got output like
     # Prompt: 'Hello, my name is', Generated text: '\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming'
