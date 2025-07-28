@@ -67,13 +67,13 @@ class VanillaAttentionMetadata(AttentionMetadata):
             self.sparse_attention_config)
 
     def prepare(self) -> None:
+        if self.sparse_metadata is not None:
+            self.sparse_metadata.prepare(self)
+
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids) if self.kv_cache_manager is not None else None
-
-        if self.sparse_metadata is not None:
-            self.sparse_metadata.prepare()
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):

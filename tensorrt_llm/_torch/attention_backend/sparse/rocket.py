@@ -29,6 +29,15 @@ class RocketVanillaAttentionMetadata(SparseAttentionMetadata):
             raise ValueError("Sparse attention config is not set")
         self.real_prompt_budget = self.sparse_attn_config.prompt_budget
 
+    def prepare(self, metadata: "VanillaAttentionMetadata"):
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        num_requests = num_contexts + num_generations
+
+        for i in range(num_contexts, num_requests):
+            metadata.kv_cache_params.num_cached_tokens_per_seq[
+                i] += self.real_prompt_budget - metadata.prompt_lens[i]
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
