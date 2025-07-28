@@ -166,7 +166,6 @@ def check_sf_layout(sf: torch.Tensor,
 
 
 @nvtx_range("[DG] transform_sf_into_required_layout")
-@torch.compile(dynamic=True)
 def transform_sf_into_required_layout(sf: torch.Tensor,
                                       mn: int,
                                       k: int,
