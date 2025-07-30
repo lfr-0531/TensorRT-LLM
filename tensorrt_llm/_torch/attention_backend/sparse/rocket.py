@@ -73,7 +73,6 @@ class RocketVanillaAttention(VanillaSparseAttention):
                          **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
-    @torch.compile(dynamic=True)
     def _single_request_update_kt_cache(self, k, kt_cache_tensor, seq_len,
                                         cache_idx, cache_position, metadata):
         """Update KT cache for RocketKV algorithm."""
@@ -124,7 +123,6 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         return k_out[:, :, :, :math.ceil(seq_len / metadata.page_size)]
 
-    @torch.compile(dynamic=True)
     def single_request_sparse_kv_predict(self, q: Optional[Tensor],
                                          k: Optional[Tensor],
                                          v: Optional[Tensor],
@@ -164,7 +162,6 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         return selected_indices
 
-    @torch.compile(dynamic=True)
     def _get_snapkv_indices(self, q: Tensor, k: Tensor,
                             metadata: SparseAttentionMetadata) -> Tensor:
         """Get SnapKV selected indices from the input sequence for context phase."""
@@ -217,7 +214,6 @@ class RocketVanillaAttention(VanillaSparseAttention):
                                                      self.head_dim).transpose(
                                                          1, 2)
 
-    @torch.compile(dynamic=True)
     def single_request_sparse_attn_predict(self, q: Tensor, k: Optional[Tensor],
                                            v: Optional[Tensor],
                                            metadata: SparseAttentionMetadata,
@@ -250,7 +246,6 @@ class RocketVanillaAttention(VanillaSparseAttention):
         # decode phase: concat the new kv indices with the kv cache calc indices
         return torch.cat([kv_indices, calc_indices], dim=1)
 
-    @torch.compile(dynamic=True)
     def _rocketkv_selection(self, q: Tensor, k: Tensor,
                             metadata: SparseAttentionMetadata,
                             past_seen_token: int, cache_idx: int) -> Tensor:
