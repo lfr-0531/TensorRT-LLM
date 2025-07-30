@@ -396,8 +396,7 @@ def create_py_executor(
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
-    # TODO: bugs here for rocket sparse attention, cannot estimate kv cache size when seq_len=1
-    estimating_kv_cache = False
+
     if estimating_kv_cache:
         assert kv_cache_creator is not None
         with mem_monitor.observe_creation_stage(

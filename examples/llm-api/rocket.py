@@ -20,7 +20,7 @@ def parse_arguments():
         '--model_path',
         type=str,
         default=
-        "/home/scratch.trt_llm_data/llm-models/llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"
+        "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
     )
     parser.add_argument(
         '--input_file',
@@ -100,7 +100,8 @@ def main():
               max_batch_size=args.max_batch_size,
               max_seq_len=args.max_seq_len,
               max_num_tokens=args.max_num_tokens,
-              cuda_graph_config=None)
+              cuda_graph_config=None,
+              disable_overlap_scheduler=False)
 
     prompts = []
     reference = []
