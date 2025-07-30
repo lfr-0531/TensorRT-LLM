@@ -54,6 +54,7 @@ def parse_arguments():
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
+    parser.add_argument('--tensor_parallel_size', type=int, default=1)
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -100,6 +101,7 @@ def main():
               max_batch_size=args.max_batch_size,
               max_seq_len=args.max_seq_len,
               max_num_tokens=args.max_num_tokens,
+              tensor_parallel_size=args.tensor_parallel_size,
               cuda_graph_config=None,
               disable_overlap_scheduler=False)
 
