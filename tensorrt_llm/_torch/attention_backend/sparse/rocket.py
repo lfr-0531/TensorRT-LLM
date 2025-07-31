@@ -15,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .interface import SparseAttentionMetadata, VanillaSparseAttention
+from .kernel import triton_index_gather
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -164,13 +165,13 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         # Generation phase: Use all tokens
         if k.size(1) == 1:
-            shape = (k.size(0), 1, k.size(2), k.size(-1))
+            shape = (k.size(0), 1, k.size(2))
             return torch.zeros(shape, device=k.device, dtype=torch.int64)
 
         # Context phase: Use SnapKV selection
         selected_indices = self._get_snapkv_indices(q, k, metadata)
 
-        k_snap = k.gather(1, selected_indices)
+        k_snap = triton_index_gather(k, selected_indices)
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
         target_seq_len = past_seen_token + k_snap.size(1)
@@ -196,10 +197,9 @@ class RocketVanillaAttention(VanillaSparseAttention):
 
         if seq_len <= self.prompt_budget:
             metadata.sparse_metadata.real_prompt_budget = seq_len
-            return torch.arange(seq_len, device=k.device).unsqueeze(
-                0).unsqueeze(-1).unsqueeze(-1).expand(bsz, -1,
-                                                      self.num_kv_heads,
-                                                      self.head_dim)
+            return torch.arange(
+                seq_len, device=k.device).unsqueeze(0).unsqueeze(-1).expand(
+                    bsz, -1, self.num_kv_heads)
 
         metadata.sparse_metadata.real_prompt_budget = metadata.sparse_metadata.sparse_attn_config.prompt_budget
         # Use last window_size tokens as observation
@@ -235,9 +235,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         selected_indices = torch.cat([selected_prefix_indices, window_indices],
                                      dim=-1)
 
-        return selected_indices.unsqueeze(-1).expand(-1, -1, -1,
-                                                     self.head_dim).transpose(
-                                                         1, 2)
+        return selected_indices.transpose(1, 2)
 
     def single_request_sparse_attn_predict(self, q: Tensor, k: Optional[Tensor],
                                            v: Optional[Tensor],
@@ -257,8 +255,8 @@ class RocketVanillaAttention(VanillaSparseAttention):
         # all new kv indices needed for attention calculation
         kv_indices = torch.arange(
             past_seen_token, past_seen_token + k.size(1),
-            device=q.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(
-                1, -1, self.num_kv_heads, self.head_dim)
+            device=q.device).unsqueeze(0).unsqueeze(-1).expand(
+                1, -1, self.num_kv_heads)
 
         # Context phase: No calc indices needed (use full attention)
         if q.size(2) > 1:
@@ -340,8 +338,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         # Top-k selection on attention scores
         topk = min(self.topk, target_seq_len)
         i2 = torch.topk(s_hat.sum(dim=2), topk, dim=-1).indices
-        iKV = i2[..., 0, :, None].transpose(1, 2).expand(
-            -1, -1, -1, self.head_dim)  # (1, topk, num_kv_heads, head_dim)
+        iKV = i2[..., 0, :].transpose(1, 2)  # (1, topk, num_kv_heads)
 
         return iKV
 

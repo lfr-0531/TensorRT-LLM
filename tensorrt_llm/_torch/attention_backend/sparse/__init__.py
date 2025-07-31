@@ -1,4 +1,5 @@
 from .interface import SparseAttentionMetadata
+from .kernel import triton_index_gather
 # yapf: disable
 from .utils import (get_flashinfer_sparse_attn_backend,
                     get_flashinfer_sparse_attn_metadata,
@@ -17,4 +18,5 @@ __all__ = [
     "get_flashinfer_sparse_attn_metadata",
     "get_trtllm_sparse_attn_metadata",
     "SparseAttentionMetadata",
+    "triton_index_gather",
 ]

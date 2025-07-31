@@ -14,7 +14,7 @@ except ImportError:
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
 from .sparse import (get_vanilla_sparse_attn_backend,
-                     get_vanilla_sparse_attn_metadata)
+                     get_vanilla_sparse_attn_metadata, triton_index_gather)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -119,8 +119,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                         past_seen_token,
                                         sparse_kv_indices=None):
         if sparse_kv_indices is not None:
-            k = k.gather(1, sparse_kv_indices)
-            v = v.gather(1, sparse_kv_indices)
+            k = triton_index_gather(k, sparse_kv_indices)
+            v = triton_index_gather(v, sparse_kv_indices)
             cache_position = torch.arange(past_seen_token,
                                           past_seen_token + k.size(1),
                                           device=k.device)
@@ -156,8 +156,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         if sparse_indices is not None:
             # Gather the selected indices
-            key_states = key_states.gather(1, sparse_indices)
-            value_states = value_states.gather(1, sparse_indices)
+            key_states = triton_index_gather(key_states, sparse_indices)
+            value_states = triton_index_gather(value_states, sparse_indices)
 
         key_states = key_states.transpose(1, 2).to(q.dtype)
         value_states = value_states.transpose(1, 2).to(q.dtype)
