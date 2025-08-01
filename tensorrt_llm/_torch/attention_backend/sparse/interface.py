@@ -8,6 +8,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..interface import AttentionMask
 from ..vanilla import VanillaAttention, VanillaAttentionMetadata
+from .kernel import triton_index_gather
 
 
 class SparseAttentionMetadata(VanillaAttentionMetadata):
@@ -35,16 +36,19 @@ class VanillaSparseAttention(VanillaAttention):
         8: torch.int64
     }
 
-    def __init__(self,
-                 layer_idx: int,
-                 num_heads: int,
-                 head_dim: int,
-                 num_kv_heads: Optional[int] = None,
-                 quant_config: Optional[QuantConfig] = None,
-                 q_scaling: Optional[float] = None,
-                 **kwargs):
+    def __init__(
+            self,
+            layer_idx: int,
+            num_heads: int,
+            head_dim: int,
+            num_kv_heads: Optional[int] = None,
+            quant_config: Optional[QuantConfig] = None,
+            q_scaling: Optional[float] = None,
+            sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+            **kwargs):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, q_scaling, **kwargs)
+        self.sparse_attention_config = sparse_attention_config
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
     @abstractmethod
@@ -65,6 +69,7 @@ class VanillaSparseAttention(VanillaAttention):
                                          **kwargs) -> Optional[Tensor]:
         pass
 
+    @torch.compile(dynamic=True)
     def single_request_sparse_attn_forward(self, q: Tensor, key_states: Tensor,
                                            value_states: Tensor,
                                            calc_indices: Optional[Tensor],
@@ -77,8 +82,8 @@ class VanillaSparseAttention(VanillaAttention):
 
         if calc_indices is not None:
             # Gather the selected indices
-            key_states = key_states.gather(1, calc_indices)
-            value_states = value_states.gather(1, calc_indices)
+            key_states = triton_index_gather(key_states, calc_indices)
+            value_states = triton_index_gather(value_states, calc_indices)
 
         bsz, num_heads, q_len, head_dim = q.shape
 
@@ -104,8 +109,10 @@ class VanillaSparseAttention(VanillaAttention):
         metadata: Optional[SparseAttentionMetadata] = None
     ) -> Tuple[Tensor, Tensor]:
         # Select tokens from input using returned indices
-        k_selected = k.gather(1, kv_indices) if len(kv_indices) > 0 else k
-        v_selected = v.gather(1, kv_indices) if len(kv_indices) > 0 else v
+        k_selected = triton_index_gather(
+            k, kv_indices) if len(kv_indices) > 0 else k
+        v_selected = triton_index_gather(
+            v, kv_indices) if len(kv_indices) > 0 else v
 
         # Calculate cache write positions
         cache_write_indices = torch.arange(past_seen_token,

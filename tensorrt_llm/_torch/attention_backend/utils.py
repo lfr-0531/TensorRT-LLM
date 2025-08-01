@@ -87,4 +87,5 @@ def create_attention(
         mla_params=mla_params,
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
+        sparse_attention_config=sparse_attention_config,
     )
