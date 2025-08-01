@@ -1303,9 +1303,6 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_ids.append(past_seen_token_num)
 
-                if self.sparse_attention_config is not None:
-                    past_seen_token_num = past_seen_token_num - request.py_prompt_len + attn_metadata.real_prompt_budget
-
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)

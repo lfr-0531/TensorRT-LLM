@@ -127,7 +127,7 @@ class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
         default=None, description="The kernel size for snap KV.")
-    topr: Optional[int] = Field(default=76, description="Top-r")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
     topk: Optional[int] = Field(default=128, description="Top-k")
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
