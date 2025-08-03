@@ -26,7 +26,7 @@ Note that if chunked context is enabled, please set the `max_num_tokens` to be a
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_chunked_attention.png" alt="feat_long_seq_chunked_attention" width="320" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_chunked_attention.png" alt="feat_long_seq_chunked_attention" width="240" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Illustration of chunked attention </em></sub></p>
@@ -43,7 +43,7 @@ Note that chunked attention can only be applied to context requests.
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_sliding_win_attn.png" alt="feat_long_seq_sliding_win_attn" width="320" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_sliding_win_attn.png" alt="feat_long_seq_sliding_win_attn" width="240" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Illustration of sliding window attention </em></sub></p>
@@ -74,7 +74,7 @@ Note that the `Sliding Window Attention` feature doesn't work with beam searchin
 
 <div align="center">
 <figure>
-  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_streamingllm.png" alt="feat_long_seq_streamingllm" width="320" height="auto">
+  <img src="https://github.com/lfr-0531/TensorRT-LLM/raw/user/fanrongl/add_long_seq_doc/docs/source/1.0/features/media/feat_long_seq_streamingllm.png" alt="feat_long_seq_streamingllm" width="240" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Illustration of StreamingLLM </em></sub></p>
