@@ -158,6 +158,7 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.enable_streaingllm = config.enable_streaingllm
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -277,6 +278,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
+            enable_streaingllm=self.enable_streaingllm,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()

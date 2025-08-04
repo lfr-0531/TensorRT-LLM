@@ -92,6 +92,9 @@ class ModelConfig(Generic[TConfig]):
 
     force_dynamic_quantization: bool = False
 
+    # If true, enable StreamingLLM.
+    enable_streaingllm: bool = False
+
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     _frozen: bool = field(default=False, init=False, repr=False)

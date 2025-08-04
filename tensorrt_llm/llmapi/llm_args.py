@@ -2092,6 +2092,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    enable_streaingllm: bool = Field(
+        default=False,
+        description="If true, enable StreamingLLM.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2303,7 +2309,8 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_min_latency=self.enable_min_latency,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy)
+            allreduce_strategy=self.allreduce_strategy,
+            enable_streaingllm=self.enable_streaingllm)
 
 
 def update_llm_args_with_extra_dict(

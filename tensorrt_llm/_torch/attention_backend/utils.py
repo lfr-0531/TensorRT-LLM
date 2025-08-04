@@ -42,6 +42,7 @@ def create_attention(
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
+    enable_streaingllm: bool = False,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -76,4 +77,5 @@ def create_attention(
         mla_params=mla_params,
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
+        enable_streaingllm=enable_streaingllm,
     )

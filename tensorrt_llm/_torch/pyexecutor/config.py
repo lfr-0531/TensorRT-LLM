@@ -100,6 +100,9 @@ class PyTorchConfig:
     # If false, set the PyTorch CUDA memory fraction to 1.0.
     _limit_torch_cuda_mem_fraction: bool = True
 
+    # If true, enable StreamingLLM.
+    enable_streaingllm: bool = False
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',

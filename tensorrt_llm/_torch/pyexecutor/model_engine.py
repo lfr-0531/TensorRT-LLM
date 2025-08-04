@@ -1011,6 +1011,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            enable_streaingllm=self.pytorch_backend_config.enable_streaingllm,
             **kwargs)
 
         validate_and_set_kv_cache_quant(

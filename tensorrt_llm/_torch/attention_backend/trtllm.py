@@ -70,6 +70,7 @@ class TrtllmAttentionWrapper:
     spec_decoding_position_offsets: Optional[torch.Tensor]
     spec_decoding_packed_mask: Optional[torch.Tensor]
     spec_decoding_generation_lengths: Optional[torch.Tensor]
+    enable_streaingllm: bool
     kwargs: dict
 
     def __init__(
@@ -180,6 +181,7 @@ class TrtllmAttentionWrapper:
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
+        enable_streaingllm: bool = False,
         **kwargs,
     ):
         """
@@ -215,6 +217,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            enable_streaingllm (bool): Whether to enable StreamingLLM.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -261,6 +264,7 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
+        self.enable_streaingllm = enable_streaingllm
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -476,6 +480,7 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
+            self.enable_streaingllm,
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
@@ -1005,6 +1010,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_params: Optional[MLAParams] = None,
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
+        enable_streaingllm: bool = False,
         **kwargs,
     ):
         """
@@ -1020,6 +1026,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            enable_streaingllm (bool): Whether to enable StreamingLLM.
         """
         super().__init__(layer_idx,
                          num_heads,
@@ -1044,6 +1051,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
         self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
+        self.enable_streaingllm = enable_streaingllm
 
         self.kv_cache_scaling_factor = torch.tensor(
             [1.0],
@@ -1117,6 +1125,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
                 metadata)
 
+        layer_idx = self.get_local_layer_idx(metadata)
+        if self.enable_streaingllm and attention_window_size is None:
+            local_layer_idx = layer_idx % len(
+                metadata.kv_cache_manager.max_attention_window_vec)
+            attention_window_size = metadata.kv_cache_manager.max_attention_window_vec[
+                local_layer_idx]
+
         use_nvfp4_output = False
         if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
         ):
@@ -1128,7 +1143,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 is_mla_enable=self.is_mla_enable,
             )
         self.wrapper.plan(
-            layer_idx=self.get_local_layer_idx(metadata),
+            layer_idx=layer_idx,
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
             max_sequence_length=metadata.max_seq_len,
@@ -1170,6 +1185,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
+            enable_streaingllm=self.enable_streaingllm,
         )
         out_dtype = None
         if out_scale is not None:

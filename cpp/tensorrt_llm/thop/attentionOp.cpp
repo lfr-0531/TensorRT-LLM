@@ -416,7 +416,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    c10::List<bool> spec_decoding_bool_params, c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params)
+    c10::List<bool> spec_decoding_bool_params, c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+    bool enable_streaingllm)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -521,6 +522,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
     op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mPosShiftEnabled = enable_streaingllm;
+    op->mDenseContextFMHA = enable_streaingllm;
 
     op->mAttentionChunkSize = attention_chunk_size;
 
@@ -786,6 +789,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? softmax_stats_tensor"
         ", bool[] spec_decoding_bool_params"
         ", Tensor?[] spec_decoding_tensor_params"
+        ", bool enable_streaingllm"
         ") -> ()");
 
     m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);
