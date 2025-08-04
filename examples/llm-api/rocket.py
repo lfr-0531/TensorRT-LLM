@@ -103,7 +103,7 @@ def main():
               max_num_tokens=args.max_num_tokens,
               tensor_parallel_size=args.tensor_parallel_size,
               cuda_graph_config=None,
-              disable_overlap_scheduler=False)
+              disable_overlap_scheduler=True)
 
     prompts = []
     reference = []
