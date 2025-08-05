@@ -1,7 +1,6 @@
 from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, AttentionMetadata
-from .sparse.rocket import (RocketVanillaAttention,
-                            RocketVanillaAttentionMetadata)
+from .sparse import get_sparse_attn_kv_cache_manager
 from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
 from .vanilla import VanillaAttention, VanillaAttentionMetadata
 
@@ -13,8 +12,7 @@ __all__ = [
     "TrtllmAttentionMetadata",
     "VanillaAttention",
     "VanillaAttentionMetadata",
-    "RocketVanillaAttention",
-    "RocketVanillaAttentionMetadata",
+    "get_sparse_attn_kv_cache_manager",
 ]
 
 if IS_FLASHINFER_AVAILABLE:

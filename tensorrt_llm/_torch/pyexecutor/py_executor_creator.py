@@ -378,6 +378,7 @@ def create_py_executor(
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
         drafter = get_spec_drafter(model_engine, spec_resource_manager)
+
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
@@ -396,6 +397,7 @@ def create_py_executor(
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
+
     if estimating_kv_cache:
         assert kv_cache_creator is not None
         with mem_monitor.observe_creation_stage(
