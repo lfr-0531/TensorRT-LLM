@@ -93,7 +93,7 @@ class VanillaSparseAttention(VanillaAttention):
         seq_len: int,
         cache_idx: int,
         cache_position: Tensor,
-        sparse_kv_indices: Tensor,
+        sparse_kv_indices: Optional[Tensor],
     ) -> Tuple[Tensor, Tensor]:
         # Select tokens using the sparse kv indices
         if sparse_kv_indices is not None:
