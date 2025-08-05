@@ -132,7 +132,7 @@ def parse_arguments() -> argparse.Namespace:
     # Sequence and batch configuration
     parser.add_argument('--max_seq_len',
                         type=int,
-                        default=262144,
+                        default=133120,
                         help='Maximum sequence length')
     parser.add_argument('--max_batch_size',
                         type=int,
@@ -145,7 +145,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--max_num_tokens',
         type=int,
-        default=262144,
+        default=133120,
         help='Maximum total tokens across all sequences in a batch')
     parser.add_argument('--tensor_parallel_size',
                         type=int,
@@ -168,6 +168,10 @@ def parse_arguments() -> argparse.Namespace:
                         type=int,
                         default=63,
                         help='Kernel size for RocketKV')
+    parser.add_argument('--topr',
+                        type=int,
+                        default=90,
+                        help='Top-r for RocketKV')
 
     # KV cache configuration
     parser.add_argument('--kv_cache_dtype',
@@ -318,6 +322,7 @@ def initialize_llm(args: argparse.Namespace, logger: logging.Logger) -> LLM:
             window_size=args.window_size,
             kernel_size=args.kernel_size,
             prompt_budget=args.token_budget,
+            topr=args.topr,
         )
     else:
         sparse_attention_config = None
@@ -334,6 +339,7 @@ def initialize_llm(args: argparse.Namespace, logger: logging.Logger) -> LLM:
         max_num_tokens=args.max_num_tokens,
         cuda_graph_config=None,
         torch_compile_config=None,
+        disable_overlap_scheduler=True,
     )
 
     logger.info("LLM initialized successfully")

@@ -256,7 +256,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 q, k, v, metadata, past_seen_token, cache_idx)
             sparse_kv_indices = self.sparse_attn.single_request_sparse_kv_predict(
                 q, k, v, metadata, past_seen_token, cache_idx)
-            kv_len = sparse_indices.size(1)
+            if sparse_indices is not None:
+                kv_len = sparse_indices.size(1)
 
         target_seq_len += kv_len
         cache_position = self._single_request_update_kv_cache(

@@ -185,6 +185,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
                                          math.ceil(target_seq_len /
                                                    self.page_size),
                                          device=q.device)
+        # context / generation
         self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
                                              target_seq_len, cache_idx,
                                              kt_cache_position)
@@ -270,21 +271,12 @@ class RocketVanillaAttention(VanillaSparseAttention):
         Predict KV cache indices for attention calculation.
 
         For RocketKV:
-        - Context phase: Returns None (no calc indices needed, use full attention)
+        - Context phase: Returns None (no sparse indices needed, use full attention)
         - Generation phase: Returns RocketKV selected indices for sparse attention
         """
-        if k is None or v is None:
+        # Context phase: use full attention
+        if k is None or v is None or q.size(2) > 1:
             return None
-
-        # all new kv indices needed for attention calculation
-        kv_indices = torch.arange(
-            past_seen_token, past_seen_token + k.size(1),
-            device=q.device).unsqueeze(0).unsqueeze(-1).expand(
-                1, -1, self.num_kv_heads)
-
-        # Context phase: No calc indices needed (use full attention)
-        if q.size(2) > 1:
-            return kv_indices
 
         # Get RocketKV selected indices
         sparse_indices = self._rocketkv_selection(q, k, metadata,
