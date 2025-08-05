@@ -110,39 +110,39 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
 
-    def _preprocess_inputs(self, q, k, v, kv_cache_tensor, past_seen_token):
+    def _single_request_preprocess_inputs(self, q, k, v, kv_dtype):
         bsz = 1
         q_len = q.size(0)
 
         q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        target_seq_len = past_seen_token
+        kv_len = 0
         if k is not None and v is not None:
             kv_len = k.size(0)
             k = k.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
             v = v.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
-            target_seq_len += kv_len
 
             if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
             ):
                 qc = self.quant_config
                 if qc.layer_quant_mode.has_fp8_kv_cache():
-                    assert kv_cache_tensor.dtype == torch.float8_e4m3fn, \
-                        f"KV cache should have fp8 dtype, but get {kv_cache_tensor.dtype}"
+                    assert kv_dtype == torch.float8_e4m3fn, \
+                        f"KV cache should have fp8 dtype, but get {kv_dtype}"
                     k = k.to(torch.float8_e4m3fn)
                     v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_cache_tensor.dtype, \
-                f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+            assert k.dtype == v.dtype == kv_dtype, \
+                f"KV cache dtype {kv_dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
-        return q, k, v, target_seq_len
+        return q, k, v, kv_len
 
-    def _create_attention_mask(self,
-                               attention_mask,
-                               past_seen_token,
-                               target_seq_len,
-                               q_device,
-                               q_len,
-                               attention_window_size=None):
+    def _single_request_create_attention_mask(self,
+                                              attention_mask,
+                                              past_seen_token,
+                                              target_seq_len,
+                                              cache_position,
+                                              q_device,
+                                              q_len,
+                                              attention_window_size=None):
         """
         Create appropriate attention mask based on the attention type.
 
@@ -156,18 +156,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             # Create custom sliding window mask as sdpa doesn't natively support it.
             if attention_window_size is not None:
-                cache_position = torch.arange(past_seen_token,
-                                              target_seq_len,
-                                              device=q_device)
                 attn_mask = generate_sliding_window_mask(
                     bsz, target_seq_len, cache_position, q_device,
                     attention_window_size)
             elif past_seen_token == 0:
                 is_causal = True
             elif q_len != 1:
-                cache_position = torch.arange(past_seen_token,
-                                              target_seq_len,
-                                              device=q_device)
                 # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
                 attn_mask = generate_causal_mask(bsz, target_seq_len,
                                                  cache_position, q_device)
@@ -176,20 +170,27 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return is_causal, attn_mask
+        return attn_mask, is_causal
 
-    def _compute_attention(self, q, key_states, value_states, is_causal,
-                           attn_mask):
+    def _single_request_attn_forward(self, q, key_states, value_states,
+                                     is_causal, attn_mask):
         """
         Common attention computation using scaled dot-product attention.
         """
+        # transpose kv
+        key_states = key_states.transpose(1, 2).to(q.dtype)
+        value_states = value_states.transpose(1, 2).to(q.dtype)
+
+        # repeat kv to support MQA/GQA
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # get qk scale
         qk_scale = None
         if self.q_scaling is not None:
             qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
 
+        # attention
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             key_states,
@@ -212,24 +213,29 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 metadata: AttentionMetadata,
                                 attention_window_size: Optional[int] = None,
                                 **kwargs):
-        q, k, v, target_seq_len = self._preprocess_inputs(
-            q, k, v, kv_cache_tensor, past_seen_token)
+        # preprocess inputs
+        q, k, v, kv_len = self._single_request_preprocess_inputs(
+            q, k, v, kv_cache_tensor.dtype)
 
+        # get target seq len and cache position
+        target_seq_len = past_seen_token + kv_len
         cache_position = torch.arange(past_seen_token,
                                       target_seq_len,
                                       device=q.device)
+
+        # update kv cache
         key_states, value_states = self._single_request_update_kv_cache(
             k, v, kv_cache_tensor, target_seq_len, cache_idx, cache_position)
 
-        key_states = key_states.transpose(1, 2).to(q.dtype)
-        value_states = value_states.transpose(1, 2).to(q.dtype)
+        # create attention mask
+        attn_mask, is_causal = self._single_request_create_attention_mask(
+            attention_mask, past_seen_token, target_seq_len, cache_position,
+            q.device, q.size(2), attention_window_size)
 
-        is_causal, attn_mask = self._create_attention_mask(
-            attention_mask, past_seen_token, target_seq_len, q.device,
-            q.size(2), attention_window_size)
-
-        attn_output = self._compute_attention(q, key_states, value_states,
-                                              is_causal, attn_mask)
+        # attention
+        attn_output = self._single_request_attn_forward(q, key_states,
+                                                        value_states, is_causal,
+                                                        attn_mask)
 
         return attn_output.squeeze(0)
 
