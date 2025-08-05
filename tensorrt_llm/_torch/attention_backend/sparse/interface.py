@@ -114,7 +114,11 @@ class VanillaSparseAttention(VanillaAttention):
             v_out.view(dtype=access_type).index_copy_(
                 1, cache_position, v_selected.view(dtype=access_type))
 
-        return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
+        # return past kv and the dense kv tensors for sparse attention
+        past_seen_token = cache_position[0]
+        k_dense = torch.cat([k_out[:, :past_seen_token, :, :], k], dim=1)
+        v_dense = torch.cat([v_out[:, :past_seen_token, :, :], v], dim=1)
+        return k_dense, v_dense
 
     def _single_request_forward(self,
                                 q,

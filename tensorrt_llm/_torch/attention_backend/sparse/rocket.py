@@ -91,7 +91,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
             - Generation phase: return None
         """
         # Generation phase: do not support sparse kv cache
-        if past_seen_token == 0 or k is None or v is None:
+        if past_seen_token > 0 or k is None or v is None:
             return None
 
         # Context phase: predict SnapKV sparse kv indices
@@ -212,7 +212,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
                 (k.size(1) - 1) % self.page_size + 1)
             padding_tensor = torch.full(
                 (k.size(0), padding_len, k.size(2), k.size(3)),
-                float('-inf'),
+                float('inf'),
                 device=k.device,
                 dtype=k.dtype)
             # (1, seq_len+padding_len, num_kv_heads, head_dim)
@@ -222,7 +222,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
                 k_min.size(0),
                 k_min.size(1) // self.page_size, self.page_size, k.size(2),
                 k_min.size(3)).amin(dim=2).permute(0, 2, 3, 1)
-            k_max = torch.cat([k, padding_tensor], dim=1)
+            k_max = torch.cat([k, -padding_tensor], dim=1)
             k_max = k_max.reshape(
                 k_max.size(0),
                 k_max.size(1) // self.page_size, self.page_size, k.size(2),
