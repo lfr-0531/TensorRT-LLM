@@ -633,9 +633,6 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == 'star_attention':
             return
 
-        # TODO: current warmup_request is not suitable for rocket kv
-        return
-
         with contextlib.ExitStack() as stack:
             if self._torch_compile_enabled:
 
@@ -1302,7 +1299,6 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_ids.append(past_seen_token_num)
-
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)

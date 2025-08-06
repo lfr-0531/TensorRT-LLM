@@ -17,7 +17,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        load_torch_hf_lora)
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend.sparse import get_sparse_attn_kv_cache_manager
+from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
 from .config import PyTorchConfig

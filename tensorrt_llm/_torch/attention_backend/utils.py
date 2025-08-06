@@ -1,6 +1,5 @@
 from typing import Optional, Type
 
-from ...llmapi.llm_args import SparseAttentionConfig
 from ...models.modeling_utils import QuantConfig
 from . import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
@@ -52,7 +51,7 @@ def create_attention(
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
-    sparse_attention_config: Optional[SparseAttentionConfig] = None,
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -80,7 +79,7 @@ def create_attention(
         layer_idx,
         num_heads,
         head_dim,
-        num_kv_heads=num_kv_heads,
+        num_kv_heads,
         quant_config=quant_config,
         q_scaling=q_scaling,
         pos_embd_params=pos_embd_params,
