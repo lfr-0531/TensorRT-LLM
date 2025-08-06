@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -8,7 +8,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import KvCacheConfig as KvCacheConfigCpp
+from tensorrt_llm.bindings.executor import ExecutorConfig, KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
@@ -356,7 +356,7 @@ class RocketKVCacheManager(KVCacheManager):
 
     def __init__(
         self,
-        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
@@ -455,3 +455,41 @@ class RocketKVCacheManager(KVCacheManager):
 
                     kt_cache_tensor[cache_idx, :, :head_dim, :] = float('inf')
                     kt_cache_tensor[cache_idx, :, head_dim:, :] = float('-inf')
+
+    @staticmethod
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 executor_config: ExecutorConfig,
+                                 mapping: Mapping):
+        sparse_attn_config = executor_config.sparse_attention_config
+        # get kv cache dtype bytes
+        mem_per_token = 2
+        quant_config = model_config.quant_config
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            mem_per_token = 1
+
+        # get num key value heads
+        config = model_config.pretrained_config
+        num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                      config.num_attention_heads)
+        if isinstance(num_key_value_heads, Iterable):
+            num_key_value_heads = sum(num_key_value_heads) / len(
+                num_key_value_heads)
+
+        # get head dim
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
+        head_dim = head_dim * num_key_value_heads // tp_size
+
+        # provide at least 1 layer to prevent division by zero cache size
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
+
+        # K and V
+        # 2 for K and V, 2 / page_size for KT cache
+        kv_factor = 2 + 2 / sparse_attn_config.page_size
+        mem_per_token *= kv_factor
+        return mem_per_token
