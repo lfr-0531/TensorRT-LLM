@@ -120,7 +120,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                         v,
                                         kv_cache_tensor,
                                         past_seen_token,
-                                        seq_len,
+                                        kv_len,
                                         cache_idx,
                                         sparse_kv_indices=None):
         # select tokens using the sparse kv indices
@@ -131,8 +131,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             k_selected, v_selected = k, v
 
         # get cache position
+        seq_len = past_seen_token + kv_len
         cache_position = torch.arange(past_seen_token,
-                                      past_seen_token + seq_len,
+                                      seq_len,
                                       device=kv_cache_tensor.device)
 
         # get kv cache tensor
@@ -149,7 +150,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # return past kv and the dense kv tensors for sparse attention
         if sparse_kv_indices is not None:
-            past_seen_token = cache_position[0]
             k_states = torch.cat([k_out[:, :past_seen_token, :, :], k], dim=1)
             v_states = torch.cat([v_out[:, :past_seen_token, :, :], v], dim=1)
         else:
@@ -185,7 +185,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     def _single_request_create_attention_mask(self,
                                               attention_mask,
                                               past_seen_token,
-                                              seq_len,
+                                              kv_len,
                                               q_device,
                                               q_len,
                                               attention_window_size=None):
@@ -200,23 +200,22 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         attn_mask = None
 
         # get cache position
-        cache_position = torch.arange(past_seen_token,
-                                      past_seen_token + seq_len,
-                                      device=q_device)
+        seq_len = past_seen_token + kv_len
+        cache_position = torch.arange(past_seen_token, seq_len, device=q_device)
 
         # create attention mask
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             # Create custom sliding window mask as sdpa doesn't natively support it.
             if attention_window_size is not None:
                 attn_mask = generate_sliding_window_mask(
-                    bsz, target_seq_len, cache_position, q_device,
+                    bsz, seq_len, cache_position, q_device,
                     attention_window_size)
             elif past_seen_token == 0:
                 is_causal = True
             elif q_len != 1:
                 # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
-                attn_mask = generate_causal_mask(bsz, target_seq_len,
-                                                 cache_position, q_device)
+                attn_mask = generate_causal_mask(bsz, seq_len, cache_position,
+                                                 q_device)
         elif attention_mask == PredefinedAttentionMask.FULL:
             pass
         else:
