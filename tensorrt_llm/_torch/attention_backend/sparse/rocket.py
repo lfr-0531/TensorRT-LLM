@@ -6,7 +6,8 @@ from torch import Tensor
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.vanilla import repeat_kv
+from tensorrt_llm._torch.attention_backend.vanilla import (
+    VanillaAttention, VanillaAttentionMetadata, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig as KvCacheConfigCpp
@@ -15,13 +16,12 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .interface import SparseAttentionMetadata, VanillaSparseAttention
 from .kernel import triton_index_gather
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 
-class RocketVanillaAttentionMetadata(SparseAttentionMetadata):
+class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
 
     def __post_init__(self):
         super().__post_init__()
@@ -44,7 +44,7 @@ class RocketVanillaAttentionMetadata(SparseAttentionMetadata):
                         i] += self.prompt_budget - self.prompt_lens[i]
 
 
-class RocketVanillaAttention(VanillaSparseAttention):
+class RocketVanillaAttention(VanillaAttention):
     """
     RocketKV sparse attention implementation.
         - Context phase: only support sparse kv cache
@@ -78,21 +78,22 @@ class RocketVanillaAttention(VanillaSparseAttention):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def single_request_sparse_kv_predict(self, q: Optional[Tensor],
-                                         k: Optional[Tensor],
-                                         v: Optional[Tensor],
-                                         metadata: SparseAttentionMetadata,
-                                         past_seen_token: int, cache_idx: int,
-                                         **kwargs) -> Optional[Tensor]:
+    def _single_request_sparse_kv_predict(
+            self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
+            metadata: RocketVanillaAttentionMetadata, past_seen_token: int,
+            cache_idx: int, **kwargs) -> Optional[Tensor]:
         """
         Predict KV indices for writing new key/value pairs.
         For RocketKV:
             - Context phase: return SnapKV sparse kv indices
             - Generation phase: return None
         """
+        if k is None or v is None:
+            return None, 0
+
         # Generation phase: do not support sparse kv cache
-        if past_seen_token > 0 or k is None or v is None:
-            return None
+        if past_seen_token > 0:
+            return None, k.size(1)
 
         # Context phase: predict SnapKV sparse kv indices
         sparse_kv_indices = self._get_snapkv_indices(q, k)
@@ -114,29 +115,30 @@ class RocketVanillaAttention(VanillaSparseAttention):
         self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
                                              target_seq_len, cache_idx,
                                              kt_cache_position)
-        return sparse_kv_indices
+        return sparse_kv_indices, k_snap.size(1)
 
-    def single_request_sparse_attn_predict(self, q: Tensor, k: Optional[Tensor],
-                                           v: Optional[Tensor],
-                                           kv_cache_tensor: Tensor,
-                                           metadata: SparseAttentionMetadata,
-                                           past_seen_token: int, cache_idx: int,
-                                           **kwargs) -> Optional[Tensor]:
+    def _single_request_sparse_attn_predict(
+            self, q: Tensor, k: Optional[Tensor], v: Optional[Tensor],
+            kv_cache_tensor: Tensor, metadata: RocketVanillaAttentionMetadata,
+            past_seen_token: int, cache_idx: int, **kwargs) -> Optional[Tensor]:
         """
         Predict KV cache indices for sparse attention computation.
         For RocketKV:
             - Context phase: returns None (use full attention)
             - Generation phase: return RocketKV sparse indices for sparse attention computation
         """
+        if k is None or v is None:
+            return None, 0
+
         # Context phase: use full attention
-        if past_seen_token == 0 or k is None or v is None:
-            return None
+        if past_seen_token == 0:
+            return None, k.size(1)
 
         # Get RocketKV sparse indices
         sparse_indices = self._rocketkv_selection(q, k, kv_cache_tensor,
                                                   metadata, past_seen_token,
                                                   cache_idx)
-        return sparse_indices
+        return sparse_indices, sparse_indices.size(1)
 
     def _get_snapkv_indices(self, q: Tensor, k: Tensor) -> Tensor:
         """Get SnapKV sparse kv indices from the input sequence for context phase."""
@@ -240,7 +242,7 @@ class RocketVanillaAttention(VanillaSparseAttention):
         return k_out[:, :, :, :math.ceil(seq_len / self.page_size)]
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor, kt_cache_tensor: Tensor,
-                            metadata: SparseAttentionMetadata,
+                            metadata: RocketVanillaAttentionMetadata,
                             past_seen_token: int, cache_idx: int) -> Tensor:
         """Implement RocketKV's two-stage selection process for generation phase."""
         bsz = 1

@@ -13,6 +13,7 @@ except ImportError:
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
+from .sparse.kernel import triton_index_gather
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -96,19 +97,65 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
 
-    def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
-                                        cache_idx, cache_position):
+    def _single_request_sparse_attn_predict(self, q: torch.Tensor,
+                                            k: Optional[torch.Tensor],
+                                            v: Optional[torch.Tensor],
+                                            kv_cache_tensor: torch.Tensor,
+                                            metadata: AttentionMetadata,
+                                            past_seen_token: int,
+                                            cache_idx: int,
+                                            **kwargs) -> Optional[torch.Tensor]:
+        raise NotImplementedError
+
+    def _single_request_sparse_kv_predict(self, q: Optional[torch.Tensor],
+                                          k: Optional[torch.Tensor],
+                                          v: Optional[torch.Tensor],
+                                          metadata: AttentionMetadata,
+                                          past_seen_token: int, cache_idx: int,
+                                          **kwargs) -> Optional[torch.Tensor]:
+        raise NotImplementedError
+
+    def _single_request_update_kv_cache(self,
+                                        k,
+                                        v,
+                                        kv_cache_tensor,
+                                        past_seen_token,
+                                        seq_len,
+                                        cache_idx,
+                                        sparse_kv_indices=None):
+        # select tokens using the sparse kv indices
+        if sparse_kv_indices is not None:
+            k_selected = triton_index_gather(k, sparse_kv_indices)
+            v_selected = triton_index_gather(v, sparse_kv_indices)
+        else:
+            k_selected, v_selected = k, v
+
+        # get cache position
+        cache_position = torch.arange(past_seen_token,
+                                      past_seen_token + seq_len,
+                                      device=kv_cache_tensor.device)
+
+        # get kv cache tensor
         k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
         v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
 
+        # update kv cache
         if k is not None and v is not None:
-            access_type = self._access_type[k.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(1, cache_position,
-                                                      k.view(dtype=access_type))
-            v_out.view(dtype=access_type).index_copy_(1, cache_position,
-                                                      v.view(dtype=access_type))
+            access_type = self._access_type[k_selected.dtype.itemsize]
+            k_out.view(dtype=access_type).index_copy_(
+                1, cache_position, k_selected.view(dtype=access_type))
+            v_out.view(dtype=access_type).index_copy_(
+                1, cache_position, v_selected.view(dtype=access_type))
 
-        return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
+        # return past kv and the dense kv tensors for sparse attention
+        if sparse_kv_indices is not None:
+            past_seen_token = cache_position[0]
+            k_states = torch.cat([k_out[:, :past_seen_token, :, :], k], dim=1)
+            v_states = torch.cat([v_out[:, :past_seen_token, :, :], v], dim=1)
+        else:
+            k_states, v_states = k_out[:, :seq_len, :, :], v_out[:, :
+                                                                 seq_len, :, :]
+        return k_states, v_states
 
     def _single_request_preprocess_inputs(self, q, k, v, kv_dtype):
         bsz = 1
@@ -138,8 +185,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     def _single_request_create_attention_mask(self,
                                               attention_mask,
                                               past_seen_token,
-                                              target_seq_len,
-                                              cache_position,
+                                              seq_len,
                                               q_device,
                                               q_len,
                                               attention_window_size=None):
@@ -153,6 +199,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         is_causal = False
         attn_mask = None
 
+        # get cache position
+        cache_position = torch.arange(past_seen_token,
+                                      past_seen_token + seq_len,
+                                      device=q_device)
+
+        # create attention mask
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             # Create custom sliding window mask as sdpa doesn't natively support it.
             if attention_window_size is not None:
@@ -172,11 +224,21 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return attn_mask, is_causal
 
-    def _single_request_attn_forward(self, q, key_states, value_states,
-                                     is_causal, attn_mask):
+    def _single_request_attn_forward(self,
+                                     q,
+                                     key_states,
+                                     value_states,
+                                     is_causal,
+                                     attn_mask,
+                                     sparse_indices=None):
         """
         Common attention computation using scaled dot-product attention.
         """
+        # select the key and value states using the sparse indices
+        if sparse_indices is not None:
+            key_states = triton_index_gather(key_states, sparse_indices)
+            value_states = triton_index_gather(value_states, sparse_indices)
+
         # transpose kv
         key_states = key_states.transpose(1, 2).to(q.dtype)
         value_states = value_states.transpose(1, 2).to(q.dtype)
@@ -217,25 +279,33 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         q, k, v, kv_len = self._single_request_preprocess_inputs(
             q, k, v, kv_cache_tensor.dtype)
 
-        # get target seq len and cache position
-        target_seq_len = past_seen_token + kv_len
-        cache_position = torch.arange(past_seen_token,
-                                      target_seq_len,
-                                      device=q.device)
+        # predict sparse kv indices
+        sparse_kv_indices = None
+        if self.sparse_attention_config is not None:
+            sparse_kv_indices, kv_len = self._single_request_sparse_kv_predict(
+                q, k, v, metadata, past_seen_token, cache_idx)
 
         # update kv cache
         key_states, value_states = self._single_request_update_kv_cache(
-            k, v, kv_cache_tensor, target_seq_len, cache_idx, cache_position)
+            k, v, kv_cache_tensor, past_seen_token, kv_len, cache_idx,
+            sparse_kv_indices)
+
+        # predict sparse attn indices
+        sparse_indices = None
+        if self.sparse_attention_config is not None:
+            sparse_indices, kv_len = self._single_request_sparse_attn_predict(
+                q, k, v, kv_cache_tensor, metadata, past_seen_token, cache_idx)
 
         # create attention mask
         attn_mask, is_causal = self._single_request_create_attention_mask(
-            attention_mask, past_seen_token, target_seq_len, cache_position,
-            q.device, q.size(2), attention_window_size)
+            attention_mask, past_seen_token, kv_len, q.device, q.size(2),
+            attention_window_size)
 
         # attention
         attn_output = self._single_request_attn_forward(q, key_states,
                                                         value_states, is_causal,
-                                                        attn_mask)
+                                                        attn_mask,
+                                                        sparse_indices)
 
         return attn_output.squeeze(0)
 
