@@ -275,7 +275,7 @@ class KvCacheCreator:
         num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -304,7 +304,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.hidden_size,
                 config.ssm_state_size,
