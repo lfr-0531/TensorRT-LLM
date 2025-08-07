@@ -83,7 +83,7 @@ python eval_longbench_v1.py \
 python eval_longbench_v1.py \
     --model_path "/path/to/your/model" \
     --longbench_path ./LongBench \
-    --dataset narrativeqa,qasper \
+    --dataset narrativeqa qasper \
     --output_dir results/v1_rocket \
     --attention_backend VANILLA \
     --backend pytorch \
