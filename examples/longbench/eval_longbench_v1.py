@@ -67,7 +67,7 @@ def parse_arguments() -> argparse.Namespace:
                         choices=LONGBENCH_DATASETS,
                         help='LongBench datasets to evaluate on')
     parser.add_argument('--run_all_tasks',
-                        action='store_false',
+                        action='store_true',
                         help='Run evaluation on all LongBench tasks')
     parser.add_argument('--longbench_path',
                         type=str,
