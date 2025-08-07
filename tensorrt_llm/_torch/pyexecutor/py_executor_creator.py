@@ -290,6 +290,8 @@ def create_py_executor(
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
 
+    # Vanilla attention backend does not support paged KV cache, so we set tokens_per_block to
+    # max_num_tokens to use it as a continuous KV cache.
     if pytorch_backend_config.attn_backend == "VANILLA":
         executor_config.tokens_per_block = model_engine.max_num_tokens
 

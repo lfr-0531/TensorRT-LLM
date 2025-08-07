@@ -163,6 +163,12 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
