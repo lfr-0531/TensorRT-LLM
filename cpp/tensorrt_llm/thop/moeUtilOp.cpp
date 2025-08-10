@@ -87,8 +87,8 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     sync_check_cuda_error(stream);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_permute_op(
-    torch::Tensor const& input, torch::Tensor const& token_selected_experts,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
     torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
     torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
     torch::optional<torch::Tensor> input_sf, int64_t const num_experts_on_rank, int64_t const tp_size,
@@ -129,26 +129,87 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
     int64_t num_moe_inputs = static_cast<int64_t>(experts_per_token * num_rows);
 
-    auto permuted_row_to_unpermuted_row_tensor
-        = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto permuted_token_selected_experts_tensor
-        = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto permuted_data_tensor = torch::empty({num_moe_inputs, hidden_size}, input.options().requires_grad(false));
-    auto permuted_token_final_scales_tensor
-        = torch::empty({num_moe_inputs}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
-    auto expert_first_token_offset_tensor = torch::empty(
-        {num_experts_per_node + 1}, torch::dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
-    auto unpermuted_row_to_permuted_row_tensor = torch::empty({static_cast<int64_t>(experts_per_token * num_rows)},
-        torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    auto round_up = [&](int64_t size, int64_t alignment)
+    {
+        return (size + alignment - 1) / alignment * alignment;
+    };
+    const int64_t alignment = 256;
 
     int64_t const num_tokens_per_block = cutlass_kernels::computeNumTokensPerBlock(num_rows, num_experts_per_node);
     int64_t const num_blocks_per_seq = tensorrt_llm::common::ceilDiv(num_rows, num_tokens_per_block);
-    auto blocked_expert_counts_tensor = torch::empty({num_experts_per_node * num_blocks_per_seq},
-        torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto blocked_expert_counts_cumsum_tensor = torch::empty({num_experts_per_node * num_blocks_per_seq},
-        torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto blocked_row_to_unpermuted_row_tensor = torch::empty(
-        {num_experts_per_node * num_rows}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+
+    int64_t permuted_row_to_unpermuted_row_bytes = num_moe_inputs * sizeof(int);
+    int64_t permuted_token_selected_experts_bytes = num_moe_inputs * sizeof(int);
+    int64_t permuted_data_bytes = num_moe_inputs * hidden_size * input.element_size();
+    int64_t permuted_token_final_scales_bytes = num_moe_inputs * sizeof(float);
+    int64_t expert_first_token_offset_bytes = (num_experts_per_node + 1) * sizeof(int64_t);
+    int64_t unpermuted_row_to_permuted_row_bytes = num_moe_inputs * sizeof(int);
+    int64_t blocked_expert_counts_bytes = num_experts_per_node * num_blocks_per_seq * sizeof(int);
+    int64_t blocked_expert_counts_cumsum_bytes = num_experts_per_node * num_blocks_per_seq * sizeof(int);
+    int64_t blocked_row_to_unpermuted_row_bytes = num_experts_per_node * num_rows * sizeof(int);
+
+    int64_t offset = 0;
+    int64_t permuted_row_to_unpermuted_row_offset = offset;
+    offset += round_up(permuted_row_to_unpermuted_row_bytes, alignment);
+
+    int64_t permuted_token_selected_experts_offset = offset;
+    offset += round_up(permuted_token_selected_experts_bytes, alignment);
+
+    int64_t permuted_data_offset = offset;
+    offset += round_up(permuted_data_bytes, alignment);
+
+    int64_t permuted_token_final_scales_offset = offset;
+    offset += round_up(permuted_token_final_scales_bytes, alignment);
+
+    int64_t expert_first_token_offset_offset = offset;
+    offset += round_up(expert_first_token_offset_bytes, alignment);
+
+    int64_t unpermuted_row_to_permuted_row_offset = offset;
+    offset += round_up(unpermuted_row_to_permuted_row_bytes, alignment);
+
+    int64_t blocked_expert_counts_offset = offset;
+    offset += round_up(blocked_expert_counts_bytes, alignment);
+
+    int64_t blocked_expert_counts_cumsum_offset = offset;
+    offset += round_up(blocked_expert_counts_cumsum_bytes, alignment);
+
+    int64_t blocked_row_to_unpermuted_row_offset = offset;
+    offset += round_up(blocked_row_to_unpermuted_row_bytes, alignment);
+
+    int64_t total_workspace_size = offset;
+    auto workspace_tensor
+        = torch::empty({total_workspace_size}, torch::dtype(torch::kByte).device(input.device()).requires_grad(false));
+
+    auto permuted_row_to_unpermuted_row_tensor = torch::from_blob(
+        static_cast<char*>(workspace_tensor.data_ptr()) + permuted_row_to_unpermuted_row_offset, {num_moe_inputs},
+        c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    auto permuted_token_selected_experts_tensor = torch::from_blob(
+        static_cast<char*>(workspace_tensor.data_ptr()) + permuted_token_selected_experts_offset, {num_moe_inputs},
+        c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    auto permuted_data_tensor = torch::from_blob(static_cast<char*>(workspace_tensor.data_ptr()) + permuted_data_offset,
+        {num_moe_inputs, hidden_size}, input.options().requires_grad(false));
+    auto permuted_token_final_scales_tensor = torch::from_blob(
+        static_cast<char*>(workspace_tensor.data_ptr()) + permuted_token_final_scales_offset, {num_moe_inputs},
+        c10::TensorOptions(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+    auto expert_first_token_offset_tensor = torch::from_blob(
+        static_cast<char*>(workspace_tensor.data_ptr()) + expert_first_token_offset_offset, {num_experts_per_node + 1},
+        c10::TensorOptions(torch::kInt64).device(torch::kCUDA).requires_grad(false));
+    auto unpermuted_row_to_permuted_row_tensor
+        = torch::from_blob(static_cast<char*>(workspace_tensor.data_ptr()) + unpermuted_row_to_permuted_row_offset,
+            {num_moe_inputs}, c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+
+    auto blocked_expert_counts_tensor
+        = torch::from_blob(static_cast<char*>(workspace_tensor.data_ptr()) + blocked_expert_counts_offset,
+            {num_experts_per_node * num_blocks_per_seq},
+            c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    auto blocked_expert_counts_cumsum_tensor
+        = torch::from_blob(static_cast<char*>(workspace_tensor.data_ptr()) + blocked_expert_counts_cumsum_offset,
+            {num_experts_per_node * num_blocks_per_seq},
+            c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    auto blocked_row_to_unpermuted_row_tensor
+        = torch::from_blob(static_cast<char*>(workspace_tensor.data_ptr()) + blocked_row_to_unpermuted_row_offset,
+            {num_experts_per_node * num_rows},
+            c10::TensorOptions(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
     cutlass_kernels::QuantParams quant_params{};
     cutlass_kernels::MoeMinLatencyParams min_latency_params{};
@@ -226,7 +287,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }
     return std::make_tuple(permuted_row_to_unpermuted_row_tensor, permuted_token_selected_experts_tensor,
         permuted_data_tensor, expert_first_token_offset_tensor, permuted_token_final_scales_tensor,
-        unpermuted_row_to_permuted_row_tensor);
+        unpermuted_row_to_permuted_row_tensor, workspace_tensor);
 }
 
 template <class UnfusedGemmOutputType, class ScaleBiasType, class OutputType>
@@ -334,7 +395,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fc1_expert_weights, Tensor fc2_expert_weights, Tensor[]? quant_scales, Tensor? input_sf, int "
         "num_experts_on_rank, int tp_size, int tp_rank, int ep_size, int ep_rank, int cluster_size, int cluster_rank, "
         "bool min_latency_mode, bool use_fp8_block_scaling)"
-        "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "moe_finalize_scale_op(Tensor gemm2_output, Tensor? biases, Tensor unpermuted_final_scales, Tensor "
         "unpermuted_row_to_permuted_row, Tensor permuted_row_to_unpermuted_row, Tensor token_selected_experts, Tensor "

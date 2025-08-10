@@ -398,6 +398,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             expert_first_token_offset_tensor,
             permuted_token_final_scales_tensor,
             unpermuted_row_to_permuted_row_tensor,
+            _,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
             token_selected_experts,
