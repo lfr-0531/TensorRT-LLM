@@ -26,6 +26,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include <cassert>
 #include <set>
@@ -115,6 +116,8 @@ public:
         // this is a buffer of size [num_tokens, num_heads_q] with each element
         // representing the max and LSE/denominator of the softmax values
         float2* softmax_stats = nullptr;
+        // optional when sparse attention
+        kernels::SparseAttentionParams* sparse_attn_params = nullptr;
     };
 
     template <typename T>
@@ -348,6 +351,11 @@ public:
         return mIsMLAEnabled;
     }
 
+    [[nodiscard]] bool useSparseAttention() const
+    {
+        return mUseSparseAttention;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -427,6 +435,7 @@ public:
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
+    bool mUseSparseAttention = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
