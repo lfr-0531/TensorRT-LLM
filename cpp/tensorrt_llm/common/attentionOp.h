@@ -26,6 +26,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include <cassert>
 #include <set>
@@ -109,6 +110,8 @@ public:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int64_t const* runtime_perf_knobs = nullptr;
+        // optional when sparse attention
+        kernels::SparseAttentionParams* sparse_attn_params = nullptr;
     };
 
     template <typename T>
@@ -330,6 +333,11 @@ public:
         return mIsMLAEnabled;
     }
 
+    [[nodiscard]] bool useSparseAttention() const
+    {
+        return mUseSparseAttention;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -407,6 +415,7 @@ public:
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
+    bool mUseSparseAttention = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;
