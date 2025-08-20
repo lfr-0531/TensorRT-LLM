@@ -174,9 +174,12 @@ class RocketTrtllmAttention(TrtllmAttention):
         if len(all_sparse_indices) == 0:
             return None, None
 
-        all_sparse_indices = torch.cat(all_sparse_indices, dim=0)
+        all_sparse_indices = torch.cat(all_sparse_indices,
+                                       dim=0).to(torch.int32)
         batch_sparse_offsets = torch.tensor(batch_sparse_kv_offsets +
-                                            batch_sparse_attn_offsets)
+                                            batch_sparse_attn_offsets,
+                                            device=all_sparse_indices.device,
+                                            dtype=torch.int32)
 
         return all_sparse_indices, batch_sparse_offsets
 

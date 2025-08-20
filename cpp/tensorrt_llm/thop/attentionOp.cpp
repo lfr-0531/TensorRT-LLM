@@ -216,27 +216,26 @@ public:
             mla_params.workspace = workspace_ptr;
         }
 
-        [[maybe_unused]] SparseAttentionParams sparse_attn_params;
         if (op.useSparseAttention())
         {
-            int num_indices_offset = 0;
+            int num_indices_offset = sparse_batch_offsets.value().index({seq_offset}).item<int32_t>();
             if (is_context)
             {
-                sparse_attn_params.sparse_kv_offsets
+                op.mRuntimeSparseAttentionParams.sparse_kv_offsets
                     = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
-                sparse_attn_params.sparse_kv_indices
+                op.mRuntimeSparseAttentionParams.sparse_kv_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.num_sparse_kv_indices
+                    = sparse_batch_offsets.value().index({num_seqs}).item<int32_t>();
             }
             else
             {
-                if (seq_offset > 0)
-                {
-                    num_indices_offset = sparse_batch_offsets.value().index({seq_offset - 1}).item<int32_t>();
-                }
-                sparse_attn_params.sparse_attn_offsets
-                    = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
-                sparse_attn_params.sparse_attn_indices
+                op.mRuntimeSparseAttentionParams.sparse_attn_offsets
+                    = sparse_batch_offsets.value().slice(0, seq_offset + 1).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.sparse_attn_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.num_sparse_attn_indices
+                    = sparse_batch_offsets.value().index({seq_offset + num_seqs + 1}).item<int32_t>();
             }
         }
 
@@ -385,7 +384,6 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
-        common_enqueue_params.sparse_attn_params = &sparse_attn_params;
 
         if (is_context) // context stage
         {
@@ -661,7 +659,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
-    if (all_sparse_indices.has_value())
+    if (all_sparse_indices.has_value() && all_sparse_indices.value().numel() > 0)
     {
         op->mUseSparseAttention = true;
     }
