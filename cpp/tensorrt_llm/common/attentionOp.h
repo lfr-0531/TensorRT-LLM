@@ -116,8 +116,6 @@ public:
         // this is a buffer of size [num_tokens, num_heads_q] with each element
         // representing the max and LSE/denominator of the softmax values
         float2* softmax_stats = nullptr;
-        // optional when sparse attention
-        kernels::SparseAttentionParams* sparse_attn_params = nullptr;
     };
 
     template <typename T>
@@ -159,14 +157,20 @@ public:
             ss << "max_cyclic_attention_window_size: " << this->max_cyclic_attention_window_size << std::endl;
             ss << "can_use_one_more_block: " << (this->can_use_one_more_block ? "true" : "false") << std::endl;
             ss << "sink_token_length: " << this->sink_token_length << std::endl;
-            ss << "context_lengths: "
-               << *(runtime::ITensor::wrap((void*) this->context_lengths, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({batch_size})))
-               << std::endl;
-            ss << "sequence_lengths: "
-               << *(runtime::ITensor::wrap((void*) this->sequence_lengths, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({batch_size})))
-               << std::endl;
+            if (this->context_lengths && batch_size > 0)
+            {
+                ss << "context_lengths: "
+                   << *(runtime::ITensor::wrap((void*) this->context_lengths, nvinfer1::DataType::kINT32,
+                          runtime::ITensor::makeShape({batch_size})))
+                   << std::endl;
+            }
+            if (this->sequence_lengths && batch_size > 0)
+            {
+                ss << "sequence_lengths: "
+                   << *(runtime::ITensor::wrap((void*) this->sequence_lengths, nvinfer1::DataType::kINT32,
+                          runtime::ITensor::makeShape({batch_size})))
+                   << std::endl;
+            }
             ss << "kv_scale_orig_quant: " << this->kv_scale_orig_quant << std::endl;
             ss << "kv_scale_quant_orig: " << this->kv_scale_quant_orig << std::endl;
             ss << "attention_output_orig_quant: " << this->attention_output_orig_quant << std::endl;
@@ -463,6 +467,8 @@ public:
     // Whether to fuse FP4 quant into attention kernel.
     bool mFuseFp4Quant = false;
 
+    kernels::SparseAttentionParams mRuntimeSparseAttentionParams;
+
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
@@ -485,7 +491,7 @@ public:
             mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
             mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank,
             mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
-            mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1));
+            mSkipAttn, mFuseFp4Quant, mRuntimeSparseAttentionParams.data(), mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1));
     };
 
 private:

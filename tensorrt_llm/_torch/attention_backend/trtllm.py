@@ -229,8 +229,8 @@ class TrtllmAttentionWrapper:
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
-            all_sparse_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_sparse_tokens, num_heads_q) on GPU.
-            sparse_batch_offsets (torch.Tensor): The batch offsets for the sparse indices, with shape of (batch_size) on GPU.
+            all_sparse_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_sparse_tokens, num_heads_kv) on GPU.
+            sparse_batch_offsets (torch.Tensor): The batch offsets for the sparse indices, with shape of (batch_size + 2) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -1253,8 +1253,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 is_mla_enable=self.is_mla_enable,
             )
 
+        all_sparse_indices, sparse_batch_offsets = None, None
         if self.sparse_attention_config is not None:
-            all_sparse_indices, batch_offsets = self.sparse_attention_predict(
+            all_sparse_indices, sparse_batch_offsets = self.sparse_attention_predict(
                 q, k, metadata)
 
         self.wrapper.plan(
@@ -1305,7 +1306,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
             all_sparse_indices=all_sparse_indices,
-            batch_offsets=batch_offsets,
+            sparse_batch_offsets=sparse_batch_offsets,
         )
         out_dtype = None
         if out_scale is not None:
