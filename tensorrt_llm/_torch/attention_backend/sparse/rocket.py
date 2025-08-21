@@ -684,6 +684,7 @@ class RocketKVCacheManager(KVCacheManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        is_draft: bool = False,
         sparse_attn_config: Optional["SparseAttentionConfig"] = None,
     ) -> None:
 
@@ -705,6 +706,7 @@ class RocketKVCacheManager(KVCacheManager):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            is_draft=is_draft,
         )
         self.page_size = sparse_attn_config.page_size
         self.max_batch_size = max_batch_size
