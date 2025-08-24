@@ -234,8 +234,6 @@ public:
                     = sparse_batch_offsets.value().slice(0, seq_offset + 1).data_ptr<int32_t>();
                 op.mRuntimeSparseAttentionParams.sparse_attn_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
-                op.mRuntimeSparseAttentionParams.num_sparse_attn_indices
-                    = sparse_batch_offsets.value().index({seq_offset + num_seqs + 1}).item<int32_t>();
             }
         }
 
