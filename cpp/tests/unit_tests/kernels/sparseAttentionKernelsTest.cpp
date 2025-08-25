@@ -12,7 +12,7 @@ using namespace tensorrt_llm::runtime;
 
 namespace
 {
-class sparseAttentionUtilsTest : public ::testing::Test
+class sparseAttentionKernelsTest : public ::testing::Test
 {
 public:
     void SetUp() override
@@ -28,7 +28,7 @@ protected:
     std::shared_ptr<BufferManager> mBufferManager;
 };
 
-TEST_F(sparseAttentionUtilsTest, GatherKvPageOffsetsKernelTest)
+TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
 {
     // Test parameters
     constexpr int max_batch_size = 4;
