@@ -64,7 +64,7 @@ public:
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens) const
+        int const num_gen_tokens, int const max_blocks_per_sequence) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -112,12 +112,12 @@ public:
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens) const override
+        int const num_gen_tokens, int const max_blocks_per_sequence) const override
     {
         size_t const context_workspace_size
             = op.getWorkspaceSizeForContext(op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens);
-        size_t const generation_workspace_size
-            = op.getWorkspaceSizeForGeneration(op.mType, max_num_requests, max_attention_window_size, num_gen_tokens);
+        size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
+            op.mType, max_num_requests, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -700,7 +700,10 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
 
     int32_t const max_attention_window_size
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
-    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens);
+    int32_t const max_blocks_per_sequence
+        = use_kv_cache && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
+    int64_t const workspace_size
+        = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     if (workspace_size >= (16l << 30))

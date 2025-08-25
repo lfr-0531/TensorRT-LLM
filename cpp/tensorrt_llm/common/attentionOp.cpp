@@ -814,7 +814,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 }
 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
-    int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
+    int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -897,9 +897,9 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
-    size_t const maxBlocksPerSeq = (mMaxContextLength + 1 + mTokensPerBlock - 1) / mTokensPerBlock;
+    // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
     size_t const sparse_attn_cache_size = (mUseSparseAttention && mEnableXQA)
-        ? sizeof(int) * (batch_beam + batch_beam * 2 * maxBlocksPerSeq * mNumKVHeads)
+        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence * mNumKVHeads)
         : 0;
 
     int const NUM_BUFFERS = 6;
