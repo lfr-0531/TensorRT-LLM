@@ -95,3 +95,5 @@ set(ROUTING_KERNEL_TEST_SRC
     routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
 
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+
+add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
