@@ -216,7 +216,12 @@ public:
             mla_params.workspace = workspace_ptr;
         }
 
-        if (op.useSparseAttention())
+        op.mRuntimeSparseAttentionParams.sparse_kv_offsets = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_kv_indices = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_offsets = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices = nullptr;
+
+        if (op.useSparseAttention() && num_seqs > 0)
         {
             int num_indices_offset = sparse_batch_offsets.value().index({seq_offset}).item<int32_t>();
             if (is_context)
@@ -225,13 +230,11 @@ public:
                     = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
                 op.mRuntimeSparseAttentionParams.sparse_kv_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
-                op.mRuntimeSparseAttentionParams.num_sparse_kv_indices
-                    = sparse_batch_offsets.value().index({num_seqs}).item<int32_t>();
             }
             else
             {
                 op.mRuntimeSparseAttentionParams.sparse_attn_offsets
-                    = sparse_batch_offsets.value().slice(0, seq_offset + 1).data_ptr<int32_t>();
+                    = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
                 op.mRuntimeSparseAttentionParams.sparse_attn_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
             }
