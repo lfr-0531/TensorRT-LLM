@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -61,7 +62,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
         = mBufferManager->pinned(ITensor::makeShape({batch_size + 1}), nvinfer1::DataType::kINT32);
 
     // Initialize test data
-    auto kv_page_offsets_ptr = bufferCast<int>(*kv_page_offsets_host);
+    auto kv_page_offsets_ptr = bufferCast<KVCacheIndex::UnderlyingType>(*kv_page_offsets_host);
     auto seq_lengths_ptr = bufferCast<int>(*seq_lengths_host);
     auto sparse_indices_ptr = bufferCast<int>(*sparse_indices_host);
     auto sparse_indices_offsets_ptr = bufferCast<int>(*sparse_indices_offsets_host);
@@ -118,8 +119,9 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     sparse_params.max_num_pages_per_seq = max_num_pages_per_seq;
 
     // Launch the kernel
-    invokeGatherKvPageOffsets(bufferCast<int>(*output_kv_page_offsets), bufferCast<int>(*output_seq_lengths),
-        bufferCast<int>(*kv_page_offsets), bufferCast<int>(*seq_lengths), sparse_params, mStream->get());
+    invokeGatherKvPageOffsets(bufferCast<KVCacheIndex::UnderlyingType>(*output_kv_page_offsets),
+        bufferCast<int>(*output_seq_lengths), bufferCast<KVCacheIndex::UnderlyingType>(*kv_page_offsets),
+        bufferCast<int>(*seq_lengths), sparse_params, mStream->get());
 
     // Wait for completion
     mStream->synchronize();
@@ -135,7 +137,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     // Wait for completion
     mStream->synchronize();
 
-    auto output_kv_offsets_ptr = bufferCast<int>(*output_kv_page_offsets_host);
+    auto output_kv_offsets_ptr = bufferCast<KVCacheIndex::UnderlyingType>(*output_kv_page_offsets_host);
     auto output_seq_len_ptr = bufferCast<int>(*output_seq_lengths_host);
 
     // Verify sequence lengths (should remain the same since we're using exact page boundaries)

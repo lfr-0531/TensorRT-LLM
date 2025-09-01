@@ -445,11 +445,6 @@ void XqaDispatcher::runImpl(
                     = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(params.sparse_kv_block_offsets);
                 tllmRunnerParams.mUseBlockSparseAttention = true;
             }
-            else
-            {
-                tllmRunnerParams.kvPageIdxPtr
-                    = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
-            }
         }
         else
         {
