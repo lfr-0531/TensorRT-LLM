@@ -2281,8 +2281,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             {
                 size_t kv_block_offsets_size = batch_beam * 2 * params.max_blocks_per_sequence * mNumKVHeads;
                 size_t seq_lengths_size = batch_beam;
-                int* sparse_kv_block_offsets
-                    = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_block_offsets_size));
+                void* sparse_kv_block_offsets
+                    = reinterpret_cast<void*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_block_offsets_size));
                 int* sparse_seq_lengths
                     = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, seq_lengths_size));
                 xqaParams.sparse_kv_block_offsets = sparse_kv_block_offsets;

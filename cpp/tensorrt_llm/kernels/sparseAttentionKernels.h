@@ -1,5 +1,6 @@
 #pragma once
 
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include <cuda_runtime.h>
 #include <sstream>
 
@@ -42,8 +43,9 @@ struct SparseAttentionParams
     }
 };
 
-void invokeGatherKvPageOffsets(int* output_kv_page_offsets, int* output_seq_lengths, int const* kv_page_offsets,
-    int const* seq_lengths, SparseAttentionParams const& sparse_params, cudaStream_t stream);
+void invokeGatherKvPageOffsets(KVCacheIndex::UnderlyingType* output_kv_page_offsets, int* output_seq_lengths,
+    KVCacheIndex::UnderlyingType const* kv_page_offsets, int const* seq_lengths,
+    SparseAttentionParams const& sparse_params, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -113,7 +113,7 @@ struct XQAParams
     int32_t* sparse_attn_indices = nullptr;
     int32_t* sparse_attn_offsets = nullptr;
     int* sparse_seq_lengths = nullptr;
-    int* sparse_kv_block_offsets = nullptr;
+    void* sparse_kv_block_offsets = nullptr;
 
     cudaStream_t stream = 0;
 
