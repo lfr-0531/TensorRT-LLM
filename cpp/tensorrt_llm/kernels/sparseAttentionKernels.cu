@@ -5,10 +5,10 @@ namespace tensorrt_llm
 namespace kernels
 {
 __global__ void gatherKvPageOffsetsKernel(
-    int* output_kv_page_offsets, // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
-    int* output_seq_lengths,     // [batch_size]
-    int const* kv_page_offsets,  // [batch_size, 2, max_num_pages_per_seq]
-    int const* seq_lengths,      // [batch_size]
+    KVCacheIndex::UnderlyingType* output_kv_page_offsets, // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
+    int* output_seq_lengths,                              // [batch_size]
+    KVCacheIndex::UnderlyingType const* kv_page_offsets,  // [batch_size, 2, max_num_pages_per_seq]
+    int const* seq_lengths,                               // [batch_size]
     SparseAttentionParams const& sparse_params)
 {
     // Each CUDA block processes one sequence from the batch.
@@ -58,8 +58,9 @@ __global__ void gatherKvPageOffsetsKernel(
 }
 
 // Host-side launcher function
-void invokeGatherKvPageOffsets(int* output_kv_page_offsets, int* output_seq_lengths, int const* kv_page_offsets,
-    int const* seq_lengths, SparseAttentionParams const& sparse_params, cudaStream_t stream)
+void invokeGatherKvPageOffsets(KVCacheIndex::UnderlyingType* output_kv_page_offsets, int* output_seq_lengths,
+    KVCacheIndex::UnderlyingType const* kv_page_offsets, int const* seq_lengths,
+    SparseAttentionParams const& sparse_params, cudaStream_t stream)
 {
     // The grid.
     dim3 grid(sparse_params.num_head_kv, sparse_params.batch_size, 1);
