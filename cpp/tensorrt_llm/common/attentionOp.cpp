@@ -903,23 +903,22 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
     // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
     size_t const sparse_attn_cache_size = (mUseSparseAttention && mEnableXQA)
-        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence * mNumKVHeads)
+        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
         : 0;
 
-    int const NUM_BUFFERS = 6;
+    int const NUM_BUFFERS = 5;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = shift_k_cache_size;
     workspaces[4] = cpWorkspaceSize;
-    workspaces[5] = sparse_attn_cache_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t xqa_workspace_size = 0;
     if (mEnableXQA)
     {
-        int const XQA_NUM_BUFFERS = 7;
+        int const XQA_NUM_BUFFERS = 8;
         size_t xqa_workspaces[XQA_NUM_BUFFERS];
         size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
@@ -934,6 +933,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         xqa_workspaces[5] = sizeof(float);
         xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
             std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
+        xqa_workspaces[7] = sparse_attn_cache_size;
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
@@ -2279,8 +2279,9 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             }
             if (mUseSparseAttention && std::is_same_v<KVCacheBuffer, KVBlockArray>)
             {
-                size_t kv_block_offsets_size = batch_beam * 2 * params.max_blocks_per_sequence * mNumKVHeads;
-                size_t seq_lengths_size = batch_beam;
+                size_t kv_block_offsets_size
+                    = sizeof(int) * batch_beam * 2 * params.max_blocks_per_sequence * mNumKVHeads;
+                size_t seq_lengths_size = sizeof(int) * batch_beam;
                 void* sparse_kv_block_offsets
                     = reinterpret_cast<void*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_block_offsets_size));
                 int* sparse_seq_lengths
