@@ -43,8 +43,11 @@ struct SparseAttentionParams
     }
 };
 
-void invokeGatherKvPageOffsets(KVCacheIndex::UnderlyingType* output_kv_page_offsets, int* output_seq_lengths,
-    KVCacheIndex::UnderlyingType const* kv_page_offsets, int const* seq_lengths,
+void invokeGatherKvPageOffsets(
+    KVCacheIndex::UnderlyingType* output_kv_page_offsets, // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
+    int* output_seq_lengths,                              // [num_head_kv, batch_size]
+    KVCacheIndex::UnderlyingType const* kv_page_offsets,  // [batch_size, 2, max_num_pages_per_seq]
+    int const* seq_lengths,                               // [batch_size]
     SparseAttentionParams const& sparse_params, cudaStream_t stream);
 
 } // namespace kernels
