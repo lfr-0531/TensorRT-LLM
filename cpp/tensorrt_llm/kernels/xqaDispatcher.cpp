@@ -399,8 +399,19 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.qPtr = xqa_q_input_ptr;
         // KV buffer
         bool use_sparse_attention = (params.sparse_attn_indices != nullptr && params.sparse_attn_offsets != nullptr);
+
+        // Use block sparse attention.
+        tllmRunnerParams.mUseBlockSparseAttention = false;
+
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
+            // Paged KV
+            tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
+            tllmRunnerParams.kvPtr = kv_cache_buffer.mPrimaryPoolPtr;
+            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
+            tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
+            tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
+
             // Gather kv page offsets for sparse attention.
             if (use_sparse_attention)
             {
@@ -411,17 +422,16 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
                 sparse_params.num_head_kv = num_kv_heads;
                 sparse_params.tokens_per_page = kv_cache_buffer.mTokensPerBlock;
                 sparse_params.max_num_pages_per_seq = kv_cache_buffer.mMaxBlocksPerSeq;
-                invokeGatherKvPageOffsets(params.sparse_kv_block_offsets, params.sparse_seq_lengths,
-                    launchParams.cu_kv_seq_lens, params.sequence_lengths, sparse_params, params.stream);
+                invokeGatherKvPageOffsets(
+                    reinterpret_cast<KVCacheIndex::UnderlyingType*>(params.sparse_kv_block_offsets),
+                    params.sparse_seq_lengths, tllmRunnerParams.kvPageIdxPtr, params.sequence_lengths, sparse_params,
+                    params.stream);
                 sync_check_cuda_error(params.stream);
+                tllmRunnerParams.seqLensKvPtr = params.sparse_seq_lengths;
+                tllmRunnerParams.kvPageIdxPtr
+                    = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(params.sparse_kv_block_offsets);
+                tllmRunnerParams.mUseBlockSparseAttention = true;
             }
-
-            // Paged KV
-            tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
-            tllmRunnerParams.kvPtr = kv_cache_buffer.mPrimaryPoolPtr;
-            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
-            tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
-            tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
         }
         else
         {
