@@ -701,7 +701,9 @@ class RocketKVCacheManager(KVCacheManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        kv_connector_manager: Optional["KvCacheConnectorManager"] = None,
         sparse_attn_config: Optional["SparseAttentionConfig"] = None,
+        **kwargs,
     ) -> None:
 
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
@@ -723,6 +725,7 @@ class RocketKVCacheManager(KVCacheManager):
             model_config=model_config,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
+            **kwargs,
         )
         self.page_size = sparse_attn_config.page_size
         self.prompt_budget = sparse_attn_config.prompt_budget
