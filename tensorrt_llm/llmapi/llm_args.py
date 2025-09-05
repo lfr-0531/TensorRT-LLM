@@ -1993,6 +1993,7 @@ class BaseLlmArgs(StrictBaseModel):
             )
 
         executor_config.enable_chunked_context = self.enable_chunked_prefill
+        executor_config.sparse_attention_config = self.sparse_attention_config
         executor_config.max_beam_width = self.max_beam_width
         if self.cache_transceiver_config is not None:
             executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
