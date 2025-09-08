@@ -269,7 +269,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             device=k.device).unsqueeze(0).unsqueeze(0).expand(
                 bsz, self.num_kv_heads, -1)
         selected_indices = torch.cat([selected_prefix_indices, window_indices],
-                                     dim=-1)
+                                     dim=-1).transpose(1, 2)
 
         k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
         k_snap = triton_index_gather(k, selected_indices)
@@ -285,7 +285,7 @@ class RocketTrtllmAttention(TrtllmAttention):
                                              target_seq_len, kt_cache_slot,
                                              kt_cache_position)
 
-        return selected_indices.transpose(1, 2)
+        return selected_indices
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor, past_seen_token: int,
                             kt_cache_slot: int,
