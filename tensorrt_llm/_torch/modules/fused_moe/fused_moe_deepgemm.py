@@ -2,10 +2,10 @@ import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+import triton
+import triton.language as tl
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
@@ -28,7 +28,7 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @triton.jit
-def _masked_index_copy_group_quant_fp8(
+def _masked_index_copy_group_quant_fp8_scale_ue8m0(
     input_ptr,
     out_q_ptr,
     out_s_ptr,
@@ -95,6 +95,67 @@ def _masked_index_copy_group_quant_fp8(
         tl.store(output_s_offs + idx_s, output_s_int32)
 
 
+@triton.jit
+def _masked_index_copy_group_quant_fp8(
+    input_ptr,
+    out_q_ptr,
+    out_s_ptr,
+    # mask indices
+    start_offsets_ptr,
+    row_indices_ptr,
+    # dimensions
+    row_size,
+    col_size,
+    dim_size,
+    group_size,
+    # output scale factor size
+    aligned_col,
+    aligned_dim,
+    # quantization parameters
+    eps,
+    fp8_max,
+    # block size
+    BLOCK: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    group_block = tl.program_id(0)
+    token_block = tl.program_id(1)
+    token_block_num = tl.num_programs(1)
+
+    # calculate group and element offsets
+    num_tokens = tl.load(start_offsets_ptr + row_size)
+    elem_offsets = group_block * group_size + tl.arange(0, BLOCK)
+    output_s_offs = out_s_ptr + group_block
+
+    # process tokens
+    for token_index in tl.range(token_block,
+                                num_tokens,
+                                token_block_num,
+                                num_stages=NUM_STAGE):
+        # load indices
+        row_idx = tl.load(row_indices_ptr + token_index)
+        start_offset = tl.load(start_offsets_ptr + row_idx)
+        idx = row_idx * col_size + token_index - start_offset
+        idx_s = row_idx * aligned_col + token_index - start_offset
+
+        # load input data
+        valid = elem_offsets < dim_size
+        input_data = tl.load(input_ptr + token_index * dim_size + elem_offsets,
+                             mask=valid,
+                             other=0.0)
+        # quantization
+        _absmax = tl.maximum(tl.max(tl.abs(input_data)), eps)
+        output_s = _absmax / fp8_max
+        output_q = tl.clamp(input_data / output_s, -fp8_max,
+                            fp8_max).to(out_q_ptr.dtype.element_ty)
+
+        # store quantized values and scaling factor
+        tl.store(out_q_ptr + idx * dim_size + elem_offsets,
+                 output_q,
+                 mask=valid)
+        tl.store(output_s_offs + idx_s * aligned_dim, output_s)
+
+
 def masked_index_copy_group_quant_fp8(
     output: torch.Tensor,
     output_s: torch.Tensor,
@@ -103,6 +164,7 @@ def masked_index_copy_group_quant_fp8(
     row_indices: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
+    scale_ue8m0: bool = True,
 ):
     assert (
         input.shape[-1] % group_size == 0
@@ -118,28 +180,25 @@ def masked_index_copy_group_quant_fp8(
     col_size = output.shape[1]
     dim_size = output.shape[2]
 
-    alignment = 4
+    alignment = 4 if scale_ue8m0 else 1
     scale_dim = (dim_size + group_size - 1) // group_size
     padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
     padded_col_size = (col_size + alignment - 1) // alignment * alignment
+    if scale_ue8m0:
+        padded_dim_size = padded_dim_size // 4
 
     # get block/grid/stage/warp
     num_groups = (dim_size + group_size - 1) // group_size
     BLOCK = group_size
     if num_tokens <= 1000 or col_size <= 256:  # Small workload
-        TOKEN_BLOCK_NUM = 256
-        NUM_STAGES = 4
-        num_warps = 2
+        params = (256, 4, 2) if scale_ue8m0 else (64, 6, 2)
     elif num_tokens <= 10000 or col_size <= 2048:  # Medium workload
-        TOKEN_BLOCK_NUM = 1024
-        NUM_STAGES = 2
-        num_warps = 1
+        params = (1024, 2, 1) if scale_ue8m0 else (128, 4, 1)
     else:  # Large workload
-        TOKEN_BLOCK_NUM = 2048
-        NUM_STAGES = 2
-        num_warps = 1
+        params = (2048, 2, 1) if scale_ue8m0 else (512, 4, 1)
+    TOKEN_BLOCK_NUM, NUM_STAGES, num_warps = params
     grid = (
-        (num_groups + 3) // 4,
+        (num_groups + 3) // 4 if scale_ue8m0 else num_groups,
         TOKEN_BLOCK_NUM,
     )
 
@@ -147,7 +206,11 @@ def masked_index_copy_group_quant_fp8(
     finfo = torch.finfo(torch.float8_e4m3fn)
     fp8_max = finfo.max
 
-    _masked_index_copy_group_quant_fp8[grid](
+    if scale_ue8m0:
+        kernel = _masked_index_copy_group_quant_fp8_scale_ue8m0
+    else:
+        kernel = _masked_index_copy_group_quant_fp8
+    kernel[grid](
         input,
         output,
         output_s,
@@ -158,14 +221,15 @@ def masked_index_copy_group_quant_fp8(
         dim_size,
         group_size,
         padded_col_size,
-        padded_dim_size // 4,
+        padded_dim_size,
         eps,
         fp8_max,
         BLOCK=BLOCK,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
     )
-    output_s = output_s.transpose(1, 2)[:, :col_size, :]
+    if scale_ue8m0:
+        output_s = output_s.transpose(1, 2)[:, :col_size, :]
     return output_s
 
 
