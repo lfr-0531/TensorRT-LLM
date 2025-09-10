@@ -185,6 +185,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Input QKV buffers.
     void const* qPtr;
@@ -324,6 +326,8 @@ struct TllmGenSelectKernelParams
     int mTileSizeKv;
     // Use 2 CTA MMA or not.
     bool mUses2CtaMma;
+    // Use block sparse attention or not.
+    bool mUseBlockSparseAttention;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -337,7 +341,8 @@ struct TllmGenSelectKernelParams
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)
         , mTileSizeKv(128)
-        , mUses2CtaMma(false){};
+        , mUses2CtaMma(false)
+        , mUseBlockSparseAttention(false){};
 };
 
 } // namespace kernels

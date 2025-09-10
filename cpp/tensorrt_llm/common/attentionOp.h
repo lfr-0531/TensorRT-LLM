@@ -355,7 +355,7 @@ public:
 
     [[nodiscard]] bool useSparseAttention() const
     {
-        return mUseSparseAttention;
+        return mUseSparseAttention && mPagedKVCache && mEnableXQA;
     }
 
     [[nodiscard]] int smVersion() const

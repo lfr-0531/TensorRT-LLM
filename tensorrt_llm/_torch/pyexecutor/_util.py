@@ -111,7 +111,6 @@ class KvCacheCreator:
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
-        
 
     def _get_free_gpu_memory_fraction(self) -> float:
         fraction = self._executor_config.kv_cache_config.free_gpu_memory_fraction
