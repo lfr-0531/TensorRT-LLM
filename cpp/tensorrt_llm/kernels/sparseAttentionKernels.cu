@@ -93,7 +93,6 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_
     // Launch the kernel.
     gatherKvPageOffsetsKernel<<<grid, block, 0, stream>>>(
         output_kv_page_offsets, output_seq_lengths, kv_page_offsets, seq_lengths, sparse_params);
-    cudaStreamSynchronize(stream); // TODO: remove this
 }
 } // namespace kernels
 } // namespace tensorrt_llm
