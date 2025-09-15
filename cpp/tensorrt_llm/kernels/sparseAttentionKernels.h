@@ -10,8 +10,8 @@ namespace kernels
 
 struct SparseAttentionParams
 {
-    int32_t* sparse_kv_indices{nullptr};   // [num_sparse_kv_indices, num_kv_heads]
-    int32_t* sparse_attn_indices{nullptr}; // [num_sparse_attn_indices, num_kv_heads]
+    int32_t* sparse_kv_indices{nullptr};   // [num_kv_heads, num_sparse_kv_indices]
+    int32_t* sparse_attn_indices{nullptr}; // [num_kv_heads, num_sparse_attn_indices]
     int32_t* sparse_kv_offsets{nullptr};   // [num_contexts + 1]
     int32_t* sparse_attn_offsets{nullptr}; // [num_generations + 1]
 
@@ -39,6 +39,23 @@ struct SparseAttentionParams
     {
         return std::make_tuple(sparse_kv_indices, sparse_attn_indices, sparse_kv_offsets, sparse_attn_offsets,
             batch_size, num_head_kv, tokens_per_page, max_num_pages_per_seq);
+    }
+};
+
+struct Pair
+{
+    int32_t max_val;
+    int32_t sum_val;
+};
+
+struct PairReduceOp
+{
+    inline __device__ Pair operator()(Pair const& a, Pair const& b) const
+    {
+        Pair result;
+        result.max_val = a.max_val > b.max_val ? a.max_val : b.max_val;
+        result.sum_val = a.sum_val + b.sum_val;
+        return result;
     }
 };
 
