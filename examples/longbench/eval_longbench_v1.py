@@ -313,6 +313,7 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             model=args.model_path,
             backend=args.backend,
             kv_cache_config=kv_cache_config,
+            max_batch_size=args.max_batch_size,
             attn_backend=args.attention_backend,
             max_batch_size=args.max_batch_size,
             sparse_attention_config=sparse_attention_config,
