@@ -1237,7 +1237,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
+            sparse_kv_indices, sparse_kv_offsets = self.batched_sparse_attention_predict(
+                q, k, metadata)
+            if sparse_kv_indices is not None:
+                sparse_kv_indices = sparse_kv_indices.transpose(
+                    0, 1).contiguous()  # Workaround now
+
+            sparse_attn_indices, sparse_attn_offsets = None, None
+            _, _, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
                 q, k, metadata)
             sparse_attn_indices, sparse_attn_offsets = None, None
             if sparse_kv_indices is not None:
