@@ -59,7 +59,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
 
-    parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.4)
 
     parser.add_argument('--num_samples', type=int, default=1)
 

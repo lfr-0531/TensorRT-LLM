@@ -108,13 +108,12 @@ def _update_kt_cache_ctx_kernel(k_ptr, cache_ptr, block_offsets_ptr,
         k_min = tl.full((BLOCK_SIZE, ), float('inf'), dtype=tl.float32)
         k_max = tl.full((BLOCK_SIZE, ), float('-inf'), dtype=tl.float32)
         for i in range(kt_page_size):
-            token_mask = (global_kv_token_idx + i) < kv_end_idx
-            mask = token_mask & dim_mask
-            k = tl.load(k_base + i * hidden_size + hidden_indices,
-                        mask=mask,
-                        other=0.0)
-            k_min = tl.minimum(k_min, k)
-            k_max = tl.maximum(k_max, k)
+            if global_kv_token_idx + i < kv_end_idx:
+                k = tl.load(k_base + i * hidden_size + hidden_indices,
+                            mask=dim_mask,
+                            other=0.0)
+                k_min = tl.minimum(k_min, k)
+                k_max = tl.maximum(k_max, k)
         k_min = k_min.to(cache_ptr.dtype.element_ty)
         k_max = k_max.to(cache_ptr.dtype.element_ty)
 

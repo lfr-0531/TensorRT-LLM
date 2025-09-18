@@ -281,12 +281,12 @@ class RocketTrtllmAttention(TrtllmAttention):
                                      dim=-1).transpose(1, 2)
 
         k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
-        triton_index_gather(k, selected_indices)
+        k_snap = triton_index_gather(k, selected_indices)
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
         triton_update_kt_cache(
-            k.squeeze(0),
+            k_snap.squeeze(0).contiguous(),
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
             metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
@@ -325,7 +325,7 @@ class RocketTrtllmAttention(TrtllmAttention):
 
         # Update KT cache
         kt_states = triton_update_kt_cache(
-            k.squeeze(0), kt_cache_tensor,
+            k.squeeze(0).contiguous(), kt_cache_tensor,
             metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
             metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
             self.page_size, metadata.tokens_per_block,
