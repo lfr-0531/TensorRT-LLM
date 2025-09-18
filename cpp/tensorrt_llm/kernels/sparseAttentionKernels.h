@@ -20,6 +20,7 @@ struct SparseAttentionParams
     int32_t num_head_kv{0};
     int32_t tokens_per_page{0};
     int32_t max_num_pages_per_seq{0};
+    int32_t num_sparse_kv_tokens{0};
 
     std::string toString() const
     {
@@ -31,14 +32,15 @@ struct SparseAttentionParams
            << "batch_size: " << this->batch_size << std::endl
            << "num_head_kv: " << this->num_head_kv << std::endl
            << "tokens_per_page: " << this->tokens_per_page << std::endl
-           << "max_num_pages_per_seq: " << this->max_num_pages_per_seq << std::endl;
+           << "max_num_pages_per_seq: " << this->max_num_pages_per_seq << std::endl
+           << "num_sparse_kv_tokens: " << this->num_sparse_kv_tokens << std::endl;
         return ss.str();
     }
 
     auto data() const
     {
         return std::make_tuple(sparse_kv_indices, sparse_attn_indices, sparse_kv_offsets, sparse_attn_offsets,
-            batch_size, num_head_kv, tokens_per_page, max_num_pages_per_seq);
+            batch_size, num_head_kv, tokens_per_page, max_num_pages_per_seq, num_sparse_kv_tokens);
     }
 };
 
