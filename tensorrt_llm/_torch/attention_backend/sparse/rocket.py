@@ -285,11 +285,14 @@ class RocketTrtllmAttention(TrtllmAttention):
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
+        k_snap_len = torch.clamp(
+            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
+            max=self.prompt_budget).int()
         triton_update_kt_cache(
             k_snap.squeeze(0).contiguous(),
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
-            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
+            k_snap_len,
             self.page_size,
             metadata.tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
