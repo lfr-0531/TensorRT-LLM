@@ -547,6 +547,7 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
+    @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig,
                                  executor_config: ExecutorConfig,
                                  mapping: Mapping):

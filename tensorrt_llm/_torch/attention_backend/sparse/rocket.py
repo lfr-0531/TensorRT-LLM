@@ -749,7 +749,7 @@ class RocketKVCacheManager(KVCacheManager):
             dtype=torch.int32) * tokens_per_block * num_kv_heads * head_dim * 2
         self.max_kt_blocks_per_seq = self.num_blocks
 
-        # Block manager to manage the KT cache blocks for each request. Different layers have share the
+        # Block manager to manage the KT cache blocks for each request. Different layers share the
         # same block ids.
         self.paged_kt_block_ids = dict()
         self.free_blocks = deque(range(self.num_blocks))
