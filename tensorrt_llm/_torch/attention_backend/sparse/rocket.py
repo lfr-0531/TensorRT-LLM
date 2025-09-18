@@ -20,7 +20,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import triton_index_gather
+from .kernel import triton_index_gather, triton_update_kt_cache
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -174,7 +174,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             if i < num_contexts:
                 # Context phase: SnapKV sparse kv indices
                 _sparse_kv_indices = self._get_snapkv_indices(
-                    single_q, single_k, past_seen_token, metadata)
+                    single_q, single_k, past_seen_token, metadata, i)
                 if _sparse_kv_indices is not None:
                     sparse_kv_indices.append(
                         _sparse_kv_indices.squeeze(0))  # [budget, num_kv_heads]
@@ -185,7 +185,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             else:
                 # Generation phase: RocketKV sparse attention indices
                 _sparse_attn_indices = self._rocketkv_selection(
-                    single_q, single_k, past_seen_token, metadata)
+                    single_q, single_k, past_seen_token, metadata, i)
                 if _sparse_attn_indices is not None:
                     sparse_attn_indices.append(
                         _sparse_attn_indices.squeeze(0))  # [topk, num_kv_heads]
@@ -214,9 +214,9 @@ class RocketTrtllmAttention(TrtllmAttention):
 
         return sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets
 
-    def _get_snapkv_indices(
-            self, q: Tensor, k: Tensor, past_seen_token: int,
-            metadata: RocketTrtllmAttentionMetadata) -> Optional[Tensor]:
+    def _get_snapkv_indices(self, q: Tensor, k: Tensor, past_seen_token: int,
+                            metadata: RocketTrtllmAttentionMetadata,
+                            sample_idx: int) -> Optional[Tensor]:
         """
         Get SnapKV sparse kv indices from the input sequence for context phase.
         The shape of output is (1, prompt_budget, num_kv_heads)
@@ -281,22 +281,25 @@ class RocketTrtllmAttention(TrtllmAttention):
                                      dim=-1).transpose(1, 2)
 
         k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
-        k_snap = triton_index_gather(k, selected_indices)
+        triton_index_gather(k, selected_indices)
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
-        target_seq_len = past_seen_token + k_snap.size(1)
-        kt_cache_position = torch.arange(past_seen_token // self.page_size,
-                                         math.ceil(target_seq_len /
-                                                   self.page_size),
-                                         device=q.device)
-        self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
-                                             target_seq_len, kt_cache_position)
+        triton_update_kt_cache(
+            k.squeeze(0),
+            kt_cache_tensor,
+            metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
+            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
+            self.page_size,
+            metadata.tokens_per_block,
+            metadata.kv_cache_manager.max_kt_blocks_per_seq,
+            update=False)
 
         return selected_indices
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor, past_seen_token: int,
-                            metadata: RocketTrtllmAttentionMetadata) -> Tensor:
+                            metadata: RocketTrtllmAttentionMetadata,
+                            sample_idx: int) -> Tensor:
         """
         Implement RocketKV's two-stage selection process for generation phase.
         The shape of output is (1, topk, num_kv_heads)
@@ -321,12 +324,13 @@ class RocketTrtllmAttention(TrtllmAttention):
         target_seq_len = past_seen_token + 1  # +1 for current token
 
         # Update KT cache
-        kt_cache_position = torch.arange(past_seen_token // self.page_size,
-                                         math.ceil(target_seq_len /
-                                                   self.page_size),
-                                         device=q.device)
-        kt_states = self._single_request_update_kt_cache(
-            k, kt_cache_tensor, target_seq_len, kt_cache_position)
+        kt_states = triton_update_kt_cache(
+            k.squeeze(0), kt_cache_tensor,
+            metadata.kt_cache_block_offsets[sample_idx:sample_idx + 1],
+            metadata.kv_lens_cuda_runtime[sample_idx:sample_idx + 1],
+            self.page_size, metadata.tokens_per_block,
+            metadata.kv_cache_manager.max_kt_blocks_per_seq)
+        kt_states = kt_states.unsqueeze(0).permute(0, 2, 3, 1)
 
         # Reshape query for multi-head processing
         qi = q.view(bsz, self.num_kv_heads, self.num_heads // self.num_kv_heads,
@@ -361,45 +365,6 @@ class RocketTrtllmAttention(TrtllmAttention):
         iKV = i2[:, :, 0, 0, :].transpose(1, 2)  # (1, topk, num_kv_heads)
 
         return iKV
-
-    def _single_request_update_kt_cache(self, k, kt_cache_tensor, seq_len,
-                                        cache_position):
-        """Update KT cache for RocketKV algorithm."""
-        # (1, num_kv_heads, 2*head_dim, num_pages_per_block)
-        k_out = kt_cache_tensor[0, :, :, :]
-
-        # k: (1, seq_len, num_kv_heads, head_dim)
-        if k is not None:
-            padding_len = self.page_size - (
-                (k.size(1) - 1) % self.page_size + 1)
-            padding_tensor = torch.full(
-                (k.size(0), padding_len, k.size(2), k.size(3)),
-                float('inf'),
-                device=k.device,
-                dtype=k.dtype)
-            # (1, seq_len+padding_len, num_kv_heads, head_dim)
-            k_min = torch.cat([k, padding_tensor], dim=1)
-            # (1, num_pages, num_kv_heads, head_dim)->(1, num_kv_heads, head_dim, num_pages)
-            k_min = k_min.reshape(
-                k_min.size(0),
-                k_min.size(1) // self.page_size, self.page_size, k.size(2),
-                k_min.size(3)).amin(dim=2).permute(0, 2, 3, 1)
-            k_max = torch.cat([k, -padding_tensor], dim=1)
-            k_max = k_max.reshape(
-                k_max.size(0),
-                k_max.size(1) // self.page_size, self.page_size, k.size(2),
-                k_max.size(3)).amax(dim=2).permute(0, 2, 3, 1)
-            k_value = torch.cat([
-                torch.min(k_min, k_out[:, :, :k_min.size(-2), cache_position]),
-                torch.max(k_max, k_out[:, :,
-                                       k_max.size(-2):, cache_position])
-            ],
-                                dim=-2)
-            access_type = self._access_type[k_value.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(
-                -1, cache_position, k_value.view(dtype=access_type))
-
-        return k_out[:, :, :, :math.ceil(seq_len / self.page_size)]
 
 
 class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
@@ -747,9 +712,9 @@ class RocketKVCacheManager(KVCacheManager):
                 device="cuda",
                 dtype=torch.bfloat16) for _ in range(self.num_local_layers)
         ]
-        self.base_kt_block_offsets = torch.arange(
-            self.num_blocks, device="cpu",
-            dtype=torch.int32) * tokens_per_block * num_kv_heads * head_dim * 2
+        self.base_kt_block_offsets = torch.arange(self.num_blocks,
+                                                  device="cpu",
+                                                  dtype=torch.int32)
         self.max_kt_blocks_per_seq = self.num_blocks
 
         # Block manager to manage the KT cache blocks for each request. Different layers share the
