@@ -493,8 +493,11 @@ class RocketVanillaAttention(VanillaAttention):
                                          math.ceil(target_seq_len /
                                                    self.page_size),
                                          device=q.device)
-        self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
-                                             target_seq_len, kt_cache_position)
+        self._single_request_update_kt_cache(k_snap,
+                                             kt_cache_tensor,
+                                             target_seq_len,
+                                             kt_cache_position,
+                                             update=False)
         return sparse_kv_indices, k_snap.size(1)
 
     def _single_request_sparse_attn_predict(
@@ -581,8 +584,12 @@ class RocketVanillaAttention(VanillaAttention):
 
         return selected_indices.transpose(1, 2)
 
-    def _single_request_update_kt_cache(self, k, kt_cache_tensor, seq_len,
-                                        cache_position):
+    def _single_request_update_kt_cache(self,
+                                        k,
+                                        kt_cache_tensor,
+                                        seq_len,
+                                        cache_position,
+                                        update=True):
         """Update KT cache for RocketKV algorithm."""
         # (1, num_pages_per_block, num_kv_heads, 2*head_dim)
         k_out = kt_cache_tensor[0, :, :, :].unsqueeze(0)
@@ -592,33 +599,28 @@ class RocketVanillaAttention(VanillaAttention):
             padding_len = self.page_size - (
                 (k.size(1) - 1) % self.page_size + 1)
             padding_tensor = torch.full(
-                (k.size(0), padding_len, k.size(2), k.size(3)),
+                (1, padding_len, self.num_kv_heads, self.head_dim),
                 float('inf'),
                 device=k.device,
                 dtype=k.dtype)
             # (1, seq_len+padding_len, num_kv_heads, head_dim)
             k_min = torch.cat([k, padding_tensor], dim=1)
-            k_min = k_min.reshape(k_min.size(0),
-                                  k_min.size(1) // self.page_size,
-                                  self.page_size, k.size(2),
-                                  k_min.size(3)).amin(dim=2)
+            k_min = k_min.reshape(1, -1, self.page_size, self.num_kv_heads,
+                                  self.head_dim).amin(dim=2)
             k_max = torch.cat([k, -padding_tensor], dim=1)
-            k_max = k_max.reshape(k_max.size(0),
-                                  k_max.size(1) // self.page_size,
-                                  self.page_size, k.size(2),
-                                  k_max.size(3)).amax(dim=2)
-            k_value = torch.cat([
-                torch.min(k_min, k_out[:, cache_position, :, :k_min.size(-1)]),
-                torch.max(k_max, k_out[:, cache_position, :,
-                                       k_max.size(-1):])
-            ],
-                                dim=-1)
+            k_max = k_max.reshape(1, -1, self.page_size, self.num_kv_heads,
+                                  self.head_dim).amax(dim=2)
+            if update:
+                k_min = torch.min(k_min,
+                                  k_out[:, cache_position, :, :self.head_dim])
+                k_max = torch.max(k_max, k_out[:, cache_position, :,
+                                               self.head_dim:])
+            k_value = torch.cat([k_min, k_max], dim=-1)
             access_type = self._access_type[k_value.dtype.itemsize]
             k_out.view(dtype=access_type).index_copy_(
                 1, cache_position, k_value.view(dtype=access_type))
 
-        return k_out[:, :math.ceil(seq_len / self.page_size), :, :].permute(
-            0, 2, 3, 1)
+        return k_out[:, :math.ceil(seq_len / self.page_size), :, :]
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor,
                             metadata: RocketVanillaAttentionMetadata,
@@ -667,7 +669,8 @@ class RocketVanillaAttention(VanillaAttention):
             i1).transpose(-1, -2)
 
         # Gather key tokens and compute attention scores
-        kt_hat = _gather(kt_states.unsqueeze(2), -2, i1_sign)
+        kt_hat = _gather(
+            kt_states.permute(0, 2, 3, 1).unsqueeze(2), -2, i1_sign)
         qk_hat = qi_hat @ kt_hat
         qk_hat = qk_hat.repeat_interleave(self.page_size,
                                           dim=-1)[:, :, :, :, :target_seq_len]
