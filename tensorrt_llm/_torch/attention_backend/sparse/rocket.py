@@ -19,9 +19,9 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import (batched_update_kt_cache, bmm_softmax,
-                     flatten_sparse_indices, qk_split,
-                     reshape_flatten_to_batched, triton_index_gather)
+from .kernel import (batched_update_kt_cache, flatten_sparse_indices,
+                     fused_qk_split, reshape_flatten_to_batched,
+                     separated_bmm_softmax, triton_index_gather)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -203,18 +203,18 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.context_cumsum_cuda[:self.num_contexts + 1].copy_(
             self.context_cumsum[:self.num_contexts + 1], non_blocking=True)
 
-        self.k_context_lens[:self.
-                            num_contexts] = self.context_lens - self.window_size
-        self.k_context_lens_cuda[:self.num_contexts].copy_(
-            self.k_context_lens[:self.num_contexts], non_blocking=True)
-        self.max_k_context_tokens = self.k_context_lens.max().item()
-
         valid_mask = self.context_lens >= self.prompt_budget
         valid_seq_indices = torch.where(valid_mask)[0]
         invalid_seq_indices = torch.where(~valid_mask)[0]
         valid_batch_size = len(valid_seq_indices)
         self.valid_seq_indices_cuda[:valid_batch_size].copy_(valid_seq_indices,
                                                              non_blocking=True)
+
+        self.k_context_lens[:valid_batch_size] = self.context_lens[
+            valid_seq_indices] - self.window_size
+        self.k_context_lens_cuda[:valid_batch_size].copy_(
+            self.k_context_lens[:valid_batch_size], non_blocking=True)
+        self.max_k_context_tokens = self.k_context_lens.max().item()
 
         sparse_counts = torch.zeros(self.num_contexts,
                                     dtype=torch.int32,
@@ -248,7 +248,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.q_output_offsets[:valid_batch_size], non_blocking=True)
 
         self.k_cu_seqlens[1:valid_batch_size + 1] = torch.cumsum(
-            self.k_context_lens[valid_seq_indices], dim=0)
+            self.k_context_lens[:valid_batch_size], dim=0)
         self.k_extract_lengths[:
                                valid_batch_size] = self.k_context_lens[:
                                                                        valid_batch_size]
@@ -262,6 +262,9 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.k_extract_lengths[:valid_batch_size], non_blocking=True)
         self.k_output_offsets_cuda[:valid_batch_size].copy_(
             self.k_output_offsets[:valid_batch_size], non_blocking=True)
+
+        self.valid_batch_size = valid_batch_size
+        self.total_sparse_tokens = self.sparse_offsets[self.num_contexts].item()
 
 
 class RocketTrtllmAttention(TrtllmAttention):
@@ -383,8 +386,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         return preprocess_inputs
 
     def batched_ctx_sparse_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: RocketTrtllmAttentionMetadata
+        self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse KV indices using optimized SnapKV algorithm.
@@ -393,39 +395,36 @@ class RocketTrtllmAttention(TrtllmAttention):
         and prefix tokens, then selects the most important prefix tokens directly.
         """
 
-        if metadata.num_ctx_tokens == 0:
+        num_ctx_tokens = metadata.num_ctx_tokens
+        if num_ctx_tokens == 0:
             return None, None
 
-        q = q.view(-1, self.num_heads, self.head_dim).transpose(0,
-                                                                1).contiguous()
-        k = k.view(-1, self.num_kv_heads,
-                   self.head_dim).transpose(0, 1).contiguous()
+        qkv_input = qkv[:num_ctx_tokens]
+        q_window, k_context = fused_qk_split(qkv_input, self.num_heads,
+                                             self.num_kv_heads, self.head_dim,
+                                             self.window_size,
+                                             self.prompt_budget, metadata)
 
-        # Split Q and K tensors using Triton kernel
-        q_window, k_context = qk_split(q, k, self.window_size,
-                                       self.prompt_budget, metadata)
-
-        q_cu_seqlens = metadata.q_cu_seqlens_cuda[:metadata.num_contexts + 1]
-        k_cu_seqlens = metadata.k_cu_seqlens_cuda[:metadata.num_contexts + 1]
-        scores = bmm_softmax(q_window,
-                             k_context,
-                             q_cu_seqlens,
-                             k_cu_seqlens,
-                             causal=False)
+        scores = separated_bmm_softmax(q_window,
+                                       k_context,
+                                       metadata.q_cu_seqlens_cuda,
+                                       metadata.k_cu_seqlens_cuda,
+                                       metadata.valid_batch_size,
+                                       causal=False)
 
         scores = scores.view(self.num_kv_heads,
                              self.num_heads // self.num_kv_heads,
                              self.window_size, -1).sum(dim=-2).sum(dim=1)
 
         padding_size = metadata.max_k_context_tokens
-        k_context_lens = metadata.k_context_lens_cuda[:metadata.
-                                                      num_contexts].clone()
 
         # Reshape scores to handle variable length sequences with padding using Triton
         # scores: [num_kv_heads, total_k_tokens] -> [valid_batch_size, num_kv_heads, padding_size]
-        valid_batch_size = len(k_context_lens)
-        scores = reshape_flatten_to_batched(scores, k_context_lens,
-                                            k_cu_seqlens, padding_size)
+        scores = reshape_flatten_to_batched(scores,
+                                            metadata.k_context_lens_cuda,
+                                            metadata.k_cu_seqlens_cuda,
+                                            metadata.valid_batch_size,
+                                            padding_size)
 
         scores = torch.nn.functional.max_pool1d(scores,
                                                 kernel_size=self.kernel_size,
@@ -436,39 +435,27 @@ class RocketTrtllmAttention(TrtllmAttention):
                                               self.window_size,
                                               dim=-1).indices.sort().values
 
-        # Combine selected prefix indices with window indices
-        window_indices = k_context_lens.unsqueeze(1) + torch.arange(
-            self.window_size, device=k.device).unsqueeze(0)
-        window_indices = window_indices.unsqueeze(1).expand(
-            valid_batch_size, self.num_kv_heads, -1)
-
-        selected_indices = torch.cat(
-            [selected_prefix_indices, window_indices], dim=-1).to(
-                torch.int32)  # [valid_batch_size, num_kv_heads, prompt_budget]
-
         # Flatten sparse indices
-        valid_seq_indices = metadata.valid_seq_indices_cuda[:valid_batch_size]
-        sparse_offsets = metadata.sparse_offsets_cuda[:metadata.num_contexts +
-                                                      1]
-        context_lens = metadata.context_lens_cuda[:metadata.num_contexts]
+        selected_prefix_indices = selected_prefix_indices.to(torch.int32)
+        sparse_kv_indices = flatten_sparse_indices(
+            selected_prefix_indices, metadata.context_lens_cuda,
+            metadata.valid_seq_indices_cuda, metadata.k_context_lens_cuda,
+            metadata.sparse_offsets_cuda, metadata.num_contexts,
+            metadata.total_sparse_tokens, self.window_size, self.prompt_budget)
 
-        sparse_kv_indices = flatten_sparse_indices(selected_indices,
-                                                   context_lens,
-                                                   valid_seq_indices,
-                                                   sparse_offsets,
-                                                   self.prompt_budget)
-
-        context_kt_cache_slot = metadata.kt_cache_slots_cuda[:metadata.
-                                                             num_contexts]
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
         max_num_pages = (metadata.max_k_context_tokens + self.page_size -
                          1) // self.page_size
-        batched_update_kt_cache(k, kt_cache_tensor, context_kt_cache_slot,
-                                sparse_kv_indices, sparse_offsets,
-                                max_num_pages, self.page_size)
+        batched_update_kt_cache(qkv_input, kt_cache_tensor,
+                                metadata.kt_cache_slots_cuda, sparse_kv_indices,
+                                metadata.sparse_offsets_cuda,
+                                metadata.num_contexts, self.num_heads,
+                                self.num_kv_heads, self.head_dim, max_num_pages,
+                                self.page_size)
 
-        return sparse_kv_indices, sparse_offsets
+        return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
+                                                               num_contexts + 1]
 
     def batched_gen_sparse_predict(
         self, q: torch.Tensor, k: torch.Tensor,
@@ -483,16 +470,8 @@ class RocketTrtllmAttention(TrtllmAttention):
         """
         Predict sparse KV indices and sparse attention indices for the input sequence.
         """
-        q, k, v = q.split([
-            self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim,
-            self.num_kv_heads * self.head_dim
-        ],
-                          dim=-1)
-
-        num_ctx_tokens = metadata.num_ctx_tokens
-
         sparse_kv_indices, sparse_kv_offsets = self.batched_ctx_sparse_predict(
-            q[:num_ctx_tokens], k[:num_ctx_tokens], metadata)
+            q, metadata)
 
         return sparse_kv_indices, sparse_kv_offsets
 
