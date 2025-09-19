@@ -82,171 +82,6 @@ def triton_index_gather(input, indices):
 
 
 @triton.jit
-def _extract_general_kernel(input_ptr, output_ptr, context_cumsum_ptr,
-                            valid_seq_indices_ptr, extract_start_offsets_ptr,
-                            extract_lengths_ptr, output_offsets_ptr, head_dim,
-                            total_tokens, total_output_tokens, num_heads,
-                            valid_batch_size, BLOCK_SIZE: tl.constexpr,
-                            BLOCK_SIZE_M: tl.constexpr):
-    """General kernel for extracting custom token ranges from sequences - optimized with token parallelism
-
-    Args:
-        input_ptr: Input tensor [num_heads, total_tokens, head_dim]
-        output_ptr: Output tensor [num_heads, total_output_tokens, head_dim]
-        context_cumsum_ptr: Cumulative sum of context lengths [batch_size + 1]
-        valid_seq_indices_ptr: Valid sequence indices [valid_batch_size]
-        extract_start_offsets_ptr: Start offset within each sequence [valid_batch_size]
-        extract_lengths_ptr: Number of tokens to extract per sequence [valid_batch_size]
-        output_offsets_ptr: Output offset for each sequence [valid_batch_size]
-    """
-    valid_seq_idx = tl.program_id(0)  # Which valid sequence
-    head_idx = tl.program_id(1)  # Which head
-    dim_offset = tl.program_id(2) * BLOCK_SIZE  # Which dimension block
-
-    if valid_seq_idx >= valid_batch_size or head_idx >= num_heads:
-        return
-
-    # Get original sequence index
-    orig_seq_idx = tl.load(valid_seq_indices_ptr + valid_seq_idx)
-
-    # Get sequence start offset in original tensor
-    seq_start_offset = tl.load(context_cumsum_ptr + orig_seq_idx)
-
-    # Get extraction parameters for this sequence
-    extract_start_offset = tl.load(extract_start_offsets_ptr + valid_seq_idx)
-    extract_length = tl.load(extract_lengths_ptr + valid_seq_idx)
-    output_offset = tl.load(output_offsets_ptr + valid_seq_idx)
-
-    # Calculate dimension indices and mask
-    dim_indices = dim_offset + tl.arange(0, BLOCK_SIZE)
-    dim_mask = dim_indices < head_dim
-
-    # Use tl.range for dynamic loop over token blocks
-    for token_block_start in tl.range(0, extract_length, BLOCK_SIZE_M):
-        # Generate token indices for current block
-        token_indices = token_block_start + tl.arange(0, BLOCK_SIZE_M)
-        token_mask = token_indices < extract_length
-
-        # Calculate source and destination positions for current token block
-        src_token_pos = seq_start_offset + extract_start_offset + token_indices  # [BLOCK_SIZE_M]
-        dst_token_pos = output_offset + token_indices  # [BLOCK_SIZE_M]
-
-        # Create 2D index arrays for parallel access
-        # src_indices: [BLOCK_SIZE_M, BLOCK_SIZE]
-        src_indices = (head_idx * total_tokens +
-                       src_token_pos[:, None]) * head_dim + dim_indices[None, :]
-        dst_indices = (head_idx * total_output_tokens +
-                       dst_token_pos[:, None]) * head_dim + dim_indices[None, :]
-
-        # Create 2D mask combining token and dimension masks
-        full_mask = token_mask[:, None] & dim_mask[
-            None, :]  # [BLOCK_SIZE_M, BLOCK_SIZE]
-
-        # Parallel load and store for current token block
-        data = tl.load(input_ptr + src_indices, mask=full_mask, other=0.0)
-        tl.store(output_ptr + dst_indices, data, mask=full_mask)
-
-
-def qk_split(q: torch.Tensor, k: torch.Tensor, window_size: int,
-             prompt_budget: int, metadata):
-    """
-    Split Q and K tensors for sparse attention computation.
-
-    Args:
-        q: Query tensor [num_heads, total_tokens, head_dim]
-        k: Key tensor [num_kv_heads, total_tokens, head_dim]
-        context_lens: Context lengths for each sequence [batch_size]
-        window_size: Size of attention window
-        prompt_budget: Minimum sequence length to be considered valid
-
-    Returns:
-        q_window: Window queries [num_heads, window_size * valid_batch_size, head_dim]
-        k_context: Context keys [num_kv_heads, sum(valid_context_lens), head_dim]
-        k_context_lens: Context lengths for valid sequences [valid_batch_size]
-        valid_seq_map: Mapping from valid sequence index to original sequence index [valid_batch_size]
-    """
-    num_heads, total_tokens, head_dim = q.shape
-    num_kv_heads = k.shape[0]
-
-    context_cumsum = metadata.context_cumsum_cuda[:metadata.num_contexts + 1]
-    valid_seq_indices = metadata.valid_seq_indices_cuda[:metadata.num_contexts]
-    q_extract_start_offsets = metadata.q_extract_start_offsets_cuda[:metadata.
-                                                                    num_contexts]
-    q_extract_lengths = metadata.q_extract_lengths_cuda[:metadata.num_contexts]
-    q_output_offsets = metadata.q_output_offsets_cuda[:metadata.num_contexts]
-    k_extract_start_offsets = metadata.k_extract_start_offsets_cuda[:metadata.
-                                                                    num_contexts]
-    k_extract_lengths = metadata.k_extract_lengths_cuda[:metadata.num_contexts]
-    k_output_offsets = metadata.k_output_offsets_cuda[:metadata.num_contexts]
-    valid_batch_size = len(valid_seq_indices)
-
-    # Calculate total K context tokens
-    total_k_context_tokens = k_extract_lengths.sum().item()
-
-    # Create output tensors
-    q_window = torch.empty(
-        (num_heads, window_size * valid_batch_size, head_dim),
-        device=q.device,
-        dtype=q.dtype)
-    k_context = torch.empty((num_kv_heads, total_k_context_tokens, head_dim),
-                            device=k.device,
-                            dtype=k.dtype)
-
-    # Launch general extraction kernel - parallel execution
-    BLOCK_SIZE = 128  # Dimension block size
-    BLOCK_SIZE_M = 128  # Token block size for parallel processing
-
-    # Create separate CUDA streams for parallel execution
-    stream_q = torch.cuda.Stream()
-    stream_k = torch.cuda.Stream()
-
-    # Asynchronously launch both kernels in parallel
-    with torch.cuda.stream(stream_q):
-        # First call: Extract Q window (last window_size tokens)
-        grid_q = (valid_batch_size, num_heads,
-                  triton.cdiv(head_dim, BLOCK_SIZE))
-        _extract_general_kernel[grid_q](q,
-                                        q_window,
-                                        context_cumsum,
-                                        valid_seq_indices,
-                                        q_extract_start_offsets,
-                                        q_extract_lengths,
-                                        q_output_offsets,
-                                        head_dim,
-                                        total_tokens,
-                                        window_size * valid_batch_size,
-                                        num_heads,
-                                        valid_batch_size,
-                                        BLOCK_SIZE=BLOCK_SIZE,
-                                        BLOCK_SIZE_M=BLOCK_SIZE_M)
-
-    with torch.cuda.stream(stream_k):
-        # Second call: Extract K context (first context_len - window_size tokens)
-        grid_k = (valid_batch_size, num_kv_heads,
-                  triton.cdiv(head_dim, BLOCK_SIZE))
-        _extract_general_kernel[grid_k](k,
-                                        k_context,
-                                        context_cumsum,
-                                        valid_seq_indices,
-                                        k_extract_start_offsets,
-                                        k_extract_lengths,
-                                        k_output_offsets,
-                                        head_dim,
-                                        total_tokens,
-                                        total_k_context_tokens,
-                                        num_kv_heads,
-                                        valid_batch_size,
-                                        BLOCK_SIZE=BLOCK_SIZE,
-                                        BLOCK_SIZE_M=BLOCK_SIZE_M)
-
-    # Synchronize both streams to ensure completion before returning
-    stream_q.synchronize()
-    stream_k.synchronize()
-
-    return q_window, k_context
-
-
-@triton.jit
 def _fused_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
                            context_cumsum_ptr, valid_seq_indices_ptr,
                            q_extract_start_offsets_ptr, q_extract_lengths_ptr,
@@ -260,17 +95,12 @@ def _fused_qk_split_kernel(input_ptr, q_output_ptr, k_output_ptr,
     """
     Fused kernel that combines tensor splitting and QK extraction with unified parallelism.
 
-    This kernel processes both Q and K heads in a single call by expanding the head dimension
-    to include both num_heads + num_kv_heads, using branch logic to handle Q vs K processing.
-
     Args:
         input_ptr: Input fused tensor [total_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
         q_output_ptr: Q output tensor [num_heads, q_total_output_tokens, head_dim]
         k_output_ptr: K output tensor [num_kv_heads, k_total_output_tokens, head_dim]
         q_start_offset: Start offset for Q in the last dimension
         k_start_offset: Start offset for K in the last dimension
-
-    Grid: (valid_batch_size, num_heads + num_kv_heads, triton.cdiv(head_dim, BLOCK_SIZE))
     """
     valid_seq_idx = tl.program_id(0)  # Which valid sequence
     head_idx = tl.program_id(1)  # Which head
@@ -355,10 +185,6 @@ def fused_qk_split(input_tensor: torch.Tensor, num_heads: int,
     """
     Fused QK split with unified kernel parallelism for optimal performance.
 
-    This function launches a single Triton kernel with expanded parallelism (num_heads + num_kv_heads)
-    to process both Q and K tensor splitting/extraction simultaneously, eliminating the need for
-    separate kernel launches and CUDA stream synchronization.
-
     Args:
         input_tensor: Fused input tensor [total_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
         num_heads: Number of Q heads
@@ -371,27 +197,26 @@ def fused_qk_split(input_tensor: torch.Tensor, num_heads: int,
     Returns:
         q_window: Window queries [num_heads, window_size * valid_batch_size, head_dim]
         k_context: Context keys [num_kv_heads, sum(valid_context_lens), head_dim]
-
-    Performance Benefits:
-        - Single kernel launch reduces GPU kernel launch overhead
-        - Doubled parallelism improves GPU utilization
-        - Eliminates CUDA stream management complexity
-        - Better memory access patterns through unified execution
     """
     total_tokens = input_tensor.shape[0]
 
     # Get metadata tensors
     context_cumsum = metadata.context_cumsum_cuda[:metadata.num_contexts + 1]
-    valid_seq_indices = metadata.valid_seq_indices_cuda[:metadata.num_contexts]
+    valid_batch_size = metadata.valid_batch_size
+    valid_seq_indices = metadata.valid_seq_indices_cuda[:metadata.
+                                                        valid_batch_size]
     q_extract_start_offsets = metadata.q_extract_start_offsets_cuda[:metadata.
-                                                                    num_contexts]
-    q_extract_lengths = metadata.q_extract_lengths_cuda[:metadata.num_contexts]
-    q_output_offsets = metadata.q_output_offsets_cuda[:metadata.num_contexts]
+                                                                    valid_batch_size]
+    q_extract_lengths = metadata.q_extract_lengths_cuda[:metadata.
+                                                        valid_batch_size]
+    q_output_offsets = metadata.q_output_offsets_cuda[:metadata.
+                                                      valid_batch_size]
     k_extract_start_offsets = metadata.k_extract_start_offsets_cuda[:metadata.
-                                                                    num_contexts]
-    k_extract_lengths = metadata.k_extract_lengths_cuda[:metadata.num_contexts]
-    k_output_offsets = metadata.k_output_offsets_cuda[:metadata.num_contexts]
-    valid_batch_size = len(valid_seq_indices)
+                                                                    valid_batch_size]
+    k_extract_lengths = metadata.k_extract_lengths_cuda[:metadata.
+                                                        valid_batch_size]
+    k_output_offsets = metadata.k_output_offsets_cuda[:metadata.
+                                                      valid_batch_size]
 
     # Calculate total K context tokens
     total_k_context_tokens = k_extract_lengths.sum().item()
@@ -662,12 +487,12 @@ def bmm_softmax(q: torch.Tensor,
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     # Create output tensor with correct shape: [num_heads, q_len_per_seq, total_k_tokens]
-    scores = torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
+    scores = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
                          dtype=torch.float32,
                          device=q.device)
 
     # Create tensor to store m_i_new values for each position
-    m_i_stored = torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
+    m_i_stored = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
                              dtype=torch.float32,
                              device=q.device)
 
@@ -822,62 +647,6 @@ def bmm_kernel(
 def softmax_kernel_batched(
     input_ptr,
     output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_rows,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Simple row-wise softmax kernel directly based on softmax_demo.py.
-
-    Args:
-        input_ptr: Input tensor pointer
-        output_ptr: Output tensor pointer
-        input_row_stride: Input row stride
-        output_row_stride: Output row stride
-        n_rows: Total number of rows to process
-        n_cols: Number of columns per row
-        BLOCK_SIZE: Block size for processing columns
-    """
-    # Each program handles one row
-    row_idx = tl.program_id(0)
-
-    if row_idx >= n_rows:
-        return
-
-    # Calculate row start pointers
-    input_row_start_ptr = input_ptr + row_idx * input_row_stride
-    output_row_start_ptr = output_ptr + row_idx * output_row_stride
-
-    # Load the entire row (with blocking for large rows)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-
-    # Load row values
-    row_values = tl.load(input_row_start_ptr + col_offsets,
-                         mask=mask,
-                         other=float('-inf'))
-
-    # Apply softmax: subtract max for numerical stability
-    row_max = tl.max(row_values, axis=0)
-    row_minus_max = row_values - row_max
-
-    # Compute exp and sum
-    numerator = tl.exp(row_minus_max)
-    denominator = tl.sum(numerator, axis=0)
-
-    # Final softmax values
-    softmax_output = numerator / denominator
-
-    # Store results
-    tl.store(output_row_start_ptr + col_offsets, softmax_output, mask=mask)
-
-
-@triton.jit
-def softmax_kernel_batched_with_seqlens(
-    input_ptr,
-    output_ptr,
     q_cu_seqlens_ptr,
     k_cu_seqlens_ptr,
     batch_size,
@@ -971,10 +740,6 @@ def separated_bmm_softmax(q: torch.Tensor,
     """
     Compute softmax(QK^T) using separated BMM and Softmax kernels.
 
-    This function splits the original bmm_softmax into two separate kernels:
-    1. BMM kernel for computing QK^T
-    2. Softmax kernel for applying softmax (respecting sequence boundaries)
-
     Args:
         q: Query tensor [num_q_heads, total_q_tokens, head_dim]
         k: Key tensor [num_kv_heads, total_k_tokens, head_dim]
@@ -1002,13 +767,13 @@ def separated_bmm_softmax(q: torch.Tensor,
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     # Step 1: BMM to compute QK^T
-    raw_scores = torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
+    raw_scores = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
                              dtype=torch.float32,
                              device=q.device)
 
     # BMM kernel configuration
     BLOCK_M = 32
-    BLOCK_N = 512
+    BLOCK_N = 256
     BLOCK_K = 64
 
     grid_bmm = lambda meta: (batch_size, num_q_heads)
@@ -1034,7 +799,7 @@ def separated_bmm_softmax(q: torch.Tensor,
     )
 
     # Step 2: Apply softmax with sequence length awareness
-    final_scores = torch.zeros_like(raw_scores)
+    final_scores = torch.empty_like(raw_scores)
 
     # Softmax kernel configuration
     SOFTMAX_BLOCK_SIZE = 1024
@@ -1042,7 +807,7 @@ def separated_bmm_softmax(q: torch.Tensor,
     # Grid: (num_heads, batch_size * q_len_per_seq)
     grid_softmax = lambda meta: (num_q_heads, batch_size * q_len_per_seq)
 
-    softmax_kernel_batched_with_seqlens[grid_softmax](
+    softmax_kernel_batched[grid_softmax](
         raw_scores,
         final_scores,
         q_cu_seqlens,
@@ -1131,11 +896,10 @@ def reshape_flatten_to_batched(
     """
     num_heads, total_tokens = input_tensor.shape
 
-    # Create output tensor filled with -inf
-    batched_tensor = torch.full((batch_size, num_heads, padding_size),
-                                padding_value,
-                                device=input_tensor.device,
-                                dtype=input_tensor.dtype)
+    # Create output tensor
+    batched_tensor = torch.empty((batch_size, num_heads, padding_size),
+                                 device=input_tensor.device,
+                                 dtype=input_tensor.dtype)
 
     # Launch kernel
     grid = lambda meta: (batch_size, num_heads)
@@ -1295,7 +1059,7 @@ def flatten_sparse_indices(
     valid_batch_size, num_kv_heads, prefix_budget = prefix_indices.shape
 
     # Create output tensor
-    sparse_indices = torch.zeros((num_kv_heads, total_sparse_tokens),
+    sparse_indices = torch.empty((num_kv_heads, total_sparse_tokens),
                                  dtype=prefix_indices.dtype,
                                  device=prefix_indices.device)
 

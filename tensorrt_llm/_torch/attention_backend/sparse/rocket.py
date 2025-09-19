@@ -35,18 +35,18 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prompt_budget = self.sparse_attention_config.prompt_budget
         self.window_size = self.sparse_attention_config.window_size
 
-        self.context_lens_cuda = torch.zeros(
+        self.context_lens_cuda = torch.empty(
             self.max_num_sequences,
             device='cuda',
             dtype=torch.int32,
         )
 
-        self.q_cu_seqlens = torch.zeros(
+        self.q_cu_seqlens = torch.empty(
             self.max_num_sequences + 1,
             device='cpu',
             dtype=torch.int32,
         )
-        self.q_cu_seqlens_cuda = torch.zeros_like(self.q_cu_seqlens,
+        self.q_cu_seqlens_cuda = torch.empty_like(self.q_cu_seqlens,
                                                   device='cuda',
                                                   dtype=torch.int32)
 
@@ -55,16 +55,16 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             dtype=torch.int32,
         )
-        self.k_cu_seqlens_cuda = torch.zeros_like(self.k_cu_seqlens,
+        self.k_cu_seqlens_cuda = torch.empty_like(self.k_cu_seqlens,
                                                   device='cuda',
                                                   dtype=torch.int32)
 
-        self.k_context_lens = torch.zeros(
+        self.k_context_lens = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.k_context_lens_cuda = torch.zeros_like(self.k_context_lens,
+        self.k_context_lens_cuda = torch.empty_like(self.k_context_lens,
                                                     device='cuda',
                                                     dtype=torch.int32)
 
@@ -77,55 +77,55 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                     device='cuda',
                                                     dtype=torch.int32)
 
-        self.q_extract_start_offsets = torch.zeros(
+        self.q_extract_start_offsets = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.q_extract_start_offsets_cuda = torch.zeros_like(
+        self.q_extract_start_offsets_cuda = torch.empty_like(
             self.q_extract_start_offsets, device='cuda', dtype=torch.int32)
 
-        self.q_extract_lengths = torch.zeros(
+        self.q_extract_lengths = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.q_extract_lengths_cuda = torch.zeros_like(self.q_extract_lengths,
+        self.q_extract_lengths_cuda = torch.empty_like(self.q_extract_lengths,
                                                        device='cuda',
                                                        dtype=torch.int32)
 
-        self.q_output_offsets = torch.zeros(
+        self.q_output_offsets = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.q_output_offsets_cuda = torch.zeros_like(self.q_output_offsets,
+        self.q_output_offsets_cuda = torch.empty_like(self.q_output_offsets,
                                                       device='cuda',
                                                       dtype=torch.int32)
 
-        self.k_extract_start_offsets = torch.zeros(
+        self.k_extract_start_offsets = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.k_extract_start_offsets_cuda = torch.zeros_like(
+        self.k_extract_start_offsets_cuda = torch.empty_like(
             self.k_extract_start_offsets, device='cuda', dtype=torch.int32)
 
-        self.k_extract_lengths = torch.zeros(
+        self.k_extract_lengths = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.k_extract_lengths_cuda = torch.zeros_like(self.k_extract_lengths,
+        self.k_extract_lengths_cuda = torch.empty_like(self.k_extract_lengths,
                                                        device='cuda',
                                                        dtype=torch.int32)
 
-        self.k_output_offsets = torch.zeros(
+        self.k_output_offsets = torch.empty(
             self.max_num_sequences,
             device='cpu',
             dtype=torch.int32,
         )
-        self.k_output_offsets_cuda = torch.zeros_like(self.k_output_offsets,
+        self.k_output_offsets_cuda = torch.empty_like(self.k_output_offsets,
                                                       device='cuda',
                                                       dtype=torch.int32)
 
@@ -138,14 +138,9 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                     device='cuda',
                                                     dtype=torch.int32)
 
-        self.valid_seq_indices = torch.zeros(
-            self.max_num_sequences,
-            device='cpu',
-            dtype=torch.int32,
-        )
-        self.valid_seq_indices_cuda = torch.zeros_like(self.valid_seq_indices,
-                                                       device='cuda',
-                                                       dtype=torch.int32)
+        self.valid_seq_indices_cuda = torch.empty(self.max_num_sequences,
+                                                  device='cuda',
+                                                  dtype=torch.int32)
 
         self.kt_cache_slots = torch.empty(
             self.max_num_sequences,
@@ -214,7 +209,13 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             valid_seq_indices] - self.window_size
         self.k_context_lens_cuda[:valid_batch_size].copy_(
             self.k_context_lens[:valid_batch_size], non_blocking=True)
-        self.max_k_context_tokens = self.k_context_lens.max().item()
+
+        if self.num_contexts > 0:
+            self.max_k_context_tokens = self.context_lens[:self.
+                                                          num_contexts].max(
+                                                          ).item()
+        else:
+            self.max_k_context_tokens = 0
 
         sparse_counts = torch.zeros(self.num_contexts,
                                     dtype=torch.int32,
@@ -303,88 +304,6 @@ class RocketTrtllmAttention(TrtllmAttention):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def preprocess_for_context(
-            self, q: torch.Tensor, k: torch.Tensor,
-            context_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_heads, total_tokens, head_dim = q.shape
-        k.shape[0]
-        batch_size = len(context_lens)
-
-        # Filter valid sequences (those with context_len >= prompt_budget)
-        valid_mask = context_lens >= self.prompt_budget
-        valid_seq_indices = torch.where(valid_mask)[0]
-        invalid_seq_indices = torch.where(~valid_mask)[0]
-        valid_batch_size = len(valid_seq_indices)
-
-        if valid_batch_size == 0:
-            return None
-
-        valid_context_lens = context_lens[valid_seq_indices]
-        k_context_lens = valid_context_lens - self.window_size
-        k_context_lens.sum()
-        max_k_context_tokens = k_context_lens.max()
-
-        # Create cumulative sum for sequence offsets (original sequences)
-        context_cumsum = torch.zeros(batch_size + 1,
-                                     device=context_lens.device,
-                                     dtype=context_lens.dtype)
-        context_cumsum[1:] = torch.cumsum(context_lens, dim=0)
-
-        # Create cumulative sum for context output offsets
-        q_cu_seqlens = torch.arange(
-            valid_batch_size + 1,
-            device=valid_context_lens.device,
-            dtype=valid_context_lens.dtype) * self.window_size
-        k_cu_seqlens = torch.zeros(valid_batch_size + 1,
-                                   device=k_context_lens.device,
-                                   dtype=k_context_lens.dtype)
-        k_cu_seqlens[1:] = torch.cumsum(k_context_lens, dim=0)
-
-        # Prepare parameters for Q extraction (last window_size tokens)
-        q_extract_start_offsets = valid_context_lens - self.window_size  # [valid_batch_size]
-        q_extract_lengths = torch.full((valid_batch_size, ),
-                                       self.window_size,
-                                       device=q.device,
-                                       dtype=torch.int32)
-        q_output_offsets = q_cu_seqlens[:
-                                        -1]  # Remove last element to get [valid_batch_size]
-
-        # Prepare parameters for K extraction (first context_len - window_size tokens)
-        k_extract_start_offsets = torch.zeros(valid_batch_size,
-                                              device=k.device,
-                                              dtype=torch.int32)
-        k_extract_lengths = k_context_lens  # [valid_batch_size]
-        k_output_offsets = k_cu_seqlens[:
-                                        -1]  # Remove last element to get [valid_batch_size]
-
-        # Calculate number of sparse tokens for each batch
-        sparse_counts = torch.zeros(batch_size,
-                                    dtype=torch.int32,
-                                    device=context_lens.device)
-        sparse_counts[valid_seq_indices] = self.prompt_budget
-        sparse_counts[invalid_seq_indices] = context_lens[invalid_seq_indices]
-        sparse_offsets = torch.zeros(batch_size + 1,
-                                     dtype=torch.int32,
-                                     device=context_lens.device)
-        sparse_offsets[1:] = torch.cumsum(sparse_counts, dim=0)
-
-        preprocess_inputs = {
-            "context_cumsum": context_cumsum,
-            "valid_seq_indices": valid_seq_indices,
-            "q_extract_start_offsets": q_extract_start_offsets,
-            "q_extract_lengths": q_extract_lengths,
-            "q_output_offsets": q_output_offsets,
-            "k_extract_start_offsets": k_extract_start_offsets,
-            "k_extract_lengths": k_extract_lengths,
-            "k_output_offsets": k_output_offsets,
-            "q_cu_seqlens": q_cu_seqlens,
-            "k_cu_seqlens": k_cu_seqlens,
-            "max_k_context_tokens": max_k_context_tokens,
-            "k_context_lens": k_context_lens,
-            "sparse_offsets": sparse_offsets,
-        }
-        return preprocess_inputs
-
     def batched_ctx_sparse_predict(
         self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -416,33 +335,31 @@ class RocketTrtllmAttention(TrtllmAttention):
                              self.num_heads // self.num_kv_heads,
                              self.window_size, -1).sum(dim=-2).sum(dim=1)
 
-        padding_size = metadata.max_k_context_tokens
-
         # Reshape scores to handle variable length sequences with padding using Triton
         # scores: [num_kv_heads, total_k_tokens] -> [valid_batch_size, num_kv_heads, padding_size]
         scores = reshape_flatten_to_batched(scores,
                                             metadata.k_context_lens_cuda,
                                             metadata.k_cu_seqlens_cuda,
                                             metadata.valid_batch_size,
-                                            padding_size)
+                                            metadata.max_k_context_tokens)
 
         scores = torch.nn.functional.max_pool1d(scores,
                                                 kernel_size=self.kernel_size,
                                                 padding=self.kernel_size // 2,
                                                 stride=1)
 
-        selected_prefix_indices = scores.topk(self.prompt_budget -
-                                              self.window_size,
-                                              dim=-1).indices.sort().values
+        selected_prefix_indices = scores.topk(
+            self.prompt_budget - self.window_size, dim=-1,
+            sorted=True).indices.to(torch.int32)
 
         # Flatten sparse indices
-        selected_prefix_indices = selected_prefix_indices.to(torch.int32)
         sparse_kv_indices = flatten_sparse_indices(
             selected_prefix_indices, metadata.context_lens_cuda,
             metadata.valid_seq_indices_cuda, metadata.k_context_lens_cuda,
             metadata.sparse_offsets_cuda, metadata.num_contexts,
             metadata.total_sparse_tokens, self.window_size, self.prompt_budget)
 
+        # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
         max_num_pages = (metadata.max_k_context_tokens + self.page_size -
