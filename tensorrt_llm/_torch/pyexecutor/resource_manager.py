@@ -10,7 +10,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -547,9 +546,7 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping):
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config

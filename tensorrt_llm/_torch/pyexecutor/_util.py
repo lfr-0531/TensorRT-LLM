@@ -10,7 +10,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SamplerType,
-                                          SpeculativeConfig, SparseAttentionConfig)
+                                          SparseAttentionConfig,
+                                          SpeculativeConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -40,10 +41,9 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
-def get_kv_cache_manager_cls(model_config: ModelConfig,
-                             executor_config: ExecutorConfig):
+def get_kv_cache_manager_cls(model_config: ModelConfig):
     config = model_config.pretrained_config
-    sparse_attn_config = executor_config.sparse_attention_config
+    sparse_attn_config = model_config.sparse_attention_config
     if is_mla(config):
         return KVCacheManager
     elif is_nemotron_hybrid(config):
@@ -93,7 +93,7 @@ class KvCacheCreator:
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config, executor_config)
+            model_engine.model.model_config)
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -144,11 +144,11 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
         kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
-            model_config, self._executor_config, mapping)
+            model_config, mapping)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                draft_model_config, self._executor_config, mapping)
+                draft_model_config, mapping)
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,

@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import ExecutorConfig, KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
@@ -1131,10 +1131,7 @@ class RocketKVCacheManager(KVCacheManager):
                     kt_cache_tensor[slot_idx, :, head_dim:, :] = float('-inf')
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping):
-        sparse_attn_config = executor_config.sparse_attention_config
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -1164,6 +1161,7 @@ class RocketKVCacheManager(KVCacheManager):
 
         # K and V
         # 2 for K and V, 2 / page_size for KT cache
+        sparse_attn_config = model_config.sparse_attention_config
         kv_factor = 2 + 2 / sparse_attn_config.page_size
         mem_per_token *= kv_factor
         return mem_per_token
