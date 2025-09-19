@@ -314,12 +314,12 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             backend=args.backend,
             kv_cache_config=kv_cache_config,
             attn_backend=args.attention_backend,
+            max_batch_size=args.max_batch_size,
             sparse_attention_config=sparse_attention_config,
             tensor_parallel_size=args.tensor_parallel_size,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
             cuda_graph_config=None,
-            torch_compile_config=None,
         )
 
         # Initialize tokenizer
