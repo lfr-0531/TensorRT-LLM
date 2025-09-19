@@ -21,10 +21,9 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import (batched_update_kt_cache, flatten_sparse_indices,
-                     fused_qk_split, reshape_flatten_to_batched,
-                     separated_bmm_softmax, triton_index_gather,
-                     triton_update_kt_cache)
+from .kernel import (flatten_sparse_indices, fused_qk_split,
+                     reshape_flatten_to_batched, separated_bmm_softmax,
+                     triton_index_gather, triton_update_kt_cache)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -145,14 +144,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                   device='cuda',
                                                   dtype=torch.int32)
 
-        self.kt_cache_slots = torch.empty(
-            self.max_num_sequences,
-            device='cpu',
-            dtype=torch.int32,
-        )
-        self.kt_cache_slots_cuda = torch.empty_like(self.kt_cache_slots,
-                                                    device='cuda',
-                                                    dtype=torch.int32)
         self.kt_cache_block_offsets = torch.empty(
             [
                 self.max_num_sequences,
@@ -206,13 +197,6 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.request_ids)
             self.kt_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_kt_cache_block_offsets, non_blocking=True)
-
-            for i in range(num_requests):
-                self.kt_cache_slots[
-                    i] = self.kv_cache_manager.get_kt_cache_slot(
-                        self.request_ids[i])
-            self.kt_cache_slots_cuda[:num_requests].copy_(
-                self.kt_cache_slots[:num_requests], non_blocking=True)
 
         self.context_lens_cuda[:self.num_contexts].copy_(
             self.context_lens[:self.num_contexts], non_blocking=True)
@@ -373,8 +357,8 @@ class RocketTrtllmAttention(TrtllmAttention):
                                                 stride=1)
 
         selected_prefix_indices = scores.topk(
-            self.prompt_budget - self.window_size, dim=-1,
-            sorted=True).indices.to(torch.int32)
+            self.prompt_budget - self.window_size,
+            dim=-1).indices.sort().values.to(torch.int32)
 
         # Flatten sparse indices
         sparse_kv_indices = flatten_sparse_indices(
@@ -386,14 +370,17 @@ class RocketTrtllmAttention(TrtllmAttention):
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
-        max_num_pages = (metadata.max_k_context_tokens + self.page_size -
-                         1) // self.page_size
-        batched_update_kt_cache(qkv_input, kt_cache_tensor,
-                                metadata.kt_cache_slots_cuda, sparse_kv_indices,
-                                metadata.sparse_offsets_cuda,
-                                metadata.num_contexts, self.num_heads,
-                                self.num_kv_heads, self.head_dim, max_num_pages,
-                                self.page_size)
+        triton_update_kt_cache(
+            qkv_input.contiguous(),
+            kt_cache_tensor,
+            metadata.kt_cache_block_offsets,
+            metadata.kv_lens_cuda_runtime[0:metadata.num_contexts],
+            self.page_size,
+            metadata.kt_tokens_per_block,
+            metadata.kv_cache_manager.max_kt_blocks_per_seq,
+            sparse_kv_indices,
+            metadata.sparse_offsets_cuda[0:metadata.num_contexts + 1],
+            update=False)
 
         return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
                                                                num_contexts + 1]
@@ -411,6 +398,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         """
         Predict sparse KV indices and sparse attention indices for the input sequence.
         """
+        assert k is None, "RocketKV can only support fused qkv input."
         sparse_kv_indices, sparse_kv_offsets = self.batched_ctx_sparse_predict(
             q, metadata)
 

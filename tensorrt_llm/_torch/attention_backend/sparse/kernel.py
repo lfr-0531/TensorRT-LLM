@@ -1282,6 +1282,69 @@ def _update_kt_cache_ctx_kernel(k_ptr, cache_ptr, block_offsets_ptr,
 
 
 @triton.jit
+def _update_kt_cache_ctx_sparse_kernel(
+        k_ptr, cache_ptr, block_offsets_ptr, sparse_kv_indices_ptr,
+        sparse_kv_offsets_ptr, cum_kt_seq_lens_ptr, token_to_batch_map_ptr,
+        batch_size, num_heads, num_kv_heads, dim_size, kt_page_size,
+        tokens_per_block, max_kt_blocks_per_seq, BLOCK_SIZE: tl.constexpr):
+    # get program id
+    kt_token_idx = tl.program_id(0)
+
+    # get params
+    batch_idx = tl.load(token_to_batch_map_ptr + kt_token_idx)
+    kt_start_idx = tl.load(cum_kt_seq_lens_ptr + batch_idx)
+    local_kt_token_idx = kt_token_idx - kt_start_idx
+    sparse_start_idx = tl.load(sparse_kv_offsets_ptr + batch_idx)
+    sparse_end_idx = tl.load(sparse_kv_offsets_ptr + batch_idx + 1)
+    total_kv_num_tokens = tl.load(sparse_kv_offsets_ptr + batch_size)
+    global_sparse_indices_idx = sparse_start_idx + local_kt_token_idx * kt_page_size
+
+    # get hidden size
+    kv_hidden_size = num_kv_heads * dim_size
+    q_hidden_size = num_heads * dim_size
+    k_stride_hidden = q_hidden_size + kv_hidden_size * 2
+
+    # get kt cache base address
+    block_offset = batch_idx * max_kt_blocks_per_seq + local_kt_token_idx // tokens_per_block
+    block_idx = tl.load(block_offsets_ptr + block_offset)
+    token_idx_in_block = local_kt_token_idx % tokens_per_block
+    cache_base = cache_ptr + (block_idx * tokens_per_block +
+                              token_idx_in_block) * kv_hidden_size * 2
+
+    # compute min/max and store kt
+    for hidden_start in tl.range(0, kv_hidden_size, BLOCK_SIZE):
+        hidden_indices = hidden_start + tl.arange(0, BLOCK_SIZE)
+        head_idx = hidden_indices // dim_size
+        dim_idx = hidden_indices % dim_size
+        dim_mask = hidden_indices < kv_hidden_size
+
+        # get k_min and k_max
+        k_min = tl.full((BLOCK_SIZE, ), float('inf'), dtype=tl.float32)
+        k_max = tl.full((BLOCK_SIZE, ), float('-inf'), dtype=tl.float32)
+        for i in range(kt_page_size):
+            current_sparse_idx_offset = global_sparse_indices_idx + i
+            sparse_idx_mask = current_sparse_idx_offset < sparse_end_idx
+            sparse_indices_offsets = head_idx * total_kv_num_tokens + current_sparse_idx_offset
+            global_kv_token_idx = tl.load(sparse_kv_indices_ptr +
+                                          sparse_indices_offsets,
+                                          mask=sparse_idx_mask & dim_mask,
+                                          other=-1)
+            k_load_mask = (global_kv_token_idx >= 0) & dim_mask
+            k_offsets = global_kv_token_idx * k_stride_hidden + q_hidden_size + hidden_indices
+            k = tl.load(k_ptr + k_offsets, mask=k_load_mask, other=0.0)
+            k_min = tl.where(k_load_mask, tl.minimum(k_min, k), k_min)
+            k_max = tl.where(k_load_mask, tl.maximum(k_max, k), k_max)
+        k_min = k_min.to(cache_ptr.dtype.element_ty)
+        k_max = k_max.to(cache_ptr.dtype.element_ty)
+
+        # store k_min and k_max to cache
+        k_min_offset = cache_base + head_idx * dim_size * 2 + dim_idx
+        k_max_offset = k_min_offset + dim_size
+        tl.store(k_min_offset, k_min, mask=dim_mask)
+        tl.store(k_max_offset, k_max, mask=dim_mask)
+
+
+@triton.jit
 def _update_kt_cache_gen_kernel(k_ptr, cache_ptr, block_offsets_ptr,
                                 seq_lens_ptr, num_kv_heads, dim_size,
                                 kt_page_size, tokens_per_block,
@@ -1371,13 +1434,18 @@ def triton_update_kt_cache(k,
                            kt_page_size,
                            tokens_per_block,
                            max_kt_blocks_per_seq,
+                           sparse_kv_indices=None,
+                           sparse_kv_offsets=None,
                            update=True):
     # inputs:
-    # k: (total_seq_len, num_kv_heads, head_dim)
+    # k: ctx: (total_seq_len, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim)
+    #    gen: (total_seq_len, num_kv_heads, head_dim)
     # kt_cache_tensor: (num_blocks, tokens_per_block, num_kv_heads, 2 * head_dim)
     # kt_cache_block_offsets: (max_batch_size, max_kt_blocks_per_seq)
     # seq_lens: (batch_size)
     # kt_page_size: int
+    # sparse_kv_indices: (num_kv_heads, num_total_sparse_tokens)
+    # sparse_kv_offsets: (batch_size + 1)
     # update: bool
 
     # outputs:
@@ -1385,13 +1453,44 @@ def triton_update_kt_cache(k,
 
     # params
     batch_size = seq_lens.size(0)
-    num_kv_heads = k.size(1)
-    head_dim = k.size(2)
+    num_kv_heads = kt_cache_tensor.size(-2)
+    head_dim = kt_cache_tensor.size(-1) // 2
     tokens_per_block = kt_cache_tensor.size(1)
-    num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
 
     # context
-    if not update:
+    if not update and sparse_kv_indices is not None and sparse_kv_offsets is not None:
+        num_heads = k.size(1) // head_dim - 2 * num_kv_heads
+        seq_lens = sparse_kv_offsets[1:batch_size +
+                                     1] - sparse_kv_offsets[:batch_size]
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
+        total_num_kt_tokens = num_kt_tokens.sum().item()
+        cum_kt_seq_lens = torch.cumsum(torch.cat([
+            torch.zeros(1, device='cuda', dtype=torch.long),
+            num_kt_tokens.to(torch.long)
+        ]),
+                                       dim=0)
+        token_to_batch_map = torch.repeat_interleave(
+            torch.arange(batch_size, device='cuda'),
+            repeats=num_kt_tokens[:batch_size]).to(torch.long)
+
+        grid = (total_num_kt_tokens, )
+        _update_kt_cache_ctx_sparse_kernel[grid](k,
+                                                 kt_cache_tensor,
+                                                 kt_cache_block_offsets,
+                                                 sparse_kv_indices,
+                                                 sparse_kv_offsets,
+                                                 cum_kt_seq_lens,
+                                                 token_to_batch_map,
+                                                 batch_size,
+                                                 num_heads,
+                                                 num_kv_heads,
+                                                 head_dim,
+                                                 kt_page_size,
+                                                 tokens_per_block,
+                                                 max_kt_blocks_per_seq,
+                                                 BLOCK_SIZE=1024)
+    elif not update:
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
         total_num_kt_tokens = num_kt_tokens.sum().item()
         cum_seq_lens = torch.cumsum(torch.cat([
             torch.zeros(1, device='cuda', dtype=torch.long),
@@ -1423,6 +1522,8 @@ def triton_update_kt_cache(k,
         return
     else:
         # generation
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
+
         # update kt cache
         grid = (batch_size, num_kv_heads)
         _update_kt_cache_gen_kernel[grid](k,
