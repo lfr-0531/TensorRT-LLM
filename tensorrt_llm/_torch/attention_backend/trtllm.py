@@ -193,6 +193,7 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_attn_indices_block_size: int = 1,
         **kwargs,
     ):
         """
@@ -273,6 +274,7 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -500,6 +502,7 @@ class TrtllmAttentionWrapper:
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
             sparse_attention_params,
+            self.sparse_attn_indices_block_size,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1339,6 +1342,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
+        sparse_attn_indices_block_size = 1
         if self.sparse_attention_config is not None:
             sparse_kv_indices, sparse_kv_offsets = self.batched_sparse_attention_predict(
                 q, k, metadata)
@@ -1346,6 +1350,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices, sparse_attn_offsets = None, None
             _, _, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
                 q, k, metadata)
+            sparse_attn_indices_block_size = self.sparse_attention_config.get_sparse_indices_block_size(
+            )
 
             if sparse_attn_indices is not None:
                 sparse_attn_indices, sparse_attn_offsets = convert_token_to_page_sparse_indices(
@@ -1404,6 +1410,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
+            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
         )
         out_dtype = None
         if out_scale is not None:

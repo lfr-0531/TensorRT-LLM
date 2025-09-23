@@ -51,7 +51,8 @@ void initBindings(nb::module_& m)
         nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
         nb::arg("attention_chunk_size") = std::nullopt, nb::arg("softmax_stats_tensor") = std::nullopt,
         nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"),
-        nb::arg("sparse_attention_params") = std::nullopt, "Multi-head attention operation",
+        nb::arg("sparse_attention_params") = std::nullopt, 
+        nb::arg("sparse_attn_indices_block_size") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop
