@@ -3,6 +3,97 @@ import math
 import torch
 import triton
 import triton.language as tl
+import triton.language.core as core
+from triton.language.standard import _log2, sum, zeros_like
+
+########################################################
+# Argsort utilities for topk operations
+# Adapted from https://github.com/triton-lang/triton/issues/3698#issuecomment-2067681396
+########################################################
+
+
+@triton.jit
+def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
+    n_outer: core.constexpr = x.numel >> n_dims
+    shape: core.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    y = core.reshape(x, shape)
+    # slice left/right with 'stride' 2**(n_dims - i - 1)
+    mask = core.arange(0, 2)[None, :, None]
+    left = core.broadcast_to(sum(y * (1 - mask), 1)[:, None, :], shape)
+    right = core.broadcast_to(sum(y * mask, 1)[:, None, :], shape)
+    left = core.reshape(left, x.shape)
+    right = core.reshape(right, x.shape)
+
+    # idx
+    y_idx = core.reshape(ids, shape)
+    left_idx = core.broadcast_to(sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = core.broadcast_to(sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = core.reshape(left_idx, x.shape)
+    right_idx = core.reshape(right_idx, x.shape)
+
+    # actual compare-and-swap
+    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth,
+                                signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+
+    cond = (left > right) ^ flip
+
+    ret = ix ^ core.where(cond, ileft ^ iright, zeros_like(ix))
+
+    new_ids = ids ^ core.where(cond, left_idx ^ right_idx, zeros_like(ids))
+
+    return ret.to(x.dtype, bitcast=True), new_ids
+
+
+@triton.jit
+def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr,
+                   n_dims: core.constexpr):
+    '''
+    order_type 0 == ascending
+    order_type 1 == descending
+    order_type 2 == alternating
+    '''
+    n_outer: core.constexpr = x.numel >> n_dims
+    core.static_assert(stage <= n_dims)
+    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
+    # descending order.
+    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
+    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
+    # a stride of 2) at this stage
+    if order == 2:
+        shape: core.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        # Create boolean flip pattern instead of integer
+        flip = core.reshape(
+            core.broadcast_to(core.arange(0, 2)[None, :, None], shape),
+            x.shape) != 0
+    else:
+        # Ensure flip is boolean for XOR operations
+        flip = order != 0
+    # perform `stage` rounds of `compare-and-swap`
+    for i in core.static_range(stage):
+        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+    return x, ids
+
+
+@triton.jit
+def argsort(x,
+            ids,
+            dim: core.constexpr = None,
+            descending: core.constexpr = core.CONSTEXPR_0):
+    # handle default dimension or check that it is the most minor dim
+    _dim: core.constexpr = len(x.shape) - 1 if dim is None else dim
+    core.static_assert(_dim == len(x.shape) - 1,
+                       "only minor dimension is currently supported")
+    # iteratively run bitonic merge-sort steps
+    n_dims: core.constexpr = _log2(x.shape[_dim])
+
+    for i in core.static_range(1, n_dims + 1):
+        x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending,
+                                n_dims)
+    return x, ids
+
 
 ########################################################
 # Index gather kernel
@@ -647,8 +738,7 @@ def bmm_kernel(
 def softmax_kernel_batched(
     input_ptr,
     output_ptr,
-    q_cu_seqlens_ptr,
-    k_cu_seqlens_ptr,
+    cu_seq_lens_ptr,
     batch_size,
     num_heads,
     q_len_per_seq,
@@ -673,8 +763,8 @@ def softmax_kernel_batched(
         return
 
     # Get k sequence boundaries for this batch
-    k_seq_start = tl.load(k_cu_seqlens_ptr + batch_idx)
-    k_seq_end = tl.load(k_cu_seqlens_ptr + batch_idx + 1)
+    k_seq_start = tl.load(cu_seq_lens_ptr + batch_idx)
+    k_seq_end = tl.load(cu_seq_lens_ptr + batch_idx + 1)
     k_seqlen = k_seq_end - k_seq_start
 
     if k_seqlen <= 0:
@@ -730,13 +820,56 @@ def softmax_kernel_batched(
         tl.store(output_ptr + output_indices, softmax_values, mask=k_mask)
 
 
-def separated_bmm_softmax(q: torch.Tensor,
-                          k: torch.Tensor,
-                          q_cu_seqlens: torch.Tensor,
-                          k_cu_seqlens: torch.Tensor,
-                          batch_size: int,
-                          sm_scale: float = None,
-                          causal: bool = False) -> torch.Tensor:
+def triton_softmax(
+    input_tensor: torch.Tensor,
+    cum_lens: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    Apply softmax to KT token scores with batch-aware sequence boundaries.
+
+    Args:
+        input_tensor: Input tensor [total_num_heads, 1, total_kt_tokens]
+        cum_lens: Cumulative lengths [batch_size + 1]
+        batch_size: Number of generation batches
+
+    Returns:
+        output: Softmax results [total_num_heads, 1, total_kt_tokens]
+    """
+    total_num_heads, q_len_per_seq, total_kt_tokens = input_tensor.shape
+
+    # Create output tensor
+    output = torch.empty_like(input_tensor,
+                              dtype=torch.float32,
+                              device=input_tensor.device)
+
+    # Softmax kernel configuration
+    BLOCK_SIZE = 1024
+
+    # Grid: (total_num_heads, batch_size)
+    grid = (total_num_heads, batch_size * q_len_per_seq)
+
+    softmax_kernel_batched[grid](
+        input_tensor,
+        output,
+        cum_lens,
+        batch_size,
+        total_num_heads,
+        q_len_per_seq,
+        total_kt_tokens,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return output
+
+
+def bmm(q: torch.Tensor,
+        k: torch.Tensor,
+        q_cu_seqlens: torch.Tensor,
+        k_cu_seqlens: torch.Tensor,
+        batch_size: int,
+        sm_scale: float = None,
+        causal: bool = False) -> torch.Tensor:
     """
     Compute softmax(QK^T) using separated BMM and Softmax kernels.
 
@@ -766,10 +899,9 @@ def separated_bmm_softmax(q: torch.Tensor,
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-    # Step 1: BMM to compute QK^T
-    raw_scores = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
-                             dtype=torch.float32,
-                             device=q.device)
+    bmm_results = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
+                              dtype=torch.float32,
+                              device=q.device)
 
     # BMM kernel configuration
     BLOCK_M = 32
@@ -781,7 +913,7 @@ def separated_bmm_softmax(q: torch.Tensor,
     bmm_kernel[grid_bmm](
         q,
         k,
-        raw_scores,
+        bmm_results,
         q_cu_seqlens,
         k_cu_seqlens,
         total_q_tokens,
@@ -798,28 +930,7 @@ def separated_bmm_softmax(q: torch.Tensor,
         BLOCK_K=BLOCK_K,
     )
 
-    # Step 2: Apply softmax with sequence length awareness
-    final_scores = torch.empty_like(raw_scores)
-
-    # Softmax kernel configuration
-    SOFTMAX_BLOCK_SIZE = 1024
-
-    # Grid: (num_heads, batch_size * q_len_per_seq)
-    grid_softmax = lambda meta: (num_q_heads, batch_size * q_len_per_seq)
-
-    softmax_kernel_batched[grid_softmax](
-        raw_scores,
-        final_scores,
-        q_cu_seqlens,
-        k_cu_seqlens,
-        batch_size,
-        num_q_heads,
-        q_len_per_seq,
-        total_k_tokens,
-        BLOCK_SIZE=SOFTMAX_BLOCK_SIZE,
-    )
-
-    return final_scores
+    return bmm_results
 
 
 ########################################################
@@ -1425,6 +1536,825 @@ def _load_kt_cache_kernel(kt_states_ptr, cache_ptr, block_offsets_ptr,
         kt = tl.load(cache_base + hidden_indices, mask=mask, other=0.0)
         # store kt to kt_states
         tl.store(kt_states_base + hidden_indices, kt, mask=mask)
+
+
+########################################################
+# Fused KT cache update and BMM kernel
+########################################################
+
+
+def _next_power_of_2(n):
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 32
+        },
+                      num_warps=2,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=2,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 64,
+            'DIM_BLOCK_SIZE': 32
+        },
+                      num_warps=2,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 32
+        },
+                      num_warps=4,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 64,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=4,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 64,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=4,
+                      num_stages=3),
+        triton.Config({
+            'KT_BLOCK_SIZE': 32,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=4,
+                      num_stages=3),
+        triton.Config({
+            'KT_BLOCK_SIZE': 128,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=4,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 64,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=8,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 128,
+            'DIM_BLOCK_SIZE': 64
+        },
+                      num_warps=8,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 64,
+            'DIM_BLOCK_SIZE': 128
+        },
+                      num_warps=8,
+                      num_stages=2),
+        triton.Config({
+            'KT_BLOCK_SIZE': 128,
+            'DIM_BLOCK_SIZE': 128
+        },
+                      num_warps=8,
+                      num_stages=3),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 64,
+                'DIM_BLOCK_SIZE': 64
+            },
+            num_warps=8,
+            num_stages=4),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 32,
+                'DIM_BLOCK_SIZE': 64
+            },
+            num_warps=8,
+            num_stages=3),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 64,
+                'DIM_BLOCK_SIZE': 32
+            },
+            num_warps=8,
+            num_stages=3),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 128,
+                'DIM_BLOCK_SIZE': 128
+            },
+            num_warps=16,
+            num_stages=3),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 256,
+                'DIM_BLOCK_SIZE': 64
+            },
+            num_warps=16,
+            num_stages=2),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 256,
+                'DIM_BLOCK_SIZE': 128
+            },
+            num_warps=16,
+            num_stages=2),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 32,
+                'DIM_BLOCK_SIZE': 128
+            },
+            num_warps=4,
+            num_stages=2),
+        triton.Config(
+            {
+                'KT_BLOCK_SIZE': 32,
+                'DIM_BLOCK_SIZE': 128
+            },
+            num_warps=8,
+            num_stages=2),
+    ],
+    key=['max_num_kt_tokens_pow2'],
+    prune_configs_by={
+        'early_config_prune':
+        lambda configs, nargs, **kwargs: [
+            config for config in configs
+            if config.kwargs['KT_BLOCK_SIZE'] <= nargs['max_num_kt_tokens'] and
+            config.kwargs['DIM_BLOCK_SIZE'] <= nargs['head_dim']
+        ]
+    })
+@triton.jit
+def fused_kt_cache_update_and_bmm_kernel(
+    q_ptr,
+    k_ptr,
+    q_mask_ptr,
+    kt_cache_tensor_ptr,
+    kt_cache_block_offsets_ptr,
+    dim_pos_ptr,
+    kv_lens_ptr,
+    output_ptr,
+    output_offsets_ptr,
+    num_gen_tokens,
+    num_kv_heads,
+    num_heads_per_kv,
+    head_dim,
+    kt_page_size,
+    tokens_per_block,
+    max_kt_blocks_per_seq,
+    max_num_kt_tokens,
+    max_num_kt_tokens_pow2,
+    total_kt_tokens,
+    sm_scale,
+    KT_BLOCK_SIZE: tl.constexpr,
+    DIM_BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel for KT cache update and BMM computation in generation phase.
+
+    Grid: (num_gen_tokens, ceil(max_num_kt_tokens / KT_BLOCK_SIZE), total_num_heads)
+    Each program handles KT_BLOCK_SIZE kt_tokens for one (batch, global_head) combination.
+
+    Args:
+        q_ptr: Query tensor [num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim]
+        k_ptr: Key tensor [num_gen_tokens, num_kv_heads * head_dim]
+        q_mask_ptr: Query mask [num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim]
+        kt_cache_tensor_ptr: KT cache [num_blocks, tokens_per_block, num_kv_heads, 2*head_dim]
+        kt_cache_block_offsets_ptr: Block offsets [batch_size, max_kt_blocks_per_seq]
+        dim_pos_ptr: Dimension positions [num_gen_tokens * num_kv_heads * head_dim] (0 or head_dim for each dim)
+        kv_lens_ptr: Sequence lengths [num_gen_tokens]
+        output_ptr: Output tensor [num_heads, 1, sum(ceil(kv_len / kt_page_size))]
+        output_offsets_ptr: Output offsets [num_gen_tokens + 1]
+        max_num_kt_tokens_pow2: Next power of 2 >= max_num_kt_tokens (for autotune key)
+        KT_BLOCK_SIZE: Number of kt_tokens to process per thread block
+        DIM_BLOCK_SIZE: Size of dimension blocks for processing
+    """
+    batch_idx = tl.program_id(0)
+    kt_block_idx = tl.program_id(1)
+    global_head_idx = tl.program_id(2)
+
+    total_num_heads = num_kv_heads * num_heads_per_kv
+
+    if batch_idx >= num_gen_tokens or global_head_idx >= total_num_heads:
+        return
+
+    kv_head_idx = global_head_idx // num_heads_per_kv
+    q_head_idx = global_head_idx % num_heads_per_kv
+
+    kv_len = tl.load(kv_lens_ptr + batch_idx)
+    num_kt_tokens = (kv_len + kt_page_size - 1) // kt_page_size
+
+    if num_kt_tokens <= 0:
+        return
+
+    kt_token_start = kt_block_idx * KT_BLOCK_SIZE
+
+    kt_token_offsets = tl.arange(0, KT_BLOCK_SIZE)
+    kt_token_indices = kt_token_start + kt_token_offsets
+    kt_token_mask = kt_token_indices < num_kt_tokens
+
+    # Base addresses
+    q_base = (batch_idx * num_kv_heads * num_heads_per_kv * head_dim +
+              kv_head_idx * num_heads_per_kv * head_dim + q_head_idx * head_dim)
+    dim_pos_base = (batch_idx * num_kv_heads * head_dim +
+                    kv_head_idx * head_dim)
+
+    # Determine if we need to update the kt cache
+    last_token_idx = kv_len - 1
+    last_kt_token_idx = last_token_idx // kt_page_size
+
+    block_offsets = batch_idx * max_kt_blocks_per_seq + kt_token_indices // tokens_per_block
+    block_indices = tl.load(kt_cache_block_offsets_ptr + block_offsets,
+                            mask=kt_token_mask,
+                            other=0)
+    token_indices_in_block = kt_token_indices % tokens_per_block
+
+    cache_bases = ((block_indices * tokens_per_block + token_indices_in_block) *
+                   num_kv_heads * 2 * head_dim + kv_head_idx * 2 * head_dim)
+
+    # Check if we should update for each kt_token
+    should_update_mask = (kt_token_indices == last_kt_token_idx) & (
+        q_head_idx == 0) & kt_token_mask
+    should_update = tl.sum(should_update_mask) > 0
+
+    results = tl.zeros([KT_BLOCK_SIZE], dtype=tl.float32)
+
+    for dim_block_start in tl.range(0, head_dim, DIM_BLOCK_SIZE):
+        dim_offsets = tl.arange(0, DIM_BLOCK_SIZE)
+        dim_indices = dim_block_start + dim_offsets
+        dim_mask = dim_indices < head_dim
+
+        q_indices = q_base + dim_indices
+        q_mask_values = tl.load(q_mask_ptr + q_indices,
+                                mask=dim_mask,
+                                other=0.0)
+        q_raw_values = tl.load(q_ptr + q_indices, mask=dim_mask, other=0.0)
+        q_values = tl.where(q_mask_values != 0.0, q_raw_values, 0.0)
+
+        dim_pos_indices = dim_pos_base + dim_indices
+        kt_cache_offsets = tl.load(dim_pos_ptr + dim_pos_indices,
+                                   mask=dim_mask,
+                                   other=0)
+
+        # Update kt cache if needed
+        if should_update and q_head_idx == 0:
+            # Load k values for this dimension block
+            k_indices = batch_idx * num_kv_heads * head_dim + kv_head_idx * head_dim + dim_indices
+            k_values = tl.load(k_ptr + k_indices, mask=dim_mask, other=0.0)
+
+            dim_indices_expanded = dim_indices[:,
+                                               None]  # Shape: [DIM_BLOCK_SIZE, 1]
+            cache_bases_expanded = cache_bases[
+                None, :]  # Shape: [1, KT_BLOCK_SIZE]
+
+            # Calculate cache indices for min and max
+            cache_min_indices = cache_bases_expanded + dim_indices_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+            cache_max_indices = cache_bases_expanded + head_dim + dim_indices_expanded
+
+            dim_mask_expanded = dim_mask[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
+            should_update_expanded = should_update_mask[
+                None, :]  # Shape: [1, KT_BLOCK_SIZE]
+            combined_mask = dim_mask_expanded & should_update_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+
+            cache_min_flat = tl.reshape(cache_min_indices,
+                                        [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+            cache_max_flat = tl.reshape(cache_max_indices,
+                                        [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+            mask_flat = tl.reshape(combined_mask,
+                                   [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+
+            # Load existing min/max values
+            k_min_flat = tl.load(kt_cache_tensor_ptr + cache_min_flat,
+                                 mask=mask_flat,
+                                 other=float('inf'))
+            k_max_flat = tl.load(kt_cache_tensor_ptr + cache_max_flat,
+                                 mask=mask_flat,
+                                 other=float('-inf'))
+
+            k_min = tl.reshape(k_min_flat, [DIM_BLOCK_SIZE, KT_BLOCK_SIZE])
+            k_max = tl.reshape(k_max_flat, [DIM_BLOCK_SIZE, KT_BLOCK_SIZE])
+
+            k_values_expanded = k_values[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
+
+            k_min = tl.minimum(k_min, k_values_expanded)
+            k_max = tl.maximum(k_max, k_values_expanded)
+            k_min = k_min.to(kt_cache_tensor_ptr.dtype.element_ty)
+            k_max = k_max.to(kt_cache_tensor_ptr.dtype.element_ty)
+
+            k_min_flat = tl.reshape(k_min, [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+            k_max_flat = tl.reshape(k_max, [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+
+            tl.store(kt_cache_tensor_ptr + cache_min_flat,
+                     k_min_flat,
+                     mask=mask_flat)
+            tl.store(kt_cache_tensor_ptr + cache_max_flat,
+                     k_max_flat,
+                     mask=mask_flat)
+
+        dim_indices_expanded = dim_indices[:,
+                                           None]  # Shape: [DIM_BLOCK_SIZE, 1]
+        cache_bases_expanded = cache_bases[None, :]  # Shape: [1, KT_BLOCK_SIZE]
+        kt_cache_offsets_expanded = kt_cache_offsets[:,
+                                                     None]  # Shape: [DIM_BLOCK_SIZE, 1]
+
+        kt_cache_indices = cache_bases_expanded + kt_cache_offsets_expanded + dim_indices_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+
+        dim_mask_expanded = dim_mask[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
+        kt_token_mask_expanded = kt_token_mask[
+            None, :]  # Shape: [1, KT_BLOCK_SIZE]
+        combined_mask = dim_mask_expanded & kt_token_mask_expanded  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+
+        kt_cache_flat = tl.reshape(kt_cache_indices,
+                                   [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+        mask_flat = tl.reshape(combined_mask, [DIM_BLOCK_SIZE * KT_BLOCK_SIZE])
+
+        kt_values_flat = tl.load(kt_cache_tensor_ptr + kt_cache_flat,
+                                 mask=mask_flat,
+                                 other=0.0)
+        kt_values = tl.reshape(kt_values_flat,
+                               [DIM_BLOCK_SIZE, KT_BLOCK_SIZE
+                                ])  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+
+        q_values_expanded = q_values[:, None]  # Shape: [DIM_BLOCK_SIZE, 1]
+
+        products = q_values_expanded * kt_values  # Shape: [DIM_BLOCK_SIZE, KT_BLOCK_SIZE]
+
+        masked_products = tl.where(combined_mask, products, 0.0)
+
+        results += tl.sum(masked_products, axis=0)  # Shape: [KT_BLOCK_SIZE]
+
+    # Store results for all kt_tokens
+    output_offset = tl.load(output_offsets_ptr + batch_idx)
+    output_indices = global_head_idx * total_kt_tokens + output_offset + kt_token_indices
+    tl.store(output_ptr + output_indices,
+             results * sm_scale,
+             mask=kt_token_mask)
+
+
+def fused_kt_cache_update_and_bmm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_mask: torch.Tensor,
+    dim_pos: torch.Tensor,
+    layer_idx: int,
+    metadata: "RocketTrtllmAttentionMetadata",
+    sm_scale: float = None,
+) -> torch.Tensor:
+    """
+    Fused KT cache update and BMM computation for generation phase.
+
+    Args:
+        q: Query tensor [num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim]
+        k: Key tensor [num_gen_tokens, num_kv_heads * head_dim]
+        q_mask: Query mask [num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim] (1 for top-r dims, 0 elsewhere)
+        dim_pos: Dimension offsets [num_gen_tokens, num_kv_heads, 1, head_dim] (0 or head_dim for each dim)
+        layer_idx: Layer index
+        metadata: Metadata
+
+    Returns:
+        output: BMM results [num_heads, 1, sum(ceil(kv_lens/kt_page_size))]
+    """
+    num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim = q.shape
+
+    total_num_heads = num_kv_heads * num_heads_per_kv
+
+    kv_lens = metadata.kv_lens_cuda_runtime[metadata.num_contexts:]
+    kt_page_size = metadata.page_size
+    tokens_per_block = metadata.kt_tokens_per_block
+    max_kt_blocks_per_seq = metadata.kv_cache_manager.max_kt_blocks_per_seq
+
+    # Calculate number of kt tokens for each batch and total
+    num_kt_tokens = metadata.num_kt_tokens_cuda[:metadata.num_generations]
+    total_kt_tokens = metadata.total_kt_tokens
+    max_num_kt_tokens = metadata.max_kt_tokens
+
+    kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(layer_idx)
+    kt_cache_block_offsets = metadata.kt_cache_block_offsets[metadata.
+                                                             num_contexts:]
+
+    # Calculate output offsets for each batch
+    output_offsets = metadata.cum_kt_lens_cuda[:metadata.num_generations + 1]
+
+    # Create output tensor with shape [num_heads, 1, sum(ceil(kv_lens/kt_page_size))]
+    output = torch.empty((total_num_heads, 1, total_kt_tokens),
+                         dtype=torch.float32,
+                         device=q.device)
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    # Calculate next power of 2 for autotune key
+    max_num_kt_tokens_pow2 = _next_power_of_2(max_num_kt_tokens)
+
+    def grid(meta):
+        return (num_gen_tokens,
+                (max_num_kt_tokens + meta['KT_BLOCK_SIZE'] - 1) //
+                meta['KT_BLOCK_SIZE'], total_num_heads)
+
+    fused_kt_cache_update_and_bmm_kernel[grid](
+        q,
+        k,
+        q_mask,
+        kt_cache_tensor,
+        kt_cache_block_offsets,
+        dim_pos,
+        kv_lens,
+        output,
+        output_offsets,
+        num_gen_tokens,
+        num_kv_heads,
+        num_heads_per_kv,
+        head_dim,
+        kt_page_size,
+        tokens_per_block,
+        max_kt_blocks_per_seq,
+        max_num_kt_tokens,
+        max_num_kt_tokens_pow2,
+        total_kt_tokens,
+        sm_scale,
+    )
+
+    return output
+
+
+########################################################
+# Triton TopK kernel with optional interleave
+########################################################
+
+
+@triton.jit
+def triton_interleave_kernel(
+    input_ptr,
+    output_ptr,
+    kt_offsets_ptr,
+    kv_lens_ptr,
+    kv_offsets_ptr,
+    batch_size,
+    num_kv_heads,
+    kt_page_size,
+    total_kt_tokens,
+    total_kv_tokens,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Interleave kt tokens to kv tokens by repeating each kt token kt_page_size times.
+
+    Args:
+        input_ptr: Input tensor [num_kv_heads, total_kt_tokens]
+        output_ptr: Output tensor [num_kv_heads, total_kv_tokens]
+        kt_offsets_ptr: KT offsets [batch_size + 1]
+        kv_lens_ptr: KV lengths [batch_size]
+        kv_offsets_ptr: KV offsets [batch_size + 1]
+        batch_size: Number of batches
+        num_kv_heads: Number of KV heads
+        kt_page_size: Page size for interleaving
+        total_kt_tokens: Total KT tokens
+        total_kv_tokens: Total KV tokens
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    if batch_idx >= batch_size or head_idx >= num_kv_heads:
+        return
+
+    # Get batch kt and kv ranges
+    kt_start = tl.load(kt_offsets_ptr + batch_idx)
+    kt_end = tl.load(kt_offsets_ptr + batch_idx + 1)
+    kt_len = kt_end - kt_start
+
+    kv_len = tl.load(kv_lens_ptr + batch_idx)
+    kv_start = tl.load(kv_offsets_ptr + batch_idx)
+
+    if kt_len <= 0 or kv_len <= 0:
+        return
+
+    # Process in blocks
+    for block_start in tl.range(0, kv_len, BLOCK_SIZE):
+        block_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < kv_len
+
+        # Calculate which kt_token each kv position corresponds to
+        kt_indices = block_offsets // kt_page_size
+        kt_valid_mask = kt_indices < kt_len
+        combined_mask = block_mask & kt_valid_mask
+
+        # Load from input kt tokens
+        input_indices = head_idx * total_kt_tokens + kt_start + kt_indices
+
+        values = tl.load(input_ptr + input_indices,
+                         mask=combined_mask,
+                         other=0.0)
+
+        # Store to output kv positions
+        output_indices = head_idx * total_kv_tokens + kv_start + block_offsets
+        tl.store(output_ptr + output_indices, values, mask=block_mask)
+
+
+@triton.autotune(configs=[
+    triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+    triton.Config({'BLOCK_SIZE': 128}, num_warps=8),
+    triton.Config({'BLOCK_SIZE': 256}, num_warps=8),
+    triton.Config({'BLOCK_SIZE': 256}, num_warps=16),
+    triton.Config({'BLOCK_SIZE': 512}, num_warps=16),
+    triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+    triton.Config({'BLOCK_SIZE': 2048}, num_warps=16),
+    triton.Config({'BLOCK_SIZE': 2048}, num_warps=32),
+    triton.Config({'BLOCK_SIZE': 4096}, num_warps=32),
+],
+                 key=['max_seq_len_pow2'],
+                 prune_configs_by={
+                     'early_config_prune':
+                     lambda configs, nargs, **kwargs: [
+                         config for config in configs
+                         if config.kwargs['BLOCK_SIZE'] > nargs['topk']
+                     ]
+                 })
+@triton.jit
+def triton_topk_kernel(
+    input_ptr,
+    output_indices_ptr,
+    temp_values_ptr,
+    temp_indices_ptr,
+    input_offsets_ptr,
+    sparse_offsets_ptr,
+    batch_size,
+    num_kv_heads,
+    topk,
+    total_input_tokens,
+    total_sparse_indices,
+    max_seq_len,
+    max_seq_len_pow2,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Perform topk operation on each batch independently using efficient argsort implementation.
+
+    Args:
+        input_ptr: Input tensor [num_kv_heads, total_input_tokens]
+        output_indices_ptr: Output indices [num_kv_heads, total_sparse_indices]
+        temp_values_ptr: Temporary values storage [batch_size, num_kv_heads, max_seq_len]
+        temp_indices_ptr: Temporary indices storage [batch_size, num_kv_heads, max_seq_len]
+        input_offsets_ptr: Input offsets [batch_size + 1]
+        sparse_offsets_ptr: Sparse offsets [batch_size + 1]
+        batch_size: Number of batches
+        num_kv_heads: Number of KV heads
+        topk: TopK parameter
+        total_input_tokens: Total input tokens
+        total_sparse_indices: Total sparse indices
+        max_seq_len: Maximum sequence length
+        max_seq_len_pow2: Next power of 2 >= max_seq_len (for autotune key)
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    if batch_idx >= batch_size or head_idx >= num_kv_heads:
+        return
+
+    input_start = tl.load(input_offsets_ptr + batch_idx)
+    input_end = tl.load(input_offsets_ptr + batch_idx + 1)
+    input_len = input_end - input_start
+
+    sparse_start = tl.load(sparse_offsets_ptr + batch_idx)
+    sparse_end = tl.load(sparse_offsets_ptr + batch_idx + 1)
+    sparse_len = sparse_end - sparse_start
+
+    if input_len <= 0 or sparse_len <= 0:
+        return
+
+    actual_topk = tl.minimum(topk, input_len)
+    actual_topk = tl.minimum(actual_topk, sparse_len)
+
+    # Base addresses
+    input_base = head_idx * total_input_tokens + input_start
+    temp_base = batch_idx * num_kv_heads * max_seq_len + head_idx * max_seq_len
+    output_base = head_idx * total_sparse_indices + sparse_start
+
+    # Process sequence in chunks to handle variable lengths efficiently
+    max_process_len = tl.cdiv(input_len, BLOCK_SIZE) * BLOCK_SIZE
+
+    for block_start in tl.range(0, max_process_len, BLOCK_SIZE):
+        block_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < input_len
+
+        values = tl.load(input_ptr + input_base + block_offsets,
+                         mask=block_mask,
+                         other=float('-inf'))
+
+        # Store values to temporary storage
+        tl.store(temp_values_ptr + temp_base + block_offsets,
+                 values,
+                 mask=block_mask)
+        # Store original indices
+        tl.store(temp_indices_ptr + temp_base + block_offsets,
+                 block_offsets,
+                 mask=block_mask)
+
+    # Multi-round iterative argsort approach
+    # This works for both short and long sequences uniformly
+    current_len = input_len
+    current_base = temp_base
+    round_num = 0
+
+    while current_len > BLOCK_SIZE:
+        round_num += 1
+
+        num_chunks = tl.cdiv(current_len, BLOCK_SIZE)
+
+        # Alternate between two halves of temp storage to avoid conflicts
+        if round_num % 2 == 1:
+            next_base = temp_base + max_seq_len // 2
+        else:
+            next_base = temp_base
+
+        next_len = 0
+
+        # Process each chunk in this round
+        for chunk_id in tl.range(0, num_chunks):
+            chunk_start = chunk_id * BLOCK_SIZE
+            chunk_end = tl.minimum(chunk_start + BLOCK_SIZE, current_len)
+            chunk_len = chunk_end - chunk_start
+
+            if chunk_len > 0:
+                # Load chunk data from current round's storage
+                chunk_offsets = tl.arange(0, BLOCK_SIZE)
+                chunk_mask = chunk_offsets < chunk_len
+
+                chunk_values = tl.load(temp_values_ptr + current_base +
+                                       chunk_start + chunk_offsets,
+                                       mask=chunk_mask,
+                                       other=float('-inf'))
+                chunk_indices = tl.load(temp_indices_ptr + current_base +
+                                        chunk_start + chunk_offsets,
+                                        mask=chunk_mask,
+                                        other=0.0).to(tl.int32)
+
+                # Sort this chunk using argsort
+                chunk_sorted_values, chunk_sorted_indices = argsort(
+                    chunk_values, chunk_indices, descending=True)
+
+                # Extract top-k candidates from this chunk
+                chunk_topk = tl.minimum(actual_topk, chunk_len)
+                chunk_topk_mask = chunk_offsets < chunk_topk
+
+                # Store top-k candidates to next round's storage
+                next_offsets = next_len + chunk_offsets
+                next_store_mask = chunk_topk_mask & (next_offsets
+                                                     < max_seq_len // 2)
+
+                tl.store(temp_values_ptr + next_base + next_offsets,
+                         chunk_sorted_values,
+                         mask=next_store_mask)
+                tl.store(temp_indices_ptr + next_base + next_offsets,
+                         chunk_sorted_indices,
+                         mask=next_store_mask)
+
+                next_len += chunk_topk
+
+        # Update parameters for next round
+        current_len = next_len
+        current_base = next_base
+
+    # Final round: current_len <= BLOCK_SIZE, do final argsort
+    final_offsets = tl.arange(0, BLOCK_SIZE)
+    final_mask = final_offsets < current_len
+
+    final_values = tl.load(temp_values_ptr + current_base + final_offsets,
+                           mask=final_mask,
+                           other=float('-inf'))
+    final_indices = tl.load(temp_indices_ptr + current_base + final_offsets,
+                            mask=final_mask,
+                            other=0.0).to(tl.int32)
+
+    final_sorted_values, final_sorted_indices = argsort(final_values,
+                                                        final_indices,
+                                                        descending=True)
+
+    result_offsets = tl.arange(0, BLOCK_SIZE)
+    result_mask = result_offsets < actual_topk
+
+    selected_indices = tl.where(result_mask, final_sorted_indices,
+                                tl.zeros_like(final_sorted_indices))
+    tl.store(output_indices_ptr + output_base + result_offsets,
+             selected_indices,
+             mask=result_mask)
+
+
+def triton_topk(
+        input_tensor: torch.Tensor,
+        kt_offsets: torch.Tensor,
+        kv_lens: torch.Tensor,
+        kt_lens: torch.Tensor,
+        kv_cu_lens: torch.Tensor,
+        total_kv_tokens: int,
+        topk: int,
+        kt_page_size: int,
+        use_interleave: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform topk operation with optional interleaving.
+
+    Args:
+        input_tensor: Input scores [num_kv_heads, sum(kt_lens)]
+        kt_offsets: KT offsets [batch_size + 1]
+        kv_lens: KV lengths [batch_size]
+        kt_lens: KT lengths [batch_size]
+        topk: TopK parameter
+        kt_page_size: Page size for interleaving
+        use_interleave: Whether to perform interleaving
+
+    Returns:
+        output_indices: Selected indices [num_kv_heads, num_total_sparse_indices]
+        sparse_offsets: Sparse offsets [batch_size + 1]
+    """
+
+    num_kv_heads = input_tensor.shape[0]
+    batch_size = len(kv_lens)
+    device = input_tensor.device
+
+    if use_interleave:
+        total_kt_tokens = input_tensor.shape[1]
+
+        # Create interleaved tensor
+        interleaved_tensor = torch.empty((num_kv_heads, total_kv_tokens),
+                                         dtype=input_tensor.dtype,
+                                         device=device)
+
+        # Launch interleave kernel
+        grid = (batch_size, num_kv_heads)
+        triton_interleave_kernel[grid](input_tensor,
+                                       interleaved_tensor,
+                                       kt_offsets,
+                                       kv_lens,
+                                       kv_cu_lens,
+                                       batch_size,
+                                       num_kv_heads,
+                                       kt_page_size,
+                                       total_kt_tokens,
+                                       total_kv_tokens,
+                                       BLOCK_SIZE=1024)
+
+        # Use interleaved tensor and kv_cu_lens for topk
+        working_tensor = interleaved_tensor
+        working_offsets = kv_cu_lens
+        working_lens = kv_lens
+    else:
+        # Use original tensor and kt_offsets for topk
+        working_tensor = input_tensor
+        working_offsets = kt_offsets
+        working_lens = kt_lens
+
+    # Calculate sparse counts and offsets
+    sparse_counts = torch.minimum(torch.tensor(topk, device=device),
+                                  working_lens)
+    sparse_offsets = torch.cumsum(torch.cat(
+        [torch.zeros(1, device=device), sparse_counts]),
+                                  dim=0).to(torch.int32)
+
+    total_sparse_indices = sparse_offsets[-1].item()
+    total_working_tokens = working_tensor.shape[1]
+    max_seq_len = working_lens.max().item()
+
+    # Create output tensor
+    output_indices = torch.empty((num_kv_heads, total_sparse_indices),
+                                 dtype=torch.int32,
+                                 device=device)
+
+    # Create temporary storage for topk algorithm
+    temp_values = torch.empty((batch_size, num_kv_heads, max_seq_len),
+                              dtype=working_tensor.dtype,
+                              device=device)
+    temp_indices = torch.empty((batch_size, num_kv_heads, max_seq_len),
+                               dtype=torch.int32,
+                               device=device)
+
+    # Calculate next power of 2 for autotune key
+    max_seq_len_pow2 = _next_power_of_2(max_seq_len)
+
+    # Launch topk kernel with autotune
+    def grid(meta):
+        return (batch_size, num_kv_heads)
+
+    triton_topk_kernel[grid](
+        working_tensor,
+        output_indices,
+        temp_values,
+        temp_indices,
+        working_offsets,
+        sparse_offsets,
+        batch_size,
+        num_kv_heads,
+        topk,
+        total_working_tokens,
+        total_sparse_indices,
+        max_seq_len,
+        max_seq_len_pow2,
+    )
+
+    return output_indices, sparse_offsets
 
 
 def triton_update_kt_cache(k,

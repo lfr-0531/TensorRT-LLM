@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two
+from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two, nvtx_range
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -21,9 +21,10 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import (flatten_sparse_indices, fused_qk_split,
-                     reshape_flatten_to_batched, separated_bmm_softmax,
-                     triton_index_gather, triton_update_kt_cache)
+from .kernel import (bmm, flatten_sparse_indices, fused_kt_cache_update_and_bmm,
+                     fused_qk_split, reshape_flatten_to_batched,
+                     triton_index_gather, triton_softmax, triton_topk,
+                     triton_update_kt_cache)
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -36,6 +37,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             raise ValueError("Sparse attention config is not set")
         self.prompt_budget = self.sparse_attention_config.prompt_budget
         self.window_size = self.sparse_attention_config.window_size
+        self.page_size = self.sparse_attention_config.page_size
 
         self.context_lens_cuda = torch.empty(
             self.max_num_sequences,
@@ -152,6 +154,33 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             device='cuda',
         )
+
+        self.num_kt_tokens = torch.empty(
+            self.max_num_sequences,
+            device='cpu',
+            dtype=torch.int32,
+        )
+        self.num_kt_tokens_cuda = torch.empty_like(self.num_kt_tokens,
+                                                   device='cuda',
+                                                   dtype=torch.int32)
+
+        self.cum_kt_lens = torch.zeros(
+            self.max_num_sequences + 1,
+            device='cpu',
+            dtype=torch.int32,
+        )
+        self.cum_kt_lens_cuda = torch.empty_like(self.cum_kt_lens,
+                                                 device='cuda',
+                                                 dtype=torch.int32)
+
+        self.cum_kv_gen_lens = torch.zeros(
+            self.max_num_sequences + 1,
+            device='cpu',
+            dtype=torch.int32,
+        )
+        self.cum_kv_gen_lens_cuda = torch.empty_like(self.cum_kv_gen_lens,
+                                                     device='cuda',
+                                                     dtype=torch.int32)
 
     @property
     def kt_tokens_per_block(self) -> Optional[int]:
@@ -275,6 +304,31 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.valid_batch_size = valid_batch_size
         self.total_sparse_tokens = self.sparse_offsets[self.num_contexts].item()
 
+        self.num_kt_tokens[:self.num_generations] = (
+            self.kv_lens[self.num_contexts:self.num_seqs] + self.page_size -
+            1) // self.page_size
+        self.num_kt_tokens_cuda[:self.num_generations].copy_(
+            self.num_kt_tokens[:self.num_generations], non_blocking=True)
+
+        self.cum_kt_lens[1:self.num_generations + 1] = torch.cumsum(
+            self.num_kt_tokens[:self.num_generations], dim=0)
+        self.cum_kt_lens_cuda[:self.num_generations + 1].copy_(
+            self.cum_kt_lens[:self.num_generations + 1], non_blocking=True)
+
+        if self.num_generations > 0:
+            self.max_kt_tokens = self.num_kt_tokens[:self.num_generations].max(
+            ).item()
+
+        self.total_kt_tokens = self.cum_kt_lens[self.num_generations].item()
+
+        self.cum_kv_gen_lens[1:self.num_generations + 1] = torch.cumsum(
+            self.kv_lens_cuda_runtime[self.num_contexts:self.num_seqs], dim=0)
+        self.cum_kv_gen_lens_cuda[:self.num_generations + 1].copy_(
+            self.cum_kv_gen_lens[:self.num_generations + 1], non_blocking=True)
+
+        self.total_kv_gen_tokens = self.cum_kv_gen_lens[
+            self.num_generations].item()
+
 
 class RocketTrtllmAttention(TrtllmAttention):
     Metadata = RocketTrtllmAttentionMetadata
@@ -332,12 +386,15 @@ class RocketTrtllmAttention(TrtllmAttention):
                                              self.window_size,
                                              self.prompt_budget, metadata)
 
-        scores = separated_bmm_softmax(q_window,
-                                       k_context,
-                                       metadata.q_cu_seqlens_cuda,
-                                       metadata.k_cu_seqlens_cuda,
-                                       metadata.valid_batch_size,
-                                       causal=False)
+        scores = bmm(q_window,
+                     k_context,
+                     metadata.q_cu_seqlens_cuda,
+                     metadata.k_cu_seqlens_cuda,
+                     metadata.valid_batch_size,
+                     causal=False)
+
+        scores = triton_softmax(scores, metadata.k_cu_seqlens_cuda,
+                                metadata.valid_batch_size)
 
         scores = scores.view(self.num_kv_heads,
                              self.num_heads // self.num_kv_heads,
@@ -385,11 +442,71 @@ class RocketTrtllmAttention(TrtllmAttention):
         return sparse_kv_indices, metadata.sparse_offsets_cuda[:metadata.
                                                                num_contexts + 1]
 
+    @torch.compile(dynamic=True)
+    def preprocess_for_gen(
+        self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv_input = qkv[metadata.num_ctx_tokens:]
+        q, k = qkv_input[:, :self.num_heads * self.
+                         head_dim], qkv_input[:, self.num_heads *
+                                              self.head_dim:self.num_heads *
+                                              self.head_dim +
+                                              self.num_kv_heads * self.head_dim]
+        q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
+                   self.head_dim)
+
+        q_abs = torch.abs(q)
+        q_mask = torch.zeros_like(q)
+
+        i1 = torch.topk(q_abs.mean(dim=2, keepdim=True), self.topr,
+                        dim=-1).indices
+        q_mask.scatter_(-1, i1.expand_as(q[..., :self.topr]), 1)
+
+        dim_pos = torch.where(q.sum(dim=2, keepdim=True) > 0, self.head_dim,
+                              0).to(torch.int32)
+
+        return q, k, q_mask, dim_pos
+
+    @nvtx_range("batched_gen_sparse_predict")
     def batched_gen_sparse_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: RocketTrtllmAttentionMetadata
+        self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        pass
+        metadata.num_ctx_tokens
+        if metadata.num_generations == 0:
+            return None, None
+
+        q, k, q_mask, dim_pos = self.preprocess_for_gen(qkv, metadata)
+
+        scores = fused_kt_cache_update_and_bmm(
+            q,
+            k,
+            q_mask,
+            dim_pos,
+            self.layer_idx,
+            metadata,
+        )
+
+        scores = triton_softmax(scores, metadata.cum_kt_lens_cuda,
+                                metadata.num_generations)
+
+        scores = scores.view(self.num_kv_heads,
+                             self.num_heads // self.num_kv_heads,
+                             -1).mean(dim=-2)
+
+        # Use triton_topk to select sparse attention indices
+        selected_indices, sparse_attn_offsets = triton_topk(
+            scores,
+            metadata.cum_kt_lens_cuda[:metadata.num_generations + 1],
+            metadata.kv_lens_cuda_runtime[metadata.num_contexts:metadata.
+                                          num_seqs],
+            metadata.num_kt_tokens_cuda[:metadata.num_generations],
+            metadata.cum_kv_gen_lens_cuda[:metadata.num_generations + 1],
+            metadata.total_kv_gen_tokens,
+            self.topk,
+            self.page_size,
+            use_interleave=True)
+
+        return selected_indices, sparse_attn_offsets
 
     def batched_sparse_attention_predict(
         self, q: torch.Tensor, k: torch.Tensor,
@@ -401,9 +518,12 @@ class RocketTrtllmAttention(TrtllmAttention):
         assert k is None, "RocketKV can only support fused qkv input."
         sparse_kv_indices, sparse_kv_offsets = self.batched_ctx_sparse_predict(
             q, metadata)
+        sparse_attn_indices, sparse_attn_offsets = self.batched_gen_sparse_predict(
+            q, metadata)
 
-        return sparse_kv_indices, sparse_kv_offsets
+        return sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets
 
+    @nvtx_range("sparse_attention_predict")
     def sparse_attention_predict(
         self, q: torch.Tensor, k: torch.Tensor,
         metadata: RocketTrtllmAttentionMetadata
