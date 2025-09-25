@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <optional>
 #include <sstream>
 
 namespace tensorrt_llm
@@ -14,6 +15,8 @@ struct SparseAttentionParams
     int32_t* sparse_attn_indices{nullptr}; // [num_kv_heads, num_sparse_attn_indices]
     int32_t* sparse_kv_offsets{nullptr};   // [num_contexts + 1]
     int32_t* sparse_attn_offsets{nullptr}; // [num_generations + 1]
+    // Indices block size is the number of tokens corresponding to each sparse index
+    std::optional<int32_t> sparse_attn_indices_block_size{std::nullopt};
 
     std::string toString() const
     {
@@ -21,7 +24,8 @@ struct SparseAttentionParams
         ss << "sparse_kv_indices: " << this->sparse_kv_indices << std::endl
            << "sparse_attn_indices: " << this->sparse_attn_indices << std::endl
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
-           << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl;
+           << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
+           << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size.value_or(1) << std::endl;
         return ss.str();
     }
 
