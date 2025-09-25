@@ -684,6 +684,9 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
+    op->mUseSparseAttention = false;
+    op->mUseTllmGenSparseAttention = false;
+    op->mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = 1;
     if ((sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0)
         || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
     {
