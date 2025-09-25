@@ -117,6 +117,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     sparse_params.num_head_kv = num_head_kv;
     sparse_params.tokens_per_page = tokens_per_page;
     sparse_params.max_num_pages_per_seq = max_num_pages_per_seq;
+    sparse_params.sparse_attn_indices_block_size = tokens_per_page;
 
     // Launch the kernel
     invokeGatherKvPageOffsets(bufferCast<int32_t>(*output_kv_page_offsets), bufferCast<int32_t>(*output_seq_lengths),
