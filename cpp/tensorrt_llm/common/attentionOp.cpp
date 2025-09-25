@@ -291,7 +291,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
     xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
-    xqaParams.sparse_attn_indices_block_size = mRuntimeSparseAttentionParams.sparse_attn_indices_block_size.value_or(1);
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
 
     // Cross attention parameters.
