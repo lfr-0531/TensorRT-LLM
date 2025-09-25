@@ -433,7 +433,6 @@ void XqaDispatcher::runImpl(
                 sparse_params.num_head_kv = num_kv_heads;
                 sparse_params.tokens_per_page = kv_cache_buffer.mTokensPerBlock;
                 sparse_params.max_num_pages_per_seq = kv_cache_buffer.mMaxBlocksPerSeq;
-                sparse_params.sparse_attn_indices_block_size = params.sparse_attn_indices_block_size;
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
                     params.sequence_lengths, sparse_params, params.stream);

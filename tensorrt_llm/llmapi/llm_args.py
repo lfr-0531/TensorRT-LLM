@@ -163,9 +163,6 @@ class SparseAttentionBaseConfig(BaseModel):
         """
         return True
 
-    def get_sparse_indices_block_size(self) -> int:
-        return 1
-
 
 class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
     """

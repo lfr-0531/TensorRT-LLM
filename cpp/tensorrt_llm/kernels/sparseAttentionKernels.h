@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <optional>
 #include <sstream>
 
 namespace tensorrt_llm
@@ -22,8 +21,6 @@ struct SparseAttentionParams
     int32_t tokens_per_page{0};
     int32_t max_num_pages_per_seq{0};
     int32_t num_sparse_kv_tokens{0};
-    // Indices block size is the number of tokens corresponding to each sparse index
-    std::optional<int32_t> sparse_attn_indices_block_size{std::nullopt};
 
     std::string toString() const
     {
@@ -36,8 +33,7 @@ struct SparseAttentionParams
            << "num_head_kv: " << this->num_head_kv << std::endl
            << "tokens_per_page: " << this->tokens_per_page << std::endl
            << "max_num_pages_per_seq: " << this->max_num_pages_per_seq << std::endl
-           << "num_sparse_kv_tokens: " << this->num_sparse_kv_tokens << std::endl
-           << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size.value_or(1) << std::endl;
+           << "num_sparse_kv_tokens: " << this->num_sparse_kv_tokens << std::endl;
         return ss.str();
     }
 
