@@ -56,19 +56,19 @@ __global__ void gatherKvPageOffsetsKernel(
     // Calculate the page mask.
     int32_t src_page_idx_offset = 0;
     int32_t dst_page_idx_offset = 0;
-    for (int32_t i = 0; i < page_loops; i++)
+    for (int32_t loop_idx = 0; loop_idx < page_loops; loop_idx++)
     {
-        src_page_idx_offset = i * MAX_NUM_PAGES;
+        src_page_idx_offset = loop_idx * MAX_NUM_PAGES;
         int32_t loop_num_valid_pages = min(MAX_NUM_PAGES, ori_valid_pages - src_page_idx_offset);
-        for (int32_t j = threadIdx.x; j < loop_num_valid_pages; j += blockDim.x)
+        for (int32_t i = threadIdx.x; i < loop_num_valid_pages; i += blockDim.x)
         {
             s_page_mask[i] = 0;
         }
         __syncthreads();
 
-        for (int32_t j = threadIdx.x; j < num_sparse_pages; j += blockDim.x)
+        for (int32_t i = threadIdx.x; i < num_sparse_pages; i += blockDim.x)
         {
-            int32_t const src_idx = sparse_params.sparse_attn_indices[sparse_idx_global + j];
+            int32_t const src_idx = sparse_params.sparse_attn_indices[sparse_idx_global + i];
             if (src_idx < 0)
             {
                 continue;
@@ -79,7 +79,6 @@ __global__ void gatherKvPageOffsetsKernel(
                 s_page_mask[src_page_idx - src_page_idx_offset] = 1;
             }
         }
-        __syncthreads();
 
         BlockScan(temp_storage_scan).ExclusiveSum(s_page_mask, s_cu_page_mask);
 
@@ -147,10 +146,10 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_
     // The block.
     dim3 block(256, 1, 1);
     // Shared memory size.
-    size_t smem_size = sizeof(Pair) * 256 + sizeof(int32_t) * (512 * 2 + 256);
+    size_t smem_size = sizeof(Pair) * 256 + sizeof(int32_t) * (256 * 2 + 256);
 
     // Launch the kernel.
-    gatherKvPageOffsetsKernel<256, 512><<<grid, block, smem_size, stream>>>(
+    gatherKvPageOffsetsKernel<256, 256><<<grid, block, smem_size, stream>>>(
         output_kv_page_offsets, output_seq_lengths, kv_page_offsets, seq_lengths, sparse_params);
 }
 } // namespace kernels
