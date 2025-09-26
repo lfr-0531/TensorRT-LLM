@@ -361,264 +361,7 @@ def fused_qk_split(input_tensor: torch.Tensor, num_heads: int,
 
 
 ########################################################
-# BMM softmax kernel
-########################################################
-
-
-@triton.jit
-def bmm_softmax_kernel(
-    q_ptr,
-    k_ptr,
-    scores_ptr,
-    m_i_stored_ptr,
-    q_cu_seqlens_ptr,
-    k_cu_seqlens_ptr,
-    total_q_tokens,
-    total_k_tokens,
-    head_dim,
-    batch_size,
-    num_q_heads,
-    num_k_heads,
-    q_len_per_seq,
-    sm_scale,
-    causal,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """
-    Optimized bmm softmax kernel for computing softmax(QK^T) with online softmax..
-
-    Args:
-        q_ptr: Query tensor [num_q_heads, total_q_tokens, head_dim]
-        k_ptr: Key tensor [num_kv_heads, total_k_tokens, head_dim]
-        scores_ptr: Output tensor [num_q_heads, q_len_per_seq, total_k_tokens]
-                   where q_len_per_seq = total_q_tokens // batch_size (uniform seq assumption)
-        m_i_stored_ptr: Tensor to store m_i_new values [num_q_heads, q_len_per_seq, total_k_tokens]
-                       for correct final normalization while maintaining numerical stability
-        BLOCK_M: Query block size (compile-time constant)
-        BLOCK_N: Key block size (compile-time constant)
-        BLOCK_K: Head dimension block size for tiled matmul (compile-time constant)
-    """
-
-    batch_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-
-    if batch_idx >= batch_size or head_idx >= num_q_heads:
-        return
-
-    # Continuous mapping of query heads to key heads
-    k_head_idx = head_idx // (num_q_heads // num_k_heads)
-
-    q_seq_start = tl.load(q_cu_seqlens_ptr + batch_idx)
-    q_seq_end = tl.load(q_cu_seqlens_ptr + batch_idx + 1)
-    k_seq_start = tl.load(k_cu_seqlens_ptr + batch_idx)
-    k_seq_end = tl.load(k_cu_seqlens_ptr + batch_idx + 1)
-
-    q_seqlen = q_seq_end - q_seq_start
-    k_seqlen = k_seq_end - k_seq_start
-
-    if q_seqlen <= 0 or k_seqlen <= 0:
-        return
-
-    # Process queries in this batch with BLOCK_M parallelization
-    for q_block_start in tl.range(0, q_seqlen, BLOCK_M):
-        q_offsets = q_block_start + tl.arange(0, BLOCK_M)
-        q_mask = q_offsets < q_seqlen
-        q_global_offsets = q_seq_start + q_offsets
-
-        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float(
-            "inf")  # Running max
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # Running sum
-
-        for k_block_start in tl.range(0, k_seqlen, BLOCK_N):
-            k_offsets = k_block_start + tl.arange(0, BLOCK_N)
-            k_mask = k_offsets < k_seqlen
-            k_global_offsets = k_seq_start + k_offsets
-
-            # Initialize QK^T accumulator for this (M, N) block
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-            for k_dim_start in tl.range(0, head_dim, BLOCK_K):
-                k_dim_offsets = k_dim_start + tl.arange(0, BLOCK_K)
-                k_dim_mask = k_dim_offsets < head_dim
-
-                # Load query chunk [BLOCK_M, BLOCK_K]
-                q_indices = head_idx * total_q_tokens * head_dim + q_global_offsets[:, None] * head_dim + k_dim_offsets[
-                    None, :]
-                q_chunk = tl.load(q_ptr + q_indices,
-                                  mask=q_mask[:, None] & k_dim_mask[None, :],
-                                  other=0.0)
-
-                # Load key chunk [BLOCK_N, BLOCK_K]
-                k_indices = k_head_idx * total_k_tokens * head_dim + k_global_offsets[:, None] * head_dim + k_dim_offsets[
-                    None, :]
-                k_chunk = tl.load(k_ptr + k_indices,
-                                  mask=k_mask[:, None] & k_dim_mask[None, :],
-                                  other=0.0)
-
-                qk += tl.dot(q_chunk, tl.trans(k_chunk))
-
-            # Scale the accumulated QK^T
-            qk = qk * sm_scale
-
-            valid_mask = q_mask[:, None] & k_mask[None, :]
-            if causal:
-                # Create causal mask based on positions within this batch's sequence
-                q_pos_in_seq = q_offsets[:, None]  # [BLOCK_M, 1]
-                k_pos_in_seq = k_offsets[None, :]  # [1, BLOCK_N]
-                causal_mask = q_pos_in_seq >= k_pos_in_seq
-                qk = tl.where(causal_mask & valid_mask, qk, float("-inf"))
-            else:
-                qk = tl.where(valid_mask, qk, float("-inf"))
-
-            # Online softmax update
-            m_ij = tl.max(qk, 1)  # Max across keys [BLOCK_M]
-            m_i_new = tl.maximum(m_i, m_ij)
-
-            # Rescale previous sum
-            alpha = tl.exp(m_i - m_i_new)
-            l_i = l_i * alpha
-
-            # Add contribution from current block
-            p = tl.exp(
-                qk -
-                m_i_new[:, None])  # [BLOCK_M, BLOCK_N] - numerically stable
-
-            l_ij = tl.sum(p, 1)  # Sum across keys [BLOCK_M]
-            l_i = l_i + l_ij
-
-            # Update running max
-            m_i = m_i_new
-
-            # Vectorized output index calculation
-            output_indices = (head_idx * q_len_per_seq * total_k_tokens +
-                              q_offsets[:, None] * total_k_tokens +
-                              k_global_offsets[None, :])  # [BLOCK_M, BLOCK_N]
-
-            # Store exp(qk - m_i_new) for numerical stability
-            tl.store(scores_ptr + output_indices, p, mask=valid_mask)
-
-            # Store corresponding m_i_new values for each position, this is needed for correct final normalization
-            tl.store(m_i_stored_ptr + output_indices,
-                     m_i_new[:, None],
-                     mask=valid_mask)
-
-        # Perform normalization for this q_block only after all k_blocks are processed
-        for k_block_start in tl.range(0, k_seqlen, BLOCK_N):
-            k_offsets = k_block_start + tl.arange(0, BLOCK_N)
-            k_mask = k_offsets < k_seqlen
-            k_global_offsets = k_seq_start + k_offsets
-
-            valid_mask = q_mask[:, None] & k_mask[None, :]
-
-            output_indices = (head_idx * q_len_per_seq * total_k_tokens +
-                              q_offsets[:, None] * total_k_tokens +
-                              k_global_offsets[None, :])
-
-            # Load current scores exp(qk - m_i_new_block)
-            stored_scores = tl.load(scores_ptr + output_indices,
-                                    mask=valid_mask,
-                                    other=0.0)
-
-            # Load the stored m_i_new values for each position
-            stored_m_i_new = tl.load(m_i_stored_ptr + output_indices,
-                                     mask=valid_mask,
-                                     other=float("-inf"))
-
-            # Apply correct normalization:
-            correction_factor = tl.exp(stored_m_i_new - m_i[:, None])
-
-            normalized_scores = tl.where(
-                valid_mask, stored_scores * correction_factor / l_i[:, None],
-                tl.zeros_like(stored_scores))
-
-            # Store normalized scores
-            tl.store(scores_ptr + output_indices,
-                     normalized_scores,
-                     mask=valid_mask)
-
-
-def bmm_softmax(q: torch.Tensor,
-                k: torch.Tensor,
-                q_cu_seqlens: torch.Tensor,
-                k_cu_seqlens: torch.Tensor,
-                batch_size: int,
-                sm_scale: float = None,
-                causal: bool = False) -> torch.Tensor:
-    """
-    Compute softmax(QK^T) using optimized bmm softmax algorithm with tiled matrix multiplication.
-
-    Args:
-        q: Query tensor [num_q_heads, total_q_tokens, head_dim]
-        k: Key tensor [num_kv_heads, total_k_tokens, head_dim]
-        q_cu_seqlens: Query cumulative sequence lengths [batch_size + 1]
-        k_cu_seqlens: Key cumulative sequence lengths [batch_size + 1]
-        batch_size: Number of batches
-        sm_scale: Scaling factor (default: 1/sqrt(head_dim))
-        causal: Whether to apply causal masking
-
-    Returns:
-        scores: Attention scores [num_q_heads, q_len_per_seq, total_k_tokens]
-                where q_len_per_seq = total_q_tokens // batch_size
-                Each batch's results are concatenated along the last dimension
-    """
-    num_q_heads, total_q_tokens, head_dim = q.shape
-    num_k_heads, total_k_tokens, _ = k.shape
-
-    assert total_q_tokens % batch_size == 0, "total_q_tokens must be divisible by batch_size"
-    q_len_per_seq = total_q_tokens // batch_size
-
-    if total_k_tokens == 0:
-        return torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
-                           dtype=torch.float32,
-                           device=q.device)
-
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(head_dim)
-
-    # Create output tensor with correct shape: [num_heads, q_len_per_seq, total_k_tokens]
-    scores = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
-                         dtype=torch.float32,
-                         device=q.device)
-
-    # Create tensor to store m_i_new values for each position
-    m_i_stored = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
-                             dtype=torch.float32,
-                             device=q.device)
-
-    BLOCK_M = 32
-    BLOCK_N = 512
-    BLOCK_K = 64
-
-    grid = lambda meta: (batch_size, num_q_heads)
-
-    bmm_softmax_kernel[grid](
-        q,
-        k,
-        scores,
-        m_i_stored,
-        q_cu_seqlens,
-        k_cu_seqlens,
-        total_q_tokens,
-        total_k_tokens,
-        head_dim,
-        batch_size,
-        num_q_heads,
-        num_k_heads,
-        q_len_per_seq,
-        sm_scale,
-        causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    return scores
-
-
-########################################################
-# Separated BMM and Softmax kernels
+# BMM kernel
 ########################################################
 
 
@@ -732,6 +475,81 @@ def bmm_kernel(
                               k_global_offsets[None, :])  # [BLOCK_M, BLOCK_N]
 
             tl.store(scores_ptr + output_indices, qk, mask=valid_mask)
+
+
+def bmm(q: torch.Tensor,
+        k: torch.Tensor,
+        q_cu_seqlens: torch.Tensor,
+        k_cu_seqlens: torch.Tensor,
+        batch_size: int,
+        sm_scale: float = None,
+        causal: bool = False) -> torch.Tensor:
+    """
+    Compute softmax(QK^T) using separated BMM and Softmax kernels.
+
+    Args:
+        q: Query tensor [num_q_heads, total_q_tokens, head_dim]
+        k: Key tensor [num_kv_heads, total_k_tokens, head_dim]
+        q_cu_seqlens: Query cumulative sequence lengths [batch_size + 1]
+        k_cu_seqlens: Key cumulative sequence lengths [batch_size + 1]
+        batch_size: Number of batches
+        sm_scale: Scaling factor (default: 1/sqrt(head_dim))
+        causal: Whether to apply causal masking
+
+    Returns:
+        scores: Attention scores [num_q_heads, q_len_per_seq, total_k_tokens]
+    """
+    num_q_heads, total_q_tokens, head_dim = q.shape
+    num_k_heads, total_k_tokens, _ = k.shape
+
+    assert total_q_tokens % batch_size == 0, "total_q_tokens must be divisible by batch_size"
+    q_len_per_seq = total_q_tokens // batch_size
+
+    if total_k_tokens == 0:
+        return torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
+                           dtype=torch.float32,
+                           device=q.device)
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    bmm_results = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
+                              dtype=torch.float32,
+                              device=q.device)
+
+    # BMM kernel configuration
+    BLOCK_M = 32
+    BLOCK_N = 256
+    BLOCK_K = 64
+
+    grid_bmm = lambda meta: (batch_size, num_q_heads)
+
+    bmm_kernel[grid_bmm](
+        q,
+        k,
+        bmm_results,
+        q_cu_seqlens,
+        k_cu_seqlens,
+        total_q_tokens,
+        total_k_tokens,
+        head_dim,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        q_len_per_seq,
+        sm_scale,
+        causal,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return bmm_results
+
+
+########################################################
+# Softmax kernel
+########################################################
 
 
 @triton.jit
@@ -861,76 +679,6 @@ def triton_softmax(
     )
 
     return output
-
-
-def bmm(q: torch.Tensor,
-        k: torch.Tensor,
-        q_cu_seqlens: torch.Tensor,
-        k_cu_seqlens: torch.Tensor,
-        batch_size: int,
-        sm_scale: float = None,
-        causal: bool = False) -> torch.Tensor:
-    """
-    Compute softmax(QK^T) using separated BMM and Softmax kernels.
-
-    Args:
-        q: Query tensor [num_q_heads, total_q_tokens, head_dim]
-        k: Key tensor [num_kv_heads, total_k_tokens, head_dim]
-        q_cu_seqlens: Query cumulative sequence lengths [batch_size + 1]
-        k_cu_seqlens: Key cumulative sequence lengths [batch_size + 1]
-        batch_size: Number of batches
-        sm_scale: Scaling factor (default: 1/sqrt(head_dim))
-        causal: Whether to apply causal masking
-
-    Returns:
-        scores: Attention scores [num_q_heads, q_len_per_seq, total_k_tokens]
-    """
-    num_q_heads, total_q_tokens, head_dim = q.shape
-    num_k_heads, total_k_tokens, _ = k.shape
-
-    assert total_q_tokens % batch_size == 0, "total_q_tokens must be divisible by batch_size"
-    q_len_per_seq = total_q_tokens // batch_size
-
-    if total_k_tokens == 0:
-        return torch.zeros((num_q_heads, q_len_per_seq, total_k_tokens),
-                           dtype=torch.float32,
-                           device=q.device)
-
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(head_dim)
-
-    bmm_results = torch.empty((num_q_heads, q_len_per_seq, total_k_tokens),
-                              dtype=torch.float32,
-                              device=q.device)
-
-    # BMM kernel configuration
-    BLOCK_M = 32
-    BLOCK_N = 256
-    BLOCK_K = 64
-
-    grid_bmm = lambda meta: (batch_size, num_q_heads)
-
-    bmm_kernel[grid_bmm](
-        q,
-        k,
-        bmm_results,
-        q_cu_seqlens,
-        k_cu_seqlens,
-        total_q_tokens,
-        total_k_tokens,
-        head_dim,
-        batch_size,
-        num_q_heads,
-        num_k_heads,
-        q_len_per_seq,
-        sm_scale,
-        causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    return bmm_results
 
 
 ########################################################
@@ -1196,146 +944,8 @@ def flatten_sparse_indices(
 
 
 ########################################################
-# Sparse KT cache update kernel
+# KT cache update kernel
 ########################################################
-
-
-@triton.jit
-def sparse_update_kt_cache_kernel(qkv_ptr, kt_cache_tensor_ptr,
-                                  sparse_kv_indices_ptr, sparse_kv_offsets_ptr,
-                                  kt_cache_slots_ptr, num_heads, num_kv_heads,
-                                  head_dim, page_size, num_pages_per_block,
-                                  num_total_tokens, num_total_sparse_tokens,
-                                  batch_size, BLOCK_SIZE: tl.constexpr):
-    """
-    Batched sparse KT cache update kernel for RocketKV algorithm.
-
-    Args:
-        qkv_ptr: Input QKV tensor [num_total_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
-        kt_cache_tensor_ptr: KT cache tensor [max_batch_size, num_kv_heads, 2*head_dim, num_pages_per_block]
-        sparse_kv_indices_ptr: Sparse indices [num_kv_heads, num_total_sparse_tokens]
-        sparse_kv_offsets_ptr: Sparse offsets [batch_size + 1]
-        kt_cache_slots_ptr: Cache slot indices for each batch [batch_size]
-        num_heads: Number of Q heads
-        num_kv_heads: Number of KV heads
-        head_dim: Head dimension
-        page_size: Page size for grouping tokens
-        num_pages_per_block: Maximum pages per block in cache
-        batch_size: Number of batches to process
-    """
-    batch_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    page_idx = tl.program_id(2)
-
-    if batch_idx >= batch_size or head_idx >= num_kv_heads:
-        return
-
-    # Get cache slot for current batch
-    cache_slot = tl.load(kt_cache_slots_ptr + batch_idx)
-
-    # Get sparse token range for current batch
-    sparse_start = tl.load(sparse_kv_offsets_ptr + batch_idx)
-    sparse_end = tl.load(sparse_kv_offsets_ptr + batch_idx + 1)
-    num_sparse_tokens = sparse_end - sparse_start
-
-    if num_sparse_tokens <= 0:
-        return
-
-    # Calculate page boundaries
-    page_token_start = page_idx * page_size
-    page_token_end = tl.minimum(page_token_start + page_size, num_sparse_tokens)
-
-    if page_token_start >= num_sparse_tokens or page_idx >= num_pages_per_block:
-        return
-
-    # Load existing cache values using cache_slot
-    cache_base = cache_slot * num_kv_heads * 2 * head_dim * num_pages_per_block + head_idx * 2 * head_dim * num_pages_per_block
-
-    # Process head dimensions in blocks using BLOCK_SIZE
-    for dim_block_start in tl.range(0, head_dim, BLOCK_SIZE):
-        # Calculate dimension offsets for current block
-        dim_offsets = dim_block_start + tl.arange(0, BLOCK_SIZE)
-        dim_mask = dim_offsets < head_dim
-
-        # Initialize min/max values for this dimension block
-        k_min = tl.full([BLOCK_SIZE], float('inf'), dtype=tl.float32)
-        k_max = tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32)
-
-        # Process tokens in current page for this dimension block
-        for token_offset in range(page_token_start, page_token_end):
-            # Get global sparse index for current head and token
-            sparse_global_idx = sparse_start + token_offset
-            sparse_indices_base = head_idx * num_total_sparse_tokens + sparse_global_idx
-            global_token_idx = tl.load(sparse_kv_indices_ptr +
-                                       sparse_indices_base)
-
-            qkv_k_start_offset = num_heads * head_dim
-            qkv_stride = num_heads * head_dim + 2 * num_kv_heads * head_dim
-
-            k_indices = (global_token_idx * qkv_stride + qkv_k_start_offset +
-                         head_idx * head_dim + dim_offsets)
-
-            # Load values for current dimension block
-            k_values = tl.load(qkv_ptr + k_indices, mask=dim_mask, other=0.0)
-
-            # Update min/max for this page and dimension block
-            k_min = tl.where(dim_mask, tl.minimum(k_min, k_values), k_min)
-            k_max = tl.where(dim_mask, tl.maximum(k_max, k_values), k_max)
-
-        # Calculate indices for min and max cache locations for current dimension block
-        cache_min_indices = cache_base + dim_offsets * num_pages_per_block + page_idx
-        cache_max_indices = cache_base + (
-            head_dim + dim_offsets) * num_pages_per_block + page_idx
-
-        # Store updated values back to cache for current dimension block
-        tl.store(kt_cache_tensor_ptr + cache_min_indices, k_min, mask=dim_mask)
-        tl.store(kt_cache_tensor_ptr + cache_max_indices, k_max, mask=dim_mask)
-
-
-def batched_update_kt_cache(qkv: torch.Tensor, kt_cache_tensor: torch.Tensor,
-                            kt_cache_slots: torch.Tensor,
-                            sparse_kv_indices: torch.Tensor,
-                            sparse_kv_offsets: torch.Tensor, batch_size: int,
-                            num_heads: int, num_kv_heads: int, head_dim: int,
-                            max_num_pages: int, page_size: int) -> None:
-    """
-    Batched update KT cache with QKV tensor using Triton kernel.
-    Updated to work directly with QKV input tensor.
-
-    Args:
-        qkv: Input QKV tensor [num_total_tokens, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim]
-        kt_cache_tensor: KT cache tensor [max_batch_size, num_kv_heads, 2*head_dim, num_pages_per_block]
-        kt_cache_slots: Cache slot indices for each batch [batch_size] (tensor or list)
-        sparse_kv_indices: Sparse indices [num_kv_heads, num_total_sparse_tokens]
-        sparse_kv_offsets: Sparse offsets [batch_size + 1]
-        batch_size: Number of batches
-        num_heads: Number of Q heads
-        num_kv_heads: Number of KV heads
-        head_dim: Head dimension
-        max_num_pages: Maximum number of pages across all batches
-        page_size: Page size for grouping tokens
-    """
-    num_total_tokens = qkv.shape[0]
-    max_batch_size, _, _, num_pages_per_block = kt_cache_tensor.shape
-    num_total_sparse_tokens = sparse_kv_indices.shape[1]
-
-    grid = (batch_size, num_kv_heads, max_num_pages)
-    BLOCK_SIZE = 128
-
-    sparse_update_kt_cache_kernel[grid](qkv,
-                                        kt_cache_tensor,
-                                        sparse_kv_indices,
-                                        sparse_kv_offsets,
-                                        kt_cache_slots,
-                                        num_heads,
-                                        num_kv_heads,
-                                        head_dim,
-                                        page_size,
-                                        num_pages_per_block,
-                                        num_total_tokens,
-                                        num_total_sparse_tokens,
-                                        batch_size,
-                                        BLOCK_SIZE=BLOCK_SIZE)
 
 
 @triton.jit
@@ -1538,11 +1148,6 @@ def _load_kt_cache_kernel(kt_states_ptr, cache_ptr, block_offsets_ptr,
         tl.store(kt_states_base + hidden_indices, kt, mask=mask)
 
 
-########################################################
-# Fused KT cache update and BMM kernel
-########################################################
-
-
 @triton.jit
 def kt_cache_update_kernel(
     k_ptr,
@@ -1628,6 +1233,150 @@ def kt_cache_update_kernel(
 
     tl.store(kt_cache_tensor_ptr + cache_min_indices, k_min_new, mask=dim_mask)
     tl.store(kt_cache_tensor_ptr + cache_max_indices, k_max_new, mask=dim_mask)
+
+
+def triton_update_kt_cache(k,
+                           kt_cache_tensor,
+                           kt_cache_block_offsets,
+                           seq_lens,
+                           kt_page_size,
+                           tokens_per_block,
+                           max_kt_blocks_per_seq,
+                           sparse_kv_indices=None,
+                           sparse_kv_offsets=None,
+                           update=True):
+    # inputs:
+    # k: ctx: (total_seq_len, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim)
+    #    gen: (total_seq_len, num_kv_heads, head_dim)
+    # kt_cache_tensor: (num_blocks, tokens_per_block, num_kv_heads, 2 * head_dim)
+    # kt_cache_block_offsets: (max_batch_size, max_kt_blocks_per_seq)
+    # seq_lens: (batch_size)
+    # kt_page_size: int
+    # sparse_kv_indices: (num_kv_heads, num_total_sparse_tokens)
+    # sparse_kv_offsets: (batch_size + 1)
+    # update: bool
+
+    # outputs:
+    # kt_states: (total_kt_tokens, num_kv_heads, 2 * head_dim)
+
+    # params
+    batch_size = seq_lens.size(0)
+    num_kv_heads = kt_cache_tensor.size(-2)
+    head_dim = kt_cache_tensor.size(-1) // 2
+    tokens_per_block = kt_cache_tensor.size(1)
+
+    # context
+    if not update and sparse_kv_indices is not None and sparse_kv_offsets is not None:
+        num_heads = k.size(1) // head_dim - 2 * num_kv_heads
+        seq_lens = sparse_kv_offsets[1:batch_size +
+                                     1] - sparse_kv_offsets[:batch_size]
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
+        total_num_kt_tokens = num_kt_tokens.sum().item()
+        cum_kt_seq_lens = torch.cumsum(torch.cat([
+            torch.zeros(1, device='cuda', dtype=torch.long),
+            num_kt_tokens.to(torch.long)
+        ]),
+                                       dim=0)
+        token_to_batch_map = torch.repeat_interleave(
+            torch.arange(batch_size, device='cuda'),
+            repeats=num_kt_tokens[:batch_size]).to(torch.long)
+
+        grid = (total_num_kt_tokens, )
+        _update_kt_cache_ctx_sparse_kernel[grid](k,
+                                                 kt_cache_tensor,
+                                                 kt_cache_block_offsets,
+                                                 sparse_kv_indices,
+                                                 sparse_kv_offsets,
+                                                 cum_kt_seq_lens,
+                                                 token_to_batch_map,
+                                                 batch_size,
+                                                 num_heads,
+                                                 num_kv_heads,
+                                                 head_dim,
+                                                 kt_page_size,
+                                                 tokens_per_block,
+                                                 max_kt_blocks_per_seq,
+                                                 BLOCK_SIZE=1024)
+    elif not update:
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
+        total_num_kt_tokens = num_kt_tokens.sum().item()
+        cum_seq_lens = torch.cumsum(torch.cat([
+            torch.zeros(1, device='cuda', dtype=torch.long),
+            seq_lens.to(torch.long)
+        ]),
+                                    dim=0)
+        cum_kt_seq_lens = torch.cumsum(torch.cat([
+            torch.zeros(1, device='cuda', dtype=torch.long),
+            num_kt_tokens.to(torch.long)
+        ]),
+                                       dim=0)
+
+        token_to_batch_map = torch.repeat_interleave(
+            torch.arange(batch_size,
+                         device='cuda'), repeats=num_kt_tokens).to(torch.long)
+        grid = (total_num_kt_tokens, )
+        _update_kt_cache_ctx_kernel[grid](k,
+                                          kt_cache_tensor,
+                                          kt_cache_block_offsets,
+                                          cum_seq_lens,
+                                          cum_kt_seq_lens,
+                                          token_to_batch_map,
+                                          num_kv_heads,
+                                          head_dim,
+                                          kt_page_size,
+                                          tokens_per_block,
+                                          max_kt_blocks_per_seq,
+                                          BLOCK_SIZE=1024)
+        return
+    else:
+        # generation
+        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
+
+        # update kt cache
+        grid = (batch_size, num_kv_heads)
+        _update_kt_cache_gen_kernel[grid](k,
+                                          kt_cache_tensor,
+                                          kt_cache_block_offsets,
+                                          seq_lens,
+                                          num_kv_heads,
+                                          head_dim,
+                                          kt_page_size,
+                                          tokens_per_block,
+                                          max_kt_blocks_per_seq,
+                                          BLOCK_SIZE=1024)
+
+        # load kt cache
+        total_num_kt_tokens = num_kt_tokens.sum().item()
+        kt_states = torch.empty(
+            (total_num_kt_tokens, num_kv_heads, 2 * head_dim),
+            device='cuda',
+            dtype=k.dtype)
+        token_to_batch_map = torch.repeat_interleave(
+            torch.arange(batch_size,
+                         device='cuda'), repeats=num_kt_tokens).to(torch.long)
+        cum_kt_seq_lens = torch.cumsum(torch.cat([
+            torch.zeros(1, device='cuda', dtype=torch.long),
+            num_kt_tokens.to(torch.long)
+        ]),
+                                       dim=0)
+        grid = (total_num_kt_tokens, )
+        _load_kt_cache_kernel[grid](kt_states,
+                                    kt_cache_tensor,
+                                    kt_cache_block_offsets,
+                                    cum_kt_seq_lens,
+                                    token_to_batch_map,
+                                    num_kv_heads,
+                                    head_dim,
+                                    tokens_per_block,
+                                    max_kt_blocks_per_seq,
+                                    BLOCK_SIZE=1024)
+
+        return kt_states
+
+
+########################################################
+# Paged KT cache BMM kernel
+########################################################
 
 
 @triton.jit
@@ -2216,142 +1965,3 @@ def triton_topk(
     )
 
     return output_indices, sparse_offsets
-
-
-def triton_update_kt_cache(k,
-                           kt_cache_tensor,
-                           kt_cache_block_offsets,
-                           seq_lens,
-                           kt_page_size,
-                           tokens_per_block,
-                           max_kt_blocks_per_seq,
-                           sparse_kv_indices=None,
-                           sparse_kv_offsets=None,
-                           update=True):
-    # inputs:
-    # k: ctx: (total_seq_len, num_heads*head_dim + num_kv_heads*head_dim + num_kv_heads*head_dim)
-    #    gen: (total_seq_len, num_kv_heads, head_dim)
-    # kt_cache_tensor: (num_blocks, tokens_per_block, num_kv_heads, 2 * head_dim)
-    # kt_cache_block_offsets: (max_batch_size, max_kt_blocks_per_seq)
-    # seq_lens: (batch_size)
-    # kt_page_size: int
-    # sparse_kv_indices: (num_kv_heads, num_total_sparse_tokens)
-    # sparse_kv_offsets: (batch_size + 1)
-    # update: bool
-
-    # outputs:
-    # kt_states: (total_kt_tokens, num_kv_heads, 2 * head_dim)
-
-    # params
-    batch_size = seq_lens.size(0)
-    num_kv_heads = kt_cache_tensor.size(-2)
-    head_dim = kt_cache_tensor.size(-1) // 2
-    tokens_per_block = kt_cache_tensor.size(1)
-
-    # context
-    if not update and sparse_kv_indices is not None and sparse_kv_offsets is not None:
-        num_heads = k.size(1) // head_dim - 2 * num_kv_heads
-        seq_lens = sparse_kv_offsets[1:batch_size +
-                                     1] - sparse_kv_offsets[:batch_size]
-        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
-        total_num_kt_tokens = num_kt_tokens.sum().item()
-        cum_kt_seq_lens = torch.cumsum(torch.cat([
-            torch.zeros(1, device='cuda', dtype=torch.long),
-            num_kt_tokens.to(torch.long)
-        ]),
-                                       dim=0)
-        token_to_batch_map = torch.repeat_interleave(
-            torch.arange(batch_size, device='cuda'),
-            repeats=num_kt_tokens[:batch_size]).to(torch.long)
-
-        grid = (total_num_kt_tokens, )
-        _update_kt_cache_ctx_sparse_kernel[grid](k,
-                                                 kt_cache_tensor,
-                                                 kt_cache_block_offsets,
-                                                 sparse_kv_indices,
-                                                 sparse_kv_offsets,
-                                                 cum_kt_seq_lens,
-                                                 token_to_batch_map,
-                                                 batch_size,
-                                                 num_heads,
-                                                 num_kv_heads,
-                                                 head_dim,
-                                                 kt_page_size,
-                                                 tokens_per_block,
-                                                 max_kt_blocks_per_seq,
-                                                 BLOCK_SIZE=1024)
-    elif not update:
-        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
-        total_num_kt_tokens = num_kt_tokens.sum().item()
-        cum_seq_lens = torch.cumsum(torch.cat([
-            torch.zeros(1, device='cuda', dtype=torch.long),
-            seq_lens.to(torch.long)
-        ]),
-                                    dim=0)
-        cum_kt_seq_lens = torch.cumsum(torch.cat([
-            torch.zeros(1, device='cuda', dtype=torch.long),
-            num_kt_tokens.to(torch.long)
-        ]),
-                                       dim=0)
-
-        token_to_batch_map = torch.repeat_interleave(
-            torch.arange(batch_size,
-                         device='cuda'), repeats=num_kt_tokens).to(torch.long)
-        grid = (total_num_kt_tokens, )
-        _update_kt_cache_ctx_kernel[grid](k,
-                                          kt_cache_tensor,
-                                          kt_cache_block_offsets,
-                                          cum_seq_lens,
-                                          cum_kt_seq_lens,
-                                          token_to_batch_map,
-                                          num_kv_heads,
-                                          head_dim,
-                                          kt_page_size,
-                                          tokens_per_block,
-                                          max_kt_blocks_per_seq,
-                                          BLOCK_SIZE=1024)
-        return
-    else:
-        # generation
-        num_kt_tokens = (seq_lens + kt_page_size - 1) // kt_page_size
-
-        # update kt cache
-        grid = (batch_size, num_kv_heads)
-        _update_kt_cache_gen_kernel[grid](k,
-                                          kt_cache_tensor,
-                                          kt_cache_block_offsets,
-                                          seq_lens,
-                                          num_kv_heads,
-                                          head_dim,
-                                          kt_page_size,
-                                          tokens_per_block,
-                                          max_kt_blocks_per_seq,
-                                          BLOCK_SIZE=1024)
-
-        # load kt cache
-        total_num_kt_tokens = num_kt_tokens.sum().item()
-        kt_states = torch.empty(
-            (total_num_kt_tokens, num_kv_heads, 2 * head_dim),
-            device='cuda',
-            dtype=k.dtype)
-        token_to_batch_map = torch.repeat_interleave(
-            torch.arange(batch_size,
-                         device='cuda'), repeats=num_kt_tokens).to(torch.long)
-        cum_kt_seq_lens = torch.cumsum(torch.cat([
-            torch.zeros(1, device='cuda', dtype=torch.long),
-            num_kt_tokens.to(torch.long)
-        ]),
-                                       dim=0)
-        grid = (total_num_kt_tokens, )
-        _load_kt_cache_kernel[grid](kt_states,
-                                    kt_cache_tensor,
-                                    kt_cache_block_offsets,
-                                    cum_kt_seq_lens,
-                                    token_to_batch_map,
-                                    num_kv_heads,
-                                    head_dim,
-                                    tokens_per_block,
-                                    max_kt_blocks_per_seq,
-                                    BLOCK_SIZE=1024)
-
-        return kt_states

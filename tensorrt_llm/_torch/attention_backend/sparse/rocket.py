@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two, nvtx_range
+from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -366,7 +366,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
 
-    def batched_ctx_sparse_predict(
+    def _batched_sparse_kv_predict(
         self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
@@ -467,8 +467,7 @@ class RocketTrtllmAttention(TrtllmAttention):
 
         return q, k, q_mask, dim_pos
 
-    @nvtx_range("batched_gen_sparse_predict")
-    def batched_gen_sparse_predict(
+    def _batched_sparse_attn_predict(
         self, qkv: torch.Tensor, metadata: RocketTrtllmAttentionMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         metadata.num_ctx_tokens
@@ -516,9 +515,9 @@ class RocketTrtllmAttention(TrtllmAttention):
         Predict sparse KV indices and sparse attention indices for the input sequence.
         """
         assert k is None, "RocketKV can only support fused qkv input."
-        sparse_kv_indices, sparse_kv_offsets = self.batched_ctx_sparse_predict(
+        sparse_kv_indices, sparse_kv_offsets = self._batched_sparse_kv_predict(
             q, metadata)
-        sparse_attn_indices, sparse_attn_offsets = self.batched_gen_sparse_predict(
+        sparse_attn_indices, sparse_attn_offsets = self._batched_sparse_attn_predict(
             q, metadata)
 
         return sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets
