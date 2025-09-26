@@ -101,7 +101,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                             kv_cache_tensor: torch.Tensor,
                                             metadata: AttentionMetadata,
                                             past_seen_token: int,
-                                            cache_idx: int,
+                                            sample_idx: int,
                                             **kwargs) -> Optional[torch.Tensor]:
         raise NotImplementedError
 
@@ -109,7 +109,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                           k: Optional[torch.Tensor],
                                           v: Optional[torch.Tensor],
                                           metadata: AttentionMetadata,
-                                          past_seen_token: int, cache_idx: int,
+                                          past_seen_token: int, sample_idx: int,
                                           **kwargs) -> Optional[torch.Tensor]:
         raise NotImplementedError
 
@@ -270,6 +270,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 past_seen_token,
                                 cache_idx,
                                 metadata: AttentionMetadata,
+                                sample_idx,
                                 attention_window_size: Optional[int] = None,
                                 **kwargs):
         # preprocess inputs
@@ -280,7 +281,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         sparse_kv_indices = None
         if self.sparse_attention_config is not None:
             sparse_kv_indices, kv_len = self._single_request_sparse_kv_predict(
-                q, k, v, metadata, past_seen_token, cache_idx)
+                q, k, v, metadata, past_seen_token, sample_idx)
 
         # update kv cache
         key_states, value_states = self._single_request_update_kv_cache(
@@ -291,7 +292,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         sparse_indices = None
         if self.sparse_attention_config is not None:
             sparse_indices, kv_len = self._single_request_sparse_attn_predict(
-                q, k, v, kv_cache_tensor, metadata, past_seen_token, cache_idx)
+                q, k, v, kv_cache_tensor, metadata, past_seen_token, sample_idx)
 
         # create attention mask
         attn_mask, is_causal = self._single_request_create_attention_mask(
@@ -429,7 +430,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                past_seen_token, cache_idx, metadata, **kwargs)
+                past_seen_token, cache_idx, metadata, i, **kwargs)
 
             attn_outputs.append(attn_output)
 
