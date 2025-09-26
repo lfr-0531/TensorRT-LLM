@@ -217,9 +217,6 @@ class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
 
         return batch_sizes
 
-    def get_sparse_indices_block_size(self) -> int:
-        return self.page_size
-
 
 class MoeConfig(StrictBaseModel):
     """
