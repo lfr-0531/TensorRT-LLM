@@ -77,6 +77,7 @@ __global__ void gatherKvPageOffsetsKernel(
                 s_page_mask[src_page_idx - src_page_idx_offset] = 1;
             }
         }
+        __syncthreads();
 
         BlockScan(temp_storage_scan).ExclusiveSum(s_page_mask, s_cu_page_mask);
 
@@ -146,10 +147,10 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_
     // The block.
     dim3 block(256, 1, 1);
     // Shared memory size.
-    size_t smem_size = sizeof(Pair) * 256 + sizeof(int32_t) * (256 * 2 + 256);
+    size_t smem_size = sizeof(Pair) * 256 + sizeof(int32_t) * (512 * 2 + 256);
 
     // Launch the kernel.
-    gatherKvPageOffsetsKernel<256, 256><<<grid, block, smem_size, stream>>>(output_kv_page_offsets, output_seq_lengths,
+    gatherKvPageOffsetsKernel<256, 512><<<grid, block, smem_size, stream>>>(output_kv_page_offsets, output_seq_lengths,
         kv_page_offsets, seq_lengths, sparse_params, batch_size, tokens_per_page, max_num_pages_per_seq);
 }
 } // namespace kernels
