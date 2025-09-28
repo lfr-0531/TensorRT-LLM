@@ -17,7 +17,6 @@
 #include "xqaDispatcher.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
-#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cstdint>
 
@@ -426,17 +425,11 @@ void XqaDispatcher::runImpl(
             // Gather kv page offsets for sparse attention.
             if (params.use_sparse_attention)
             {
-                SparseAttentionParams sparse_params;
-                sparse_params.sparse_attn_indices = params.sparse_attn_indices;
-                sparse_params.sparse_attn_offsets = params.sparse_attn_offsets;
-                sparse_params.batch_size = batch_beam_size;
-                sparse_params.num_head_kv = num_kv_heads;
-                sparse_params.tokens_per_page = kv_cache_buffer.mTokensPerBlock;
-                sparse_params.max_num_pages_per_seq = kv_cache_buffer.mMaxBlocksPerSeq;
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
-                    params.sequence_lengths, sparse_params, params.stream);
-                sync_check_cuda_error(params.stream);
+                    params.sequence_lengths, params.sparse_attn_indices, params.sparse_attn_offsets, batch_beam_size,
+                    num_kv_heads, kv_cache_buffer.mTokensPerBlock, kv_cache_buffer.mMaxBlocksPerSeq, params.stream)
+                    sync_check_cuda_error(params.stream);
                 tllmRunnerParams.seqLensKvPtr = launchParams.sparse_seq_lengths;
                 tllmRunnerParams.kvPageIdxPtr
                     = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(launchParams.sparse_kv_block_offsets);

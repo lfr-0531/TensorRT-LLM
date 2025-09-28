@@ -218,35 +218,17 @@ public:
             mla_params.workspace = workspace_ptr;
         }
 
-        op.mRuntimeSparseAttentionParams.sparse_kv_offsets = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_kv_indices = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_offsets = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_indices = nullptr;
-        op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens = 0;
-
-        if (op.useSparseAttention() && num_seqs > 0)
-        {
-            if (is_context)
-            {
-                if (sparse_kv_indices.has_value())
-                {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_indices = sparse_kv_indices.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.sparse_kv_offsets = sparse_kv_offsets.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
-                        = sparse_kv_offsets.value().index({num_seqs}).item<int32_t>();
-                }
-            }
-            else
-            {
-                if (sparse_attn_indices.has_value())
-                {
-                    op.mRuntimeSparseAttentionParams.sparse_attn_indices
-                        = sparse_attn_indices.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.sparse_attn_offsets
-                        = sparse_attn_offsets.value().data_ptr<int32_t>();
-                }
-            }
-        }
+        // Prepare sparse attention parameters
+        op.mRuntimeSparseAttentionParams.sparse_kv_indices
+            = sparse_kv_indices.has_value() ? sparse_kv_indices.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_kv_offsets
+            = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices
+            = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_offsets
+            = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
+            = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().index({num_seqs}).item<int32_t>() : 0;
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();

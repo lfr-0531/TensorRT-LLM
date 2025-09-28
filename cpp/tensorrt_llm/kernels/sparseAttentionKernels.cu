@@ -1,4 +1,3 @@
-#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include <cub/cub.cuh>
 
 namespace tensorrt_llm
@@ -7,16 +6,17 @@ namespace kernels
 {
 template <int THREADS_PER_BLOCK>
 __global__ void gatherKvPageOffsetsKernel(
-    int32_t* output_kv_page_offsets, // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
-    int32_t* output_seq_lengths,     // [num_head_kv, batch_size]
-    int32_t const* kv_page_offsets,  // [batch_size, 2, max_num_pages_per_seq]
-    int32_t const* seq_lengths,      // [batch_size]
-    SparseAttentionParams sparse_params)
+    int32_t* output_kv_page_offsets,    // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
+    int32_t* output_seq_lengths,        // [num_head_kv, batch_size]
+    int32_t const* kv_page_offsets,     // [batch_size, 2, max_num_pages_per_seq]
+    int32_t const* seq_lengths,         // [batch_size]
+    int32_t const* sparse_attn_indices, // [num_head_kv, num_sparse_attn_indices]
+    int32_t const* sparse_attn_offsets, // [num_generations + 1]
+    int32_t const batch_size, int32_t const tokens_per_page, int32_t const max_num_pages_per_seq)
 {
     // Each CUDA block processes one sequence from the batch for one head.
     int32_t const head_idx = blockIdx.x;
     int32_t const batch_idx = blockIdx.y;
-    int32_t const batch_size = sparse_params.batch_size;
     if (batch_idx >= batch_size)
     {
         return;
@@ -26,9 +26,9 @@ __global__ void gatherKvPageOffsetsKernel(
     __shared__ typename cub::BlockReduce<Pair, THREADS_PER_BLOCK>::TempStorage temp_storage;
 
     // Get the range of sparse indices and the sequence length.
-    int32_t const start_offset = sparse_params.sparse_attn_offsets[batch_idx];
-    int32_t const end_offset = sparse_params.sparse_attn_offsets[batch_idx + 1];
-    int32_t const total_pages = sparse_params.sparse_attn_offsets[batch_size];
+    int32_t const start_offset = sparse_attn_offsets[batch_idx];
+    int32_t const end_offset = sparse_attn_offsets[batch_idx + 1];
+    int32_t const total_pages = sparse_attn_offsets[batch_size];
     int32_t const num_sparse_pages = end_offset - start_offset;
     int32_t const original_seq_len = seq_lengths[batch_idx];
 
@@ -36,7 +36,6 @@ __global__ void gatherKvPageOffsetsKernel(
     int32_t const sparse_idx_global = head_idx * total_pages + start_offset;
 
     // Get the base memory offset. shape: [batch_size, 2, max_num_pages_per_seq]
-    int32_t const max_num_pages_per_seq = sparse_params.max_num_pages_per_seq;
     size_t const src_base_offset = (size_t) batch_idx * 2 * max_num_pages_per_seq;
     size_t const dst_base_offset = (size_t) head_idx * batch_size * 2 * max_num_pages_per_seq + src_base_offset;
 
@@ -48,7 +47,7 @@ __global__ void gatherKvPageOffsetsKernel(
     for (int32_t i = threadIdx.x; i < num_sparse_pages; i += blockDim.x)
     {
         // Get the source idx and offset.
-        int32_t const src_idx = sparse_params.sparse_attn_indices[sparse_idx_global + i];
+        int32_t const src_idx = sparse_attn_indices[sparse_idx_global + i];
         if (src_idx < 0)
         {
             continue;
@@ -78,7 +77,6 @@ __global__ void gatherKvPageOffsetsKernel(
     {
         int32_t const max_page_index = result.max_val;
         int32_t const num_valid_pages = result.sum_val;
-        int32_t const tokens_per_page = sparse_params.tokens_per_page;
         int32_t const ori_valid_pages = (original_seq_len + tokens_per_page - 1) / tokens_per_page;
         size_t const seq_len_offset = (size_t) head_idx * batch_size + batch_idx;
         if (num_valid_pages > 0)
@@ -99,19 +97,21 @@ __global__ void gatherKvPageOffsetsKernel(
 
 // Host-side launcher function
 void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_seq_lengths,
-    int32_t const* kv_page_offsets, int32_t const* seq_lengths, SparseAttentionParams sparse_params,
-    cudaStream_t stream)
+    int32_t const* kv_page_offsets, int32_t const* seq_lengths, int32_t const* sparse_attn_indices,
+    int32_t const* sparse_attn_offsets, int32_t const batch_size, int32_t const num_head_kv,
+    int32_t const tokens_per_page, int32_t const max_num_pages_per_seq, cudaStream_t stream)
 {
     // The grid.
-    dim3 grid(sparse_params.num_head_kv, sparse_params.batch_size, 1);
+    dim3 grid(num_head_kv, batch_size, 1);
     // The block.
     dim3 block(256, 1, 1);
     // Shared memory size.
     size_t smem_size = sizeof(Pair) * 256;
 
     // Launch the kernel.
-    gatherKvPageOffsetsKernel<256><<<grid, block, smem_size, stream>>>(
-        output_kv_page_offsets, output_seq_lengths, kv_page_offsets, seq_lengths, sparse_params);
+    gatherKvPageOffsetsKernel<256><<<grid, block, smem_size, stream>>>(output_kv_page_offsets, output_seq_lengths,
+        kv_page_offsets, seq_lengths, sparse_attn_indices, sparse_attn_offsets, batch_size, tokens_per_page,
+        max_num_pages_per_seq);
 }
 } // namespace kernels
 } // namespace tensorrt_llm
