@@ -269,8 +269,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 kv_cache_tensor,
                                 past_seen_token,
                                 cache_idx,
-                                metadata: AttentionMetadata,
                                 sample_idx,
+                                metadata: AttentionMetadata,
                                 attention_window_size: Optional[int] = None,
                                 **kwargs):
         # preprocess inputs
@@ -415,7 +415,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         offset = 0
         offset_kv = 0
         attn_outputs = []
-        for i, (seq_len, seq_len_kv) in enumerate(
+        for sample_idx, (seq_len, seq_len_kv) in enumerate(
                 zip(metadata.seq_lens, metadata.seq_lens_kv)):
             single_q = q[offset:offset + seq_len]
             single_k = k[
@@ -425,12 +425,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 offset_kv:offset_kv +
                 seq_len_kv] if v is not None and seq_len_kv != 0 else None
 
-            past_seen_token = past_seen_tokens[i]
-            cache_idx = cache_indices[i]
+            past_seen_token = past_seen_tokens[sample_idx]
+            cache_idx = cache_indices[sample_idx]
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                past_seen_token, cache_idx, metadata, i, **kwargs)
+                past_seen_token, cache_idx, sample_idx, metadata, **kwargs)
 
             attn_outputs.append(attn_output)
 
