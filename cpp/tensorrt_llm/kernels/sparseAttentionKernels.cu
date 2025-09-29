@@ -1,3 +1,4 @@
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include <cub/cub.cuh>
 
 namespace tensorrt_llm

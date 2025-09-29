@@ -219,16 +219,22 @@ public:
         }
 
         // Prepare sparse attention parameters
-        op.mRuntimeSparseAttentionParams.sparse_kv_indices
-            = sparse_kv_indices.has_value() ? sparse_kv_indices.value().data_ptr<int32_t>() : nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_kv_offsets
-            = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().data_ptr<int32_t>() : nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_indices
-            = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_offsets
-            = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
-        op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
-            = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().index({num_seqs}).item<int32_t>() : 0;
+        if (is_context)
+        {
+            op.mRuntimeSparseAttentionParams.sparse_kv_indices
+                = sparse_kv_indices.has_value() ? sparse_kv_indices.value().data_ptr<int32_t>() : nullptr;
+            op.mRuntimeSparseAttentionParams.sparse_kv_offsets
+                = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().data_ptr<int32_t>() : nullptr;
+            op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
+                = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().index({num_seqs}).item<int32_t>() : 0;
+        }
+        else
+        {
+            op.mRuntimeSparseAttentionParams.sparse_attn_indices
+                = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
+            op.mRuntimeSparseAttentionParams.sparse_attn_offsets
+                = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
+        }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
