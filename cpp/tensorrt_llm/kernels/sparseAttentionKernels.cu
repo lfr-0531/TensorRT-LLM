@@ -82,9 +82,10 @@ __global__ void gatherKvPageOffsetsKernel(
         if (num_valid_pages > 0)
         {
             int32_t seq_len = original_seq_len - (ori_valid_pages - num_valid_pages) * tokens_per_page;
-            if (max_page_index != ori_valid_pages - 1)
+            int32_t seq_len_remain = original_seq_len % tokens_per_page;
+            if (max_page_index != ori_valid_pages - 1 && seq_len_remain != 0)
             {
-                seq_len += tokens_per_page - original_seq_len % tokens_per_page;
+                seq_len += tokens_per_page - seq_len_remain;
             }
             output_seq_lengths[seq_len_offset] = seq_len;
         }
