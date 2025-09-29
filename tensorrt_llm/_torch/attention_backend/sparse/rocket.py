@@ -608,12 +608,11 @@ class RocketVanillaAttention(VanillaAttention):
             k_max = torch.cat([k, -padding_tensor], dim=1)
             k_max = k_max.reshape(1, -1, self.page_size, self.num_kv_heads,
                                   self.head_dim).amax(dim=2)
-            if update:  # gen phase
-                if (seq_len - 1) % self.page_size > 0:
-                    k_min = torch.min(
-                        k_min, k_out[:, cache_position, :, :self.head_dim])
-                    k_max = torch.max(
-                        k_max, k_out[:, cache_position, :, self.head_dim:])
+            if update and (seq_len - 1) % self.page_size > 0:  # gen phase
+                k_min = torch.min(k_min,
+                                  k_out[:, cache_position, :, :self.head_dim])
+                k_max = torch.max(k_max, k_out[:, cache_position, :,
+                                               self.head_dim:])
             k_value = torch.cat([k_min, k_max], dim=-1)
             access_type = self._access_type[k_value.dtype.itemsize]
             k_out.view(dtype=access_type).index_copy_(

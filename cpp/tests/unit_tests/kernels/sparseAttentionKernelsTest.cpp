@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
@@ -108,11 +109,14 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     mBufferManager->copy(*sparse_indices_host, *sparse_indices);
     mBufferManager->copy(*sparse_indices_offsets_host, *sparse_indices_offsets);
 
+    SparseAttentionParams sparse_attention_params;
+    sparse_attention_params.sparse_attn_indices = bufferCast<int32_t>(*sparse_indices);
+    sparse_attention_params.sparse_attn_offsets = bufferCast<int32_t>(*sparse_indices_offsets);
+
     // Launch the kernel
     invokeGatherKvPageOffsets(bufferCast<int32_t>(*output_kv_page_offsets), bufferCast<int32_t>(*output_seq_lengths),
-        bufferCast<int32_t>(*kv_page_offsets), bufferCast<int32_t>(*seq_lengths), bufferCast<int>(*sparse_indices),
-        bufferCast<int>(*sparse_indices_offsets), batch_size, num_head_kv, tokens_per_page, max_num_pages_per_seq,
-        mStream->get());
+        bufferCast<int32_t>(*kv_page_offsets), bufferCast<int32_t>(*seq_lengths), sparse_attention_params, batch_size,
+        num_head_kv, tokens_per_page, max_num_pages_per_seq, mStream->get());
 
     // Wait for completion
     mStream->synchronize();

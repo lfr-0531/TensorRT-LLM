@@ -225,8 +225,6 @@ public:
                 = sparse_kv_indices.has_value() ? sparse_kv_indices.value().data_ptr<int32_t>() : nullptr;
             op.mRuntimeSparseAttentionParams.sparse_kv_offsets
                 = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().data_ptr<int32_t>() : nullptr;
-            op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
-                = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().index({num_seqs}).item<int32_t>() : 0;
         }
         else
         {
