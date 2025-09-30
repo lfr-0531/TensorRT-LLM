@@ -196,6 +196,8 @@ class RocketTrtllmAttention(TrtllmAttention):
         else:
             sparse_attn_indices = torch.cat(sparse_attn_indices,
                                             dim=0).to(torch.int32)
+            sparse_attn_indices = sparse_attn_indices.transpose(0, 1)
+            sparse_attn_indices = sparse_attn_indices.contiguous()
             sparse_attn_offsets = torch.tensor(sparse_attn_offsets,
                                                dtype=torch.int32).to(q.device)
         return sparse_attn_indices, sparse_attn_offsets

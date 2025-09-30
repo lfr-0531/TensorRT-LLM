@@ -112,6 +112,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     SparseAttentionParams sparse_params;
     sparse_params.sparse_attn_indices = bufferCast<int32_t>(*sparse_indices);
     sparse_params.sparse_attn_offsets = bufferCast<int32_t>(*sparse_indices_offsets);
+    sparse_params.sparse_attn_indices_block_size = tokens_per_page;
 
     // Launch the kernel
     invokeGatherKvPageOffsets(bufferCast<int32_t>(*output_kv_page_offsets), bufferCast<int32_t>(*output_seq_lengths),
