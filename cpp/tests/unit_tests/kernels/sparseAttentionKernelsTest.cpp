@@ -109,13 +109,13 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     mBufferManager->copy(*sparse_indices_host, *sparse_indices);
     mBufferManager->copy(*sparse_indices_offsets_host, *sparse_indices_offsets);
 
-    SparseAttentionParams sparse_attention_params;
-    sparse_attention_params.sparse_attn_indices = bufferCast<int32_t>(*sparse_indices);
-    sparse_attention_params.sparse_attn_offsets = bufferCast<int32_t>(*sparse_indices_offsets);
+    SparseAttentionParams sparse_params;
+    sparse_params.sparse_attn_indices = bufferCast<int32_t>(*sparse_indices);
+    sparse_params.sparse_attn_offsets = bufferCast<int32_t>(*sparse_indices_offsets);
 
     // Launch the kernel
     invokeGatherKvPageOffsets(bufferCast<int32_t>(*output_kv_page_offsets), bufferCast<int32_t>(*output_seq_lengths),
-        bufferCast<int32_t>(*kv_page_offsets), bufferCast<int32_t>(*seq_lengths), sparse_attention_params, batch_size,
+        bufferCast<int32_t>(*kv_page_offsets), bufferCast<int32_t>(*seq_lengths), sparse_params, batch_size,
         num_head_kv, tokens_per_page, max_num_pages_per_seq, mStream->get());
 
     // Wait for completion

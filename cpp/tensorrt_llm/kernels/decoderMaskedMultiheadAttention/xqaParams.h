@@ -111,7 +111,7 @@ struct XQAParams
     int32_t const* encoder_input_lengths = nullptr;
 
     // sparse attention parameters
-    SparseAttentionParams sparse_attention_params;
+    SparseAttentionParams sparse_params;
     bool use_sparse_attention = false;
 
     cudaStream_t stream = 0;
@@ -184,7 +184,7 @@ struct XQAParams
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
-           << "sparse_attention_params: " << sparse_attention_params.toString() << std::endl
+           << "sparse_params: " << sparse_params.toString() << std::endl
            << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
            << "stream :" << stream;
 

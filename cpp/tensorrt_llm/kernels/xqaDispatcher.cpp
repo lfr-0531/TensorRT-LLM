@@ -428,7 +428,7 @@ void XqaDispatcher::runImpl(
             {
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
-                    params.sequence_lengths, params.sparse_attention_params, batch_beam_size, num_kv_heads,
+                    params.sequence_lengths, params.sparse_params, batch_beam_size, num_kv_heads,
                     kv_cache_buffer.mTokensPerBlock, kv_cache_buffer.mMaxBlocksPerSeq, params.stream);
                 sync_check_cuda_error(params.stream);
                 tllmRunnerParams.seqLensKvPtr = launchParams.sparse_seq_lengths;
