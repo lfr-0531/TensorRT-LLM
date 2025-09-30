@@ -1618,8 +1618,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
 
     def sparse_attn_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: TrtllmAttentionMetadata
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse attn indices. It's implemented in the derived class.
@@ -1627,8 +1630,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         raise NotImplementedError
 
     def sparse_kv_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: TrtllmAttentionMetadata
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse kv indices. It's implemented in the derived class.

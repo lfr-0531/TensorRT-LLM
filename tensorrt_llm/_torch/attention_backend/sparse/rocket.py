@@ -126,8 +126,11 @@ class RocketTrtllmAttention(TrtllmAttention):
         self.page_size = sparse_attention_config.page_size
 
     def sparse_attn_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: RocketTrtllmAttentionMetadata
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse attention indices.
@@ -138,14 +141,12 @@ class RocketTrtllmAttention(TrtllmAttention):
             - sparse_attn_indices: [total_selected_indices, num_kv_heads]
             - sparse_attn_offsets: [batch_size + 1] with cumulative indices count
         """
-        q, k, _ = q.split([
-            self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim,
-            self.num_kv_heads * self.head_dim
-        ],
-                          dim=-1)
-
-        if k is None or metadata is None:
-            return None, None
+        if k is None:
+            q, k, _ = q.split([
+                self.num_heads * self.head_dim, self.num_kv_heads *
+                self.head_dim, self.num_kv_heads * self.head_dim
+            ],
+                              dim=-1)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
@@ -200,8 +201,11 @@ class RocketTrtllmAttention(TrtllmAttention):
         return sparse_attn_indices, sparse_attn_offsets
 
     def sparse_kv_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: RocketTrtllmAttentionMetadata
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse kv indices.
@@ -213,14 +217,12 @@ class RocketTrtllmAttention(TrtllmAttention):
             - flattened_indices: [total_selected_indices, num_kv_heads]
             - batch_offsets: [batch_size + 1] with cumulative indices count
         """
-        q, k, _ = q.split([
-            self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim,
-            self.num_kv_heads * self.head_dim
-        ],
-                          dim=-1)
-
-        if k is None or metadata is None:
-            return None, None
+        if k is None:
+            q, k, _ = q.split([
+                self.num_heads * self.head_dim, self.num_kv_heads *
+                self.head_dim, self.num_kv_heads * self.head_dim
+            ],
+                              dim=-1)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
