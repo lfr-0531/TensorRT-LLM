@@ -193,6 +193,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
+        self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -265,7 +266,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             pytorch_backend_config.attn_backend,
-            sparse_attn_config=sparse_attention_config)
+            sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
