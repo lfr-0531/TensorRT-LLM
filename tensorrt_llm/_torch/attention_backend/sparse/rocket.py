@@ -906,9 +906,8 @@ class RocketKVCacheManager(KVCacheManager):
     def get_cache_bytes_per_token(self):
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
         kv_factor = self.kv_factor + 2 * self.kt_tokens_per_block / self.tokens_per_block
-        cache_size_per_token = int(
-            math.ceil(kv_factor * sum(self.num_kv_heads_per_layer) *
-                      self.head_dim))
+        cache_size_per_token = math.ceil(
+            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
