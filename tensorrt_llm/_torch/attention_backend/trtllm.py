@@ -1276,9 +1276,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 q, k, metadata)
             sparse_attn_indices_block_size = self.sparse_attention_config.get_sparse_indices_block_size(
             )
-            if sparse_attn_indices is not None:
-                sparse_attn_indices = sparse_attn_indices.transpose(
-                    0, 1).contiguous()
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
