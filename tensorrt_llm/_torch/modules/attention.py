@@ -720,6 +720,12 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
+        # only support one kind of sparse attention, dsa now.
+        if config.sparse_attention_config is not None:
+            self.is_dsa = True
+        else:
+            self.is_dsa = False
+
         # tensor parallel
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
@@ -844,25 +850,26 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
-        self.mha = create_attention(
-            config.attn_backend,
-            self.layer_idx,
-            self.num_heads,
-            head_dim=self.qk_head_dim,
-            num_kv_heads=self.num_key_value_heads,
-            pos_embd_params=pos_embd_params,
-            quant_config=quant_config,
-            q_scaling=q_scaling,
-            is_mla_enable=True,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim,
-            predicted_tokens_per_seq=self.predicted_tokens_per_seq,
-            skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_attention_config=config.sparse_attention_config,
-        )
+        if not self.is_dsa:
+            self.mha = create_attention(
+                config.attn_backend,
+                self.layer_idx,
+                self.num_heads,
+                head_dim=self.qk_head_dim,
+                num_kv_heads=self.num_key_value_heads,
+                pos_embd_params=pos_embd_params,
+                quant_config=quant_config,
+                q_scaling=q_scaling,
+                is_mla_enable=True,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                sparse_attention_config=config.sparse_attention_config,
+            )
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -879,15 +886,17 @@ class MLA(nn.Module):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
             v_head_dim=self.kv_lora_rank,
+            hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             sparse_attention_config=config.sparse_attention_config,
+            dtype=dtype,
         )
 
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.rope_fusion = self.mha.support_fused_rope()
+        self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.rope_fusion
         if self.apply_rotary_emb:
@@ -903,7 +912,8 @@ class MLA(nn.Module):
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
         # which could be modified after __init__
-        self.mha.update_quant_config(self.quant_config)
+        if not self.is_dsa:
+            self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
@@ -1037,6 +1047,7 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
+        qr = q
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -1055,6 +1066,8 @@ class MLA(nn.Module):
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
+            hidden_states_ctx = hidden_states[:num_ctx_tokens, ...]
+            qr_ctx = qr[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
@@ -1066,6 +1079,9 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
+                hidden_states_ctx,
+                qr_ctx,
+                position_ids,
             )
 
         if num_generations > 0:
@@ -1073,6 +1089,8 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+            hidden_states_gen = hidden_states[num_ctx_tokens:, ...]
+            qr_gen = qr[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -1084,6 +1102,9 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
+                hidden_states_gen,
+                qr_gen,
+                position_ids,
             )
 
     def forward_context_default(
@@ -1124,6 +1145,22 @@ class MLA(nn.Module):
         )
 
         return attn_output
+
+    def forward_context_dsa(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        qr: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.forward_generation(q, compressed_kv, k_pe, attn_metadata,
+                                       output, latent_cache, hidden_states, qr,
+                                       position_ids)
 
     def forward_context_with_cached_kv(
         self,
@@ -1363,8 +1400,15 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        qr: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(self.mha, TrtllmAttention):
+        if self.is_dsa:
+            return self.forward_context_dsa(q, compressed_kv, k_pe,
+                                            attn_metadata, output, latent_cache,
+                                            hidden_states, qr, position_ids)
+        elif isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
@@ -1374,6 +1418,7 @@ class MLA(nn.Module):
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
+
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, output, latent_cache)
 
@@ -1385,6 +1430,9 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        qr: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -1444,6 +1492,9 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            hidden_states=hidden_states,
+            qr=qr,
+            position_ids=position_ids,
         )
         fused_q = None
 
