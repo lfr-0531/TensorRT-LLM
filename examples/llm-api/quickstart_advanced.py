@@ -85,6 +85,7 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
+    parser.add_argument("--tokens_per_block", type=int, default=32)
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -179,6 +180,7 @@ def setup_llm(args, **kwargs):
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
+        tokens_per_block=args.tokens_per_block,
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(
