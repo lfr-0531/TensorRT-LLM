@@ -699,6 +699,15 @@ struct KernelParams
         std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
+
+        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv, headDimQk).
+        if(options.mSparseMla) {
+            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
+                                           static_cast<uint64_t>(INT_MAX)};
+            strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            tileShapeKv[1] = 1;
+        }
+
         // Build tma descriptor for K.
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
