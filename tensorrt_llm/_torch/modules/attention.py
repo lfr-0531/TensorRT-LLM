@@ -876,6 +876,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 sparse_attention_config=config.sparse_attention_config,
             )
+        else:
+            self.mha = None
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -1105,9 +1107,9 @@ class MLA(nn.Module):
             )
 
     def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
-                     hidden_states: torch.Tensor,
-                     attn_metadata: AttentionMetadata,
-                     output: torch.Tensor) -> None:
+                              hidden_states: torch.Tensor,
+                              attn_metadata: AttentionMetadata,
+                              output: torch.Tensor) -> None:
         """
         Forward pass for the MLA module with DSA (always in MQA mode).
 
@@ -1131,11 +1133,8 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-  
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-            hidden_states).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-            ], -1)
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
@@ -1159,7 +1158,8 @@ class MLA(nn.Module):
         assert output is not None, "output must be provided"
 
         # Indexer
-        topk_indices = self.mqa.indexer(qr, hidden_states, attn_metadata, position_ids)
+        topk_indices = self.mqa.indexer(qr, hidden_states, attn_metadata,
+                                        position_ids)
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -1248,7 +1248,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-    # TODO: implement other paths
+        # TODO: implement other paths
         return self.forward_sparse_mla_kvcache_bf16(q,
                                                     compressed_kv,
                                                     k_pe,
@@ -1788,15 +1788,15 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
 
         attn_output = self.create_output(hidden_states)
-        if self.register_to_config:
+        if self.is_dsa:
+            self.forward_impl_with_dsa(position_ids,
+                                       hidden_states,
+                                       attn_metadata,
+                                       output=attn_output)
+        elif self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
                                                    attn_output)
-        elif self.is_dsa:
-            self.forward_impl_with_dsa(position_ids,
-                                      hidden_states,
-                                      attn_metadata,
-                                      output=attn_output)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
