@@ -1034,6 +1034,12 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
+        // // Set the following parameters if sparseMLA is used.
+        // tllmRunnerParams.mSparseMla = true;
+        // tllmRunnerParams.mSparseMlaTopK = 2048;
+        // The kvPageIdxPtr should has the shape of [numTokensQ, sparseMlaTopK] in the paged kv cache,
+        // The start address of the memory pool stays the same.
+
         // Parameters to select kernels.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;

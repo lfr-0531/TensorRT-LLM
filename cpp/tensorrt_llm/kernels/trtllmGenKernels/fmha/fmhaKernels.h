@@ -343,6 +343,11 @@ private:
         {
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
+            // The sparseMla only selects topK tokensKv.
+            if(params.mSparseMla)
+            {
+                maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
+            }
             // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
             if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
             {
@@ -476,9 +481,10 @@ private:
             // 1. The number of headsQPerKv is <= 32.
             // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
             //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+            // The sparseMla kernel will always use the 2CTA high-throughput kernel.
 
             // Check the conditions.
-            if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params))
+            if ((params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params)) && !params.mSparseMla)
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
@@ -491,6 +497,8 @@ private:
                 {
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
+                // The sparseMla only supports numHeadsQPerKv = 128.
+                TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128, "The sparseMla only supports numHeadsQPerKv = 128");
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {

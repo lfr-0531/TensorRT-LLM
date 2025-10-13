@@ -157,6 +157,8 @@ struct KernelParams
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
     // The flag to use block sparse attention.
     bool mUseBlockSparseAttention;
+    // The top k value for sparse MLA.
+    int32_t mSparseMlaTopK;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -822,6 +824,9 @@ struct KernelParams
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
+
+        // The top k value for sparse MLA.
+        params.mSparseMlaTopK = options.mSparseMlaTopK;
 
         return params;
     }
