@@ -118,6 +118,12 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
 
+        // // Set the following parameters if sparseMLA is used.
+        // tllmRunnerParams.mSparseMla = true;
+        // // Hack for now.
+        // tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+        // tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::dense;
+
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
     else
@@ -165,6 +171,15 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
+        // // Set the following parameters if sparseMLA is used.
+        // tllmRunnerParams.mSparseMla = true;
+        // tllmRunnerParams.mSparseMlaTopK = 2048;
+        // // Hack for now.
+        // tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+        // tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::dense;
+        // The kvPageIdxPtr should has the shape of [numTokensQ, sparseMlaTopK] in the paged kv cache,
+        // The start address of the memory pool stays the same.
+        
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
         tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
