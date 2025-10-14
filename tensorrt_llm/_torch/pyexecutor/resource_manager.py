@@ -1155,7 +1155,7 @@ class BlockManager:
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:
-        return (token_count + tokens_per_page) // tokens_per_page
+        return (token_count + tokens_per_page - 1) // tokens_per_page
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
