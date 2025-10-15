@@ -437,10 +437,29 @@ class ModelConfig(Generic[TConfig]):
                     **kwargs,
                 )
                 if model_type == "deepseek_v32":
-                    kwargs['sparse_attention_config'] = \
-                        DSASparseAttentionConfig(index_n_heads=pretrained_config.index_n_heads,
-                                                 index_head_dim=pretrained_config.index_head_dim,
-                                                 index_topk=pretrained_config.index_topk)
+                    sparse_attention_config = kwargs.get('sparse_attention_config')
+                    kwargs['sparse_attention_config'] = DSASparseAttentionConfig(
+                        index_n_heads=(
+                            sparse_attention_config.index_n_heads
+                            if sparse_attention_config and sparse_attention_config.index_n_heads is not None
+                            else pretrained_config.index_n_heads
+                        ),
+                        index_head_dim=(
+                            sparse_attention_config.index_head_dim
+                            if sparse_attention_config and sparse_attention_config.index_head_dim is not None
+                            else pretrained_config.index_head_dim
+                        ),
+                        index_topk=(
+                            sparse_attention_config.index_topk
+                            if sparse_attention_config and sparse_attention_config.index_topk is not None
+                            else pretrained_config.index_topk
+                        ),
+                        indexer_max_chunk_size=(
+                            sparse_attention_config.indexer_max_chunk_size
+                            if sparse_attention_config and sparse_attention_config.indexer_max_chunk_size is not None
+                            else None
+                        )
+                    )
             else:
                 pretrained_config = transformers.AutoConfig.from_pretrained(
                     checkpoint_dir,
