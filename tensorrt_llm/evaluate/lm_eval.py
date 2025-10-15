@@ -51,11 +51,13 @@ class LmEvalWrapper(TemplateLM):
     def __init__(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False):
+                 streaming: bool = False,
+                 enable_thinking: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
+        self.enable_thinking = enable_thinking
 
     @property
     def eot_token_id(self) -> int:
@@ -67,11 +69,17 @@ class LmEvalWrapper(TemplateLM):
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
+        chat_template_kwargs = {
+            "continue_final_message": not add_generation_prompt,
+        }
+        if self.enable_thinking:
+            chat_template_kwargs["thinking"] = True
+
         return self.llm.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
-            continue_final_message=not add_generation_prompt,
+            **chat_template_kwargs,
         )
 
     @property
@@ -301,7 +309,8 @@ class LmEvalEvaluator(Evaluator):
                  apply_chat_template: bool = False,
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
-                 is_multimodal: bool = False):
+                 is_multimodal: bool = False,
+                 enable_thinking: bool = False):
         try:
             import lm_eval
         except ImportError as e:
@@ -323,6 +332,7 @@ class LmEvalEvaluator(Evaluator):
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
+        self.enable_thinking = enable_thinking
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -390,7 +400,7 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
         results = lm_eval.evaluate(
-            lm=lm_cls(llm, sampling_params, streaming),
+            lm=lm_cls(llm, sampling_params, streaming, enable_thinking=self.enable_thinking),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -428,7 +438,8 @@ class LmEvalEvaluator(Evaluator):
                         fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn",
                                                         False),
                         system_prompt=kwargs.pop("system_prompt", None),
-                        is_multimodal=kwargs.pop("is_multimodal", False))
+                        is_multimodal=kwargs.pop("is_multimodal", False),
+                        enable_thinking=kwargs.pop("enable_thinking", False))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"),
@@ -517,6 +528,10 @@ class GPQADiamond(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -560,6 +575,10 @@ class GPQAMain(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -603,6 +622,10 @@ class GPQAExtended(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
