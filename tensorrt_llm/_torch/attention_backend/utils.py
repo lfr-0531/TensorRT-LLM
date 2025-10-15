@@ -56,6 +56,7 @@ def create_attention(
     attention_chunk_size: Optional[int] = None,
     sparse_attention_config: Optional["SparseAttentionConfig"] = None,
     dtype: Optional[torch.dtype] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -93,4 +94,5 @@ def create_attention(
         attention_chunk_size=attention_chunk_size,
         sparse_attention_config=sparse_attention_config,
         dtype=dtype,
+        aux_stream=aux_stream,
     )
