@@ -203,7 +203,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
         else:
-            self.indexer_max_chunk_size = 32768 # Default to 32K tokens for the indexer
+            self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
 
     def __post_init__(self):
         super().__post_init__()
@@ -367,10 +367,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.max_ctx_seq_len = 0
 
         if self.num_generations > 0:
-            self.num_gen_cached_tokens = cached_token_lens[
-                self.num_contexts:self.num_seqs].sum().item()
-            self.max_gen_kv_len = kv_lens[self.num_contexts:self.num_seqs].max(
-            ).item()
+            # Because load_paged_kv_cache_for_mla cannot support CUDA graph, we need to set the
+            # max_gen_kv_len and num_gen_cached_tokens_with_input to the max value for CUDA graph.
+            if self.is_cuda_graph:
+                self.max_gen_kv_len = self.max_seq_len
+                self.num_gen_cached_tokens_with_input = self.num_generations * self.max_seq_len
+            else:
+                self.max_gen_kv_len = kv_lens[self.num_contexts:self.
+                                              num_seqs].max().item()
+                self.num_gen_cached_tokens_with_input = cached_token_lens[
+                    self.num_contexts:self.num_seqs].sum().item(
+                    ) + self.num_generations * self.max_seq_len
             self.max_gen_seq_len = self.seq_lens[self.num_contexts:self.
                                                  num_seqs].max().item()
             # generation cached token indptr
@@ -393,7 +400,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.host_gen_kv_indptr[:self.num_generations + 1],
                 non_blocking=True)
         else:
-            self.num_gen_cached_tokens = 0
+            self.num_gen_cached_tokens_with_input = 0
             self.max_gen_kv_len = 0
             self.max_gen_seq_len = 0
 
@@ -407,9 +414,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().update_for_spec_dec()
         tokens_per_block = self.kv_cache_manager.indexer_k_cache_tokens_per_block
         # host
-        self.max_gen_kv_len = max(self.max_gen_kv_len, self.max_ctx_kv_len) + 1
+        if self.is_cuda_graph:
+            self.max_gen_kv_len = self.max_seq_len
+            self.num_gen_cached_tokens_with_input = self.num_generations * self.max_seq_len
+        else:
+            self.max_gen_kv_len = max(self.max_gen_kv_len,
+                                      self.max_ctx_kv_len) + 1
+            self.num_gen_cached_tokens_with_input += self.num_ctx_cached_tokens_for_spec_dec + self.num_seqs
         self.max_ctx_kv_len = 0
-        self.num_gen_cached_tokens = self.num_gen_cached_tokens + self.num_ctx_cached_tokens_for_spec_dec + self.num_seqs
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
         self.num_ctx_cached_tokens_for_spec_dec = 0
@@ -1163,8 +1175,7 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
 
         if is_generation:
             max_kv_len = metadata.max_gen_kv_len
-            num_cached_tokens = (metadata.num_gen_cached_tokens +
-                                 metadata.num_tokens - metadata.num_ctx_tokens)
+            num_cached_tokens = metadata.num_gen_cached_tokens_with_input
             num_seqs = metadata.num_generations
             kv_indptr = metadata.gen_kv_indptr
             block_offsets = metadata.kv_cache_block_offsets[:, metadata.
