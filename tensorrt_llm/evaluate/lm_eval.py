@@ -400,7 +400,10 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
         results = lm_eval.evaluate(
-            lm=lm_cls(llm, sampling_params, streaming, enable_thinking=self.enable_thinking),
+            lm=lm_cls(llm,
+                      sampling_params,
+                      streaming,
+                      enable_thinking=self.enable_thinking),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -528,10 +531,11 @@ class GPQADiamond(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
-    @click.option("--enable_thinking",
-                  is_flag=True,
-                  default=False,
-                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
+    @click.option(
+        "--enable_thinking",
+        is_flag=True,
+        default=False,
+        help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -575,10 +579,11 @@ class GPQAMain(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
-    @click.option("--enable_thinking",
-                  is_flag=True,
-                  default=False,
-                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
+    @click.option(
+        "--enable_thinking",
+        is_flag=True,
+        default=False,
+        help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -622,10 +627,11 @@ class GPQAExtended(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
-    @click.option("--enable_thinking",
-                  is_flag=True,
-                  default=False,
-                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
+    @click.option(
+        "--enable_thinking",
+        is_flag=True,
+        default=False,
+        help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
