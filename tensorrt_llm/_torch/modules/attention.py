@@ -1717,7 +1717,7 @@ class MLA(nn.Module):
 
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement")
+                f"due to FlashMLA sparse attention kernel requirement", key="flash_mla_padding")
 
             # Create padded tensor with zeros for extra heads
             q_padded = q_concat.new_empty(
