@@ -459,6 +459,10 @@ private:
         // The number of Ctas.
         int const numCtas
             = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16));
+        if (numCtas == 0)
+        {
+            return false;
+        }
         // Compute numCtasPerSeqKv.
         int const numCtasPerSeqKv
             = std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
