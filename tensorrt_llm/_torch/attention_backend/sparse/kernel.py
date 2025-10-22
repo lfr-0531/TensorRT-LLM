@@ -372,14 +372,12 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
 def triton_convert_req_index_to_global_index(
         req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table: torch.
-    Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+        block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
         token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
         BLOCK_SIZE: int,
         NUM_TOPK_TOKENS: int = 2048,
         BLOCK_N: int = 128,  # tile width along columns
-        stride_factor:
-    int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
+        stride_factor: int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
         layer_id: int = 0,  # for layer interleaving layout
 ):
     """
