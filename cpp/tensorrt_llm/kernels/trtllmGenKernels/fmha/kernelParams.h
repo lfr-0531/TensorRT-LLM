@@ -155,8 +155,8 @@ struct KernelParams
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // The flag to use block sparse attention.
-    bool mUseBlockSparseAttention;
+    // // The flag to use block sparse attention.
+    // bool mUseBlockSparseAttention;
     // The top k value for sparse MLA.
     int32_t mSparseMlaTopK;
 
@@ -583,7 +583,7 @@ struct KernelParams
         // Check shape must be in range [1, 2^32]
         int32_t dim = shapes.size();
         // Max five dimension and min 3 dimension.
-        TLLM_CHECK((dim <= 5) && (dim >= 3));
+        TLLM_CHECK((dim <= 5) && (dim >= 2));
         // Check shape range.
         for (int32_t ii = 0; ii < dim; ++ii)
         {
@@ -823,7 +823,7 @@ struct KernelParams
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
-        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
+        // params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
         // The top k value for sparse MLA.
         params.mSparseMlaTopK = options.mSparseMlaTopK;
