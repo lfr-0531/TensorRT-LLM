@@ -1034,12 +1034,6 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
-        // // Set the following parameters if sparseMLA is used.
-        // tllmRunnerParams.mSparseMla = true;
-        // tllmRunnerParams.mSparseMlaTopK = 2048;
-        // The kvPageIdxPtr should has the shape of [numTokensQ, sparseMlaTopK] in the paged kv cache,
-        // The start address of the memory pool stays the same.
-
         // Parameters to select kernels.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
@@ -1114,6 +1108,15 @@ int AttentionOp::mlaGeneration(
             tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
             tllmRunnerParams.scaleSoftmaxLog2Ptr
                 = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
+        }
+
+        // Set the following parameters if sparseMLA is used.
+        if (useSparseMLA())
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseMlaTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
+            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(mRuntimeSparseAttentionParams.sparse_attn_indices);
+            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
@@ -1302,6 +1305,12 @@ int AttentionOp::mlaGeneration(
         fmhaParams.scaleBmm2Ptr = reinterpret_cast<float const*>(params.bmm2_scale);
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+
+        // Sparse attention parameters
+        if (useSparseMLA())
+        {
+            fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
+        }
 
         // Run the fmha kernel
         mDecoderFMHARunner->run(fmhaParams);
@@ -2729,6 +2738,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
+        fmhaParams.useSparseMLA = useSparseMLA();
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));

@@ -117,12 +117,13 @@ bool FmhaDispatcher::isSupported()
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
-
-        // // Set the following parameters if sparseMLA is used.
-        // tllmRunnerParams.mSparseMla = true;
-        // // Hack for now.
-        // tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-        // tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::dense;
+        // Set the kernel type and mask type if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -171,15 +172,6 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
-        // // Set the following parameters if sparseMLA is used.
-        // tllmRunnerParams.mSparseMla = true;
-        // tllmRunnerParams.mSparseMlaTopK = 2048;
-        // // Hack for now.
-        // tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-        // tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::dense;
-        // The kvPageIdxPtr should has the shape of [numTokensQ, sparseMlaTopK] in the paged kv cache,
-        // The start address of the memory pool stays the same.
-        
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
         tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
@@ -232,6 +224,16 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
+        // Set the sparse attention parameters if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+        }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
