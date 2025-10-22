@@ -197,6 +197,7 @@ class TrtllmAttentionWrapper:
         sparse_kv_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
+        sparse_mla_topk: int = 0,
         **kwargs,
     ):
         """
@@ -240,6 +241,7 @@ class TrtllmAttentionWrapper:
             sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
             sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
+            sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -281,6 +283,7 @@ class TrtllmAttentionWrapper:
         self.sparse_kv_offsets = sparse_kv_offsets
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
+        self.sparse_mla_topk = sparse_mla_topk
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -438,12 +441,13 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         mla_tensor_params = [self.helix_position_offsets]
-        sparse_attention_params = [
+        sparse_attention_tensor_params = [
             self.sparse_kv_indices,
             self.sparse_kv_offsets,
             self.sparse_attn_indices,
             self.sparse_attn_offsets,
         ]
+        sparse_attention_params = [self.sparse_mla_topk]
 
         thop.attention(
             q,
@@ -511,6 +515,7 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
+            sparse_attention_tensor_params,
             sparse_attention_params,
         )
         # reset the planned states (especially tensors) to avoid memory leak
@@ -1354,6 +1359,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
+            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(metadata, 'sparse_mla_topk') else 0
         )
         out_dtype = None
         if out_scale is not None:
