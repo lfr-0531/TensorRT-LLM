@@ -2722,17 +2722,28 @@ int AttentionOp::initialize() noexcept
         // the wrong kernel, no matter mIsGenerationMLA is true or false
         if (mIsMLAEnabled)
         {
-            // Context MLA always use separate_q_k_v layout
-            fmhaParams.attentionInputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
-            // Context attention of MLA is different
-            fmhaParams.numKvHeads = mNumHeads;
-            fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
-            // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA context(v_head_dim=128)
-            // and gen(v_head_dim=512) runners in a single op, the headSizeV will be set to 512 when we create the gen
-            // attention op and that could fail to create the FmhaDispatcher for context phase.
-            // Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
-            fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
-            fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
+            if (useSparseMLA())
+            {
+                fmhaParams.attentionInputLayout = AttentionInputLayout::Q_PAGED_KV;
+                fmhaParams.numKvHeads = 1;
+                fmhaParams.headSize = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+                fmhaParams.headSizeV = mMLAParams.kv_lora_rank;
+                fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
+            }
+            else
+            {
+                // Context MLA always use separate_q_k_v layout
+                fmhaParams.attentionInputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
+                // Context attention of MLA is different
+                fmhaParams.numKvHeads = mNumHeads;
+                fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
+                // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA context(v_head_dim=128)
+                // and gen(v_head_dim=512) runners in a single op, the headSizeV will be set to 512 when we create the gen
+                // attention op and that could fail to create the FmhaDispatcher for context phase.
+                // Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
+                fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
+                fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
+            }
         }
         fmhaParams.qScaling = mQScaling;
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
