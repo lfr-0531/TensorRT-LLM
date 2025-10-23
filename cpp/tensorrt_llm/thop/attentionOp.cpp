@@ -175,7 +175,26 @@ public:
         {
             TORCH_CHECK(mla_tensor_params.size() == 1,
                 "Expecting 1 tensor for custom MLA tensor params: helix_position_offsets.");
-            if (is_context)
+            if (is_context && op.mUseSparseAttention)
+            {
+                if (latent_cache.has_value())
+                {
+                    mla_params.latent_cache = static_cast<T const*>(latent_cache->data_ptr());
+                }
+                else
+                {
+                    // kv cache reuse / chunked context cases, latent_cache is not used
+                    mla_params.latent_cache = nullptr;
+                }
+                TORCH_CHECK(q_pe.has_value());
+                TORCH_CHECK(q_pe->dim() == 3);
+                TORCH_CHECK(q_pe->strides()[2] == 1);
+
+                mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
+                mla_params.q_pe_ld = q_pe->strides()[1];
+                mla_params.q_pe_stride = q_pe->strides()[0];
+            }
+            else if (is_context)
             {
                 if (latent_cache.has_value())
                 {

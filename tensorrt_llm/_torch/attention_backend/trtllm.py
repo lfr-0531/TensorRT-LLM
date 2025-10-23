@@ -388,7 +388,13 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
-            if self.attention_input_type == AttentionInputType.context_only:
+            # For DSA, use the same qkv hidden size for context and generation phases
+            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel() > 0
+            if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            elif self.attention_input_type == AttentionInputType.context_only:
                 assert not is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
                                                     self.qk_rope_head_dim)
