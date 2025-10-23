@@ -1738,8 +1738,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             if (params.mla_param->latent_cache != nullptr)
             {
-                // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if latent_cache is not nullptr
-                invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+                // The sparse MLA is in the absorption mode for the context phase.
+                bool absorption_mode = useSparseMLA();
+                invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, absorption_mode, stream);
             }
             if (mFP8ContextMLA)
             {
