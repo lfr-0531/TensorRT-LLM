@@ -184,10 +184,10 @@ inline __device__ void dequantCopy(
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
+__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
+    int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
     int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv)
+    float const* quant_scale_kv, bool absorption_mode)
 {
 
     // Constants.
@@ -209,6 +209,10 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
     // Block/Head idx.
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
+
+    // The nope head_size for q.
+    // Use the latent_space head size in the absorption mode.
+    int nope_head_size_q = absorption_mode ? c_k : head_size;
 
     if (head_idx < head_num)
     {
@@ -239,10 +243,17 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
 
             VecT q, k;
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
-            auto const src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+            auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
+            // In the absorption mode, we load pe from q_pe instead of q_ptr.
+            T* q_pe_input = q_ptr;
+            if (absorption_mode)
+            {
+                q_pe_input = q_pe;
+                src_q_global_offset = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
+            }
 
-            q = *reinterpret_cast<VecT const*>(&q_ptr[src_q_global_offset + head_dim_idx]);
+            q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
             k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
             // Pack two elements into one for gptj rotary embedding.
@@ -273,12 +284,16 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
                     else
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                 }
-                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
-                    + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
+                auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (nope_head_size_q + ROPE_DIM)
+                    + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
                 reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
-                reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                // Only write to k_pe to k_buf in the non-absorption mode.
+                if (!absorption_mode)
+                {
+                    reinterpret_cast<VecT*>(k_ptr)[dst_k_idx / ELTS_PER_VEC] = k;
+                }
             }
         }
     }
@@ -922,14 +937,16 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
+void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-        params.k_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num, head_size,
+    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,\
+        params.q_pe,
+        params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+        params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size,
         params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv);
+        params.cache_type, params.quant_scale_kv, absorption_mode);
 }
 
 template <typename T>
@@ -1027,7 +1044,7 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
-    template void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);      \
+    template void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream);      \
     template void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 INSTANTIATE_MLA_ROPE(float, KVBlockArray);
