@@ -1856,6 +1856,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
+	// Sparse attention parameters
+        if (useSparseMLA())
+        {
+            fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
+        }
+
         if (mAttentionChunkSize)
         {
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
