@@ -775,7 +775,7 @@ public:
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        if (mFormatter->getCacheManager()->getBlockManager().getNumPools() == 1)
+        if (mFormatter->getCacheManager()->getBlockManager().getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false) == 1)
         {
             auto* cacheManager = mFormatter->getCacheManager();
             auto beam = 0;

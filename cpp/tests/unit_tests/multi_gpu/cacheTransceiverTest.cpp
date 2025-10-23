@@ -407,7 +407,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
 #if ENABLE_MULTI_DEVICE
 
 using AsymmetricTestParam
-    = std::tuple<int, int, int, int, int, int, int, int, int, int, nvinfer1::DataType, int, bool, bool, bool, bool>;
+    = std::tuple<int, int, int, int, int, int, int, int, int, int, nvinfer1::DataType, int, bool, bool, bool, bool, bool>;
 
 class AsymmetricalCacheTest : public ::testing::TestWithParam<AsymmetricTestParam>
 {
@@ -418,7 +418,7 @@ protected:
     void TearDown() override {}
 
     void setUpCommunicator(int contextTp, int contextPp, int contextCp, int genTp, int genPp, int genCp,
-        bool isMLA = false, bool contextDP = false, bool generationDP = false)
+        bool isMLA = false, bool contextDP = false, bool generationDP = false, bool isWindow = false)
     {
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
@@ -507,7 +507,7 @@ protected:
 
     void setUpCacheManager(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock,
         nvinfer1::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
-        bool isWindow = false)
+        bool isWindow = false, bool isIndexerKCache = true)
     {
         mIsWindowAttention = isWindow;
 
@@ -620,7 +620,7 @@ protected:
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
             blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
             sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
-            true);
+            isIndexerKCache);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
@@ -808,7 +808,7 @@ protected:
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
 
-        int const numPools = mManager->getBlockManager().getNumPools();
+        int const numPools = mManager->getBlockManager().getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         TLLM_LOG_DEBUG(" addRequestAndTransportCacheForContext mManager numPools: %d", numPools);
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
@@ -865,7 +865,7 @@ protected:
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int const numTotalBlocks = blockRange.getBlockIds().size();
-        auto const numPools = mManager->getBlockManager().getNumPools();
+        auto const numPools = mManager->getBlockManager().getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
@@ -1122,6 +1122,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     bool generationDP = std::get<14>(param);
 
     bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
 
     if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
     {
@@ -1132,7 +1133,8 @@ TEST_P(AsymmetricalCacheTest, TestCase)
 
     if (mIsContext || mIsGeneration)
     {
-        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow);
+        setUpCacheManager(
+            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow, isIndexerKCache);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
 
@@ -1220,6 +1222,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     bool contextDP = std::get<13>(param);
     bool generationDP = std::get<14>(param);
     bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
 
     if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
     {
@@ -1231,7 +1234,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         bool enableDP = mIsContext ? contextDP : generationDP;
         setUpCacheManager(
-            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow, isIndexerKCache);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
         int requestId = 0;
@@ -1318,7 +1321,8 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false),
+        testing::Values(false)));
 
 // Waive off isWindow test for now
 // INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
@@ -1333,49 +1337,56 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(8), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false /*, true*/)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false /*, true*/),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1EvenLayer, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2EvenLayer, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(2), testing::Values(1), testing::Values(1),
         testing::Values(1, 4), testing::Values(1), testing::Values(16), testing::Values(16), testing::Values(4),
         testing::Values(8), testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false),
-        testing::Values(false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLA, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLA, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false),
+        testing::Values(false)));
+
+
 
 // Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
@@ -1394,7 +1405,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false)));
+        /*isWindow*/ testing::Values(false), testing::Values(false)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
@@ -1413,88 +1424,101 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false)));
+        /*isWindow*/ testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(true), testing::Values(true), testing::Values(false)));
+        testing::Values(true), testing::Values(true), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(true), testing::Values(false), testing::Values(false)));
+        testing::Values(true), testing::Values(true), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA3, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA4, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA5, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
+        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true), testing::Values(true), testing::Values(false)));
+        testing::Values(false), testing::Values(true), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0EvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(5), testing::Values(2), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(2),
         testing::Values(2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false), testing::Values(false)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4, 2),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate3, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate4, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1, 2),
         testing::Values(2), testing::Values(1), testing::Values(4), testing::Values(1, 2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false)));
 
 #endif
 

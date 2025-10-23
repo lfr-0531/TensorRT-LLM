@@ -112,6 +112,14 @@ public:
         }
     }
 
+    void useIndexerKCache()
+    {
+        TLLM_CHECK(mManager);
+        TLLM_CHECK(mManager->getIndexerKCachePool() != nullptr);
+        mPool = mManager->getIndexerKCachePool();
+        usingIndexerKCache = true;
+    }
+
     friend class BlockIterator;
 
 private:
@@ -140,6 +148,7 @@ private:
 
     static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
     static constexpr SizeType32 kFIRST_POOL_INDEX = 0;
+    bool usingIndexerKCache = false;
 };
 
 class BlockIterator

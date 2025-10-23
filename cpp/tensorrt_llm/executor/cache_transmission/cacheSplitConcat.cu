@@ -1322,7 +1322,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 }
 
 void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> const& kVCacheBlocksPerWindow,
-    std::vector<runtime::ITensor::SharedPtr>& ouputSplitBlocks, kv_cache::CacheState const& iCacheState,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, kv_cache::CacheState const& iCacheState,
     kv_cache::CacheState const& oCacheState, int selfIdx, runtime::BufferManager const& bufferManager)
 {
     auto dataType = kVCacheBlocksPerWindow.begin()->second.front()->getDataType();
@@ -1332,25 +1332,25 @@ void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::Sha
     case 8:
     {
         splitKVCache<int64_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+            kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
         break;
     }
     case 4:
     {
         splitKVCache<int32_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+            kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
         break;
     }
     case 2:
     {
         splitKVCache<int16_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+            kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
         break;
     }
     case 1:
     {
         splitKVCache<int8_t>(
-            kVCacheBlocksPerWindow, ouputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
+            kVCacheBlocksPerWindow, outputSplitBlocks, iCacheState, oCacheState, selfIdx, bufferManager);
         break;
     }
     default:
