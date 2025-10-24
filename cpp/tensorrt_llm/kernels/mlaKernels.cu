@@ -184,9 +184,9 @@ inline __device__ void dequantCopy(
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
-    int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
+__global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
+    KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
+    int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
     float const* quant_scale_kv, bool absorption_mode)
 {
 
@@ -907,46 +907,51 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
         }
     }
 
-    // Quantize K, both src and dst are contiguous
-    for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
-         k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
+    if (k_buf != nullptr)
     {
-        if (k_token_idx < total_kv_len)
+        // Quantize K, both src and dst are contiguous
+        for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
+             k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_k_idx
-                = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
-            auto const dst_k_idx = src_k_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            if (k_token_idx < total_kv_len)
+            {
+                auto const src_k_idx = static_cast<size_t>(k_token_idx) * QK_HEAD_DIM * head_num
+                    + head_idx * QK_HEAD_DIM + qk_head_dim_idx;
+                auto const dst_k_idx = src_k_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
+            }
         }
     }
 
-    // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
-    size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
-    for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
-         v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
+    if (v_buf != nullptr)
     {
-        if (v_token_idx < total_kv_len)
+        // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
+        size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
+        for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
+             v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto const src_v_idx
-                = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            auto const dst_v_idx
-                = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
-            quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            if (v_token_idx < total_kv_len)
+            {
+                auto const src_v_idx
+                    = static_cast<size_t>(v_token_idx) * src_v_token_stride + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                auto const dst_v_idx
+                    = static_cast<size_t>(v_token_idx) * V_HEAD_DIM * head_num + head_idx * V_HEAD_DIM + v_head_dim_idx;
+                quantCopy<T, ELTS_PER_VEC>(quant_v_buf + dst_v_idx, &v_buf[src_v_idx], quant_scale_qkv_val);
+            }
         }
     }
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream)
+void invokeMLARopeContext(
+    MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,\
-        params.q_pe,
-        params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
-        params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size,
-        params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.quant_scale_kv, absorption_mode);
+    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
+        params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+        params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+        params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv, absorption_mode);
 }
 
 template <typename T>
@@ -954,17 +959,17 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 {
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8, "MLA Context: cache_type must be FP8");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.k_buf != nullptr, "MLA Context: k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.v_buf != nullptr, "MLA Context: v_buf must be non-null");
+    // TLLM_CHECK_WITH_INFO(params.k_buf != nullptr, "MLA Context: k_buf must be non-null");
+    // TLLM_CHECK_WITH_INFO(params.v_buf != nullptr, "MLA Context: v_buf must be non-null");
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_k_buf != nullptr, "MLA Context: quant_k_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_v_buf != nullptr, "MLA Context: quant_v_buf must be non-null");
+    // TLLM_CHECK_WITH_INFO(params.quant_k_buf != nullptr, "MLA Context: quant_k_buf must be non-null");
+    // TLLM_CHECK_WITH_INFO(params.quant_v_buf != nullptr, "MLA Context: quant_v_buf must be non-null");
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
     if (params.acc_q_len > 0)
     {
-        constexpr int threads_per_block = 384;
+        constexpr int threads_per_block = 1152;
         dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
 
         TLLM_LOG_DEBUG(
@@ -972,7 +977,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             "total_kv_len: %d, acc_q_len: %d",
             grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
 
-        quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
+        quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512>
             <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
                 params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
                 static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, params.quant_scale_qkv,
@@ -1044,7 +1049,8 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
-    template void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream);      \
+    template void invokeMLARopeContext(                                                                                \
+        MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream);               \
     template void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 INSTANTIATE_MLA_ROPE(float, KVBlockArray);

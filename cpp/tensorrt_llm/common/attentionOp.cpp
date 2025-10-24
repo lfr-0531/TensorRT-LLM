@@ -747,9 +747,13 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * max_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * kv_seq_length;
-    int const dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int const dim_v_per_head = (mMLAParams.v_head_dim);
+    if (useSparseMLA())
+    {
+        dim_q_per_head = 512 + 64;
+    }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
     int const total_q_dim_all_heads = mNumAttnHeads * dim_q_per_head;
@@ -1115,7 +1119,8 @@ int AttentionOp::mlaGeneration(
         {
             tllmRunnerParams.mSparseMla = true;
             tllmRunnerParams.mSparseMlaTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
-            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(mRuntimeSparseAttentionParams.sparse_attn_indices);
+            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
+                mRuntimeSparseAttentionParams.sparse_attn_indices);
             tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
         }
 
@@ -1420,7 +1425,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const qk_buf_float_size = mEnableContextFMHA
         ? 0
         : sizeof(float) * params.batch_size * mNumHeads * params.input_seq_length * kv_seq_length;
-    int const dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    if (useSparseMLA())
+    {
+        dim_q_per_head = 512 + 64;
+    }
     int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int const dim_v_per_head = (mMLAParams.v_head_dim);
 
@@ -1857,7 +1866,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
-	// Sparse attention parameters
+        // Sparse attention parameters
         if (useSparseMLA())
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
@@ -2744,10 +2753,10 @@ int AttentionOp::initialize() noexcept
                 // Context attention of MLA is different
                 fmhaParams.numKvHeads = mNumHeads;
                 fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
-                // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA context(v_head_dim=128)
-                // and gen(v_head_dim=512) runners in a single op, the headSizeV will be set to 512 when we create the gen
-                // attention op and that could fail to create the FmhaDispatcher for context phase.
-                // Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
+                // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA
+                // context(v_head_dim=128) and gen(v_head_dim=512) runners in a single op, the headSizeV will be set to
+                // 512 when we create the gen attention op and that could fail to create the FmhaDispatcher for context
+                // phase. Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
                 fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
             }
