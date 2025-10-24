@@ -1622,6 +1622,7 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices, # used by DSA attention
+            is_generation=is_generation, # used by DSA attention
         )
         fused_q = None
 
