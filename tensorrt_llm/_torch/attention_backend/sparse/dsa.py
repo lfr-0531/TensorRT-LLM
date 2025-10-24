@@ -11,7 +11,7 @@ import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
-    TrtllmAttention, TrtllmAttentionMetadata)
+    AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
@@ -1169,10 +1169,9 @@ class DSATrtllmAttention(TrtllmAttention):
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # DSA runs context and generation phases separately, so we need to check if we are in generation phase.
-        is_generation = metadata.num_generations > 0
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.layer_idx, is_generation)
