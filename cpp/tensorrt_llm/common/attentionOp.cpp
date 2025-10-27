@@ -2733,6 +2733,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.numTokensPerBlock = mTokensPerBlock;
         fmhaParams.headSize = mHeadSize;
         fmhaParams.headSizeV = mHeadSize;
+        fmhaParams.qScaling = mQScaling;
 
         // mFmhaDispatcher is not used for generation MLA, but we still need to modify these values to avoid selecting
         // the wrong kernel, no matter mIsGenerationMLA is true or false
@@ -2745,6 +2746,10 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.headSize = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
                 fmhaParams.headSizeV = mMLAParams.kv_lora_rank;
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
+                // Adjust the qScaling for the absorption mode.
+                fmhaParams.qScaling = mQScaling
+                    * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
+                    / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
             }
             else
             {
@@ -2761,7 +2766,6 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
             }
         }
-        fmhaParams.qScaling = mQScaling;
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
