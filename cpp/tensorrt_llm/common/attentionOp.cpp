@@ -748,11 +748,13 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * kv_seq_length;
     int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
-    int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
-    int const dim_v_per_head = (mMLAParams.v_head_dim);
+    int dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int dim_v_per_head = (mMLAParams.v_head_dim);
     if (useSparseMLA())
     {
-        dim_q_per_head = 512 + 64;
+        dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        dim_v_per_head = mMLAParams.kv_lora_rank;
     }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
@@ -1426,12 +1428,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         ? 0
         : sizeof(float) * params.batch_size * mNumHeads * params.input_seq_length * kv_seq_length;
     int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
+    int dim_v_per_head = (mMLAParams.v_head_dim);
     if (useSparseMLA())
     {
-        dim_q_per_head = 512 + 64;
+        dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        dim_v_per_head = mMLAParams.kv_lora_rank;
     }
-    int const dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
-    int const dim_v_per_head = (mMLAParams.v_head_dim);
 
     // Total dimension per token across all heads for Q, K, and V components respectively
     int const total_q_dim_all_heads = mNumAttnHeads * dim_q_per_head;
@@ -1745,15 +1749,15 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
             params.mla_param->host_bmm1_scale
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            // The sparse MLA is in the absorption mode for the context phase.
+            bool absorption_mode = useSparseMLA();
             if (params.mla_param->latent_cache != nullptr)
             {
-                // The sparse MLA is in the absorption mode for the context phase.
-                bool absorption_mode = useSparseMLA();
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, absorption_mode, stream);
             }
             if (mFP8ContextMLA)
             {
-                invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
+                invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, absorption_mode, stream);
             }
         }
         else

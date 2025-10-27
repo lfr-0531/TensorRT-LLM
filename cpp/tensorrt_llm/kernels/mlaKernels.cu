@@ -955,7 +955,7 @@ void invokeMLARopeContext(
 }
 
 template <typename T>
-void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream)
+void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, bool absorption_mode, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8, "MLA Context: cache_type must be FP8");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
@@ -969,20 +969,41 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 
     if (params.acc_q_len > 0)
     {
-        constexpr int threads_per_block = 1152;
-        dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
+        if (absorption_mode)
+        {
+            constexpr int threads_per_block = 1152;
+            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
 
-        TLLM_LOG_DEBUG(
-            "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-            "total_kv_len: %d, acc_q_len: %d",
-            grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                "total_kv_len: %d, acc_q_len: %d",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
 
-        quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512>
-            <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, params.quant_scale_qkv,
-                params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
-                params.dequant_scale_kv, params.host_bmm1_scale);
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
+        else
+        {
+            constexpr int threads_per_block = 384;
+
+            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
+
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                "total_kv_len: %d, acc_q_len: %d",
+                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
+
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
     }
     else
     {
@@ -1061,7 +1082,8 @@ INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVBlockArray);
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
 
 #define INSTANTIATE_MLA_QUANTIZE(T)                                                                                    \
-    template void invokeMLAContextFp8Quantize<T>(MlaParams<T> & params, int total_kv_len, cudaStream_t stream);
+    template void invokeMLAContextFp8Quantize<T>(                                                                      \
+        MlaParams<T> & params, int total_kv_len, bool absorption_mode, cudaStream_t stream);
 
 INSTANTIATE_MLA_QUANTIZE(float);
 INSTANTIATE_MLA_QUANTIZE(half);
