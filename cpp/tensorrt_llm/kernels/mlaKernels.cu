@@ -957,7 +957,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 }
 
 template <typename T>
-void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, bool absorption_mode, cudaStream_t stream)
+void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8, "MLA Context: cache_type must be FP8");
     TLLM_CHECK_WITH_INFO(params.q_buf != nullptr, "MLA Context: q_buf must be non-null");
@@ -1094,8 +1094,7 @@ INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVBlockArray);
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
 
 #define INSTANTIATE_MLA_QUANTIZE(T)                                                                                    \
-    template void invokeMLAContextFp8Quantize<T>(                                                                      \
-        MlaParams<T> & params, int total_kv_len, bool absorption_mode, cudaStream_t stream);
+    template void invokeMLAContextFp8Quantize<T>(MlaParams<T> & params, int total_kv_len, cudaStream_t stream);
 
 INSTANTIATE_MLA_QUANTIZE(float);
 INSTANTIATE_MLA_QUANTIZE(half);

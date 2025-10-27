@@ -1757,7 +1757,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             }
             if (mFP8ContextMLA)
             {
-                invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, absorption_mode, stream);
+                invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }
         }
         else
