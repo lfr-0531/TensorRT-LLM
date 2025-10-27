@@ -99,6 +99,9 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
+    // Is it absorption mode?
+    bool absorption_mode = false;
+
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 
@@ -107,8 +110,7 @@ struct MlaParams
 };
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(
-    MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, bool absorption_mode, cudaStream_t stream);
+void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 template <typename T>
 void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, bool absorption_mode, cudaStream_t stream);
