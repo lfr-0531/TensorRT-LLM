@@ -231,7 +231,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-            tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
+            tllmRunnerParams.kvPageIdxPtr
+                = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
         }
 

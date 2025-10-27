@@ -122,7 +122,8 @@ public:
             "headDimV=%d",
             headDimPerCtaV, headDimQk, headDimV);
         // The numTokensPerPage must be power of 2.
-        TLLM_CHECK_WITH_INFO((numTokensPerPage & (numTokensPerPage - 1)) == 0, "The numTokensPerPage must be power of 2.");
+        TLLM_CHECK_WITH_INFO(
+            (numTokensPerPage & (numTokensPerPage - 1)) == 0, "The numTokensPerPage must be power of 2.");
         TLLM_CHECK_WITH_INFO(maxNumHeadsQPerKvInCta <= 128, "The maxNumHeadsQPerKvInCta <= 128 is required.");
         TLLM_CHECK_WITH_INFO(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
         // Format of the hash key:
@@ -344,7 +345,7 @@ private:
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
             // The sparseMla only selects topK tokensKv.
-            if(params.mSparseMla)
+            if (params.mSparseMla)
             {
                 maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
             }
@@ -502,7 +503,8 @@ private:
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
                 // The sparseMla only supports numHeadsQPerKv = 128.
-                TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128, "The sparseMla only supports numHeadsQPerKv = 128");
+                TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
+                    "The sparseMla only supports numHeadsQPerKv = 128");
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {
@@ -556,17 +558,17 @@ private:
                 "Sliding window attention and chunked attention should not be used together");
             selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
-        
+
         // The number of tokens per page.
         int numTokensPerPage = params.mNumTokensPerPage;
         // SparseMla kernels use a fixed numTokensPerPage of 4 (TMALDG.Gather4).
-        if(params.mSparseMla)
+        if (params.mSparseMla)
         {
             numTokensPerPage = 4;
         }
-        else if(!isPagedKv(params.mQkvLayout))
+        else if (!isPagedKv(params.mQkvLayout))
         {
-             // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
+            // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
             numTokensPerPage = 0;
         }
 
@@ -582,9 +584,8 @@ private:
             + ", headDimQk=" + std::to_string(params.mHeadDimQk) + ", headDimV=" + std::to_string(params.mHeadDimV)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(numTokensPerPage) + ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
-            + ", sparseMla=" + std::to_string(params.mSparseMla);
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
+            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla);
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
@@ -592,7 +593,8 @@ private:
                 static_cast<int>(kernelType), static_cast<int>(selectKernelParams.mTileScheduler),
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
-                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma, params.mSparseMla),
+                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
+                params.mSparseMla),
             info);
     }
 

@@ -1254,15 +1254,14 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.sm_version >= 100:
-            return self.forward_generation(
-                        q,
-                        compressed_kv,
-                        k_pe,
-                        attn_metadata,
-                        output,
-                        latent_cache,
-                        topk_indices,
-                        is_generation=False)
+            return self.forward_generation(q,
+                                           compressed_kv,
+                                           k_pe,
+                                           attn_metadata,
+                                           output,
+                                           latent_cache,
+                                           topk_indices,
+                                           is_generation=False)
         else:
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
@@ -1282,14 +1281,9 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.sm_version >= 100:
-            return self.forward_generation(
-                        q,
-                        compressed_kv,
-                        k_pe,
-                        attn_metadata,
-                        output,
-                        latent_cache,
-                        topk_indices)
+            return self.forward_generation(q, compressed_kv, k_pe,
+                                           attn_metadata, output, latent_cache,
+                                           topk_indices)
         else:
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
@@ -1621,8 +1615,8 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-            topk_indices=topk_indices, # used by DSA attention
-            is_generation=is_generation, # used by DSA attention
+            topk_indices=topk_indices,  # used by DSA attention
+            is_generation=is_generation,  # used by DSA attention
         )
         fused_q = None
 

@@ -376,7 +376,8 @@ public:
             op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
             if (op.useKVCache() && host_kv_cache_pool_pointers.has_value())
             {
-                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool = reinterpret_cast<char*>(
+                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
             }
         }
 
@@ -834,7 +835,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_mla_topk);
+            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
+            sparse_mla_topk);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -851,7 +853,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_mla_topk);
+            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
+            sparse_mla_topk);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

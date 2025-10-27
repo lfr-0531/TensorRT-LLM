@@ -389,7 +389,8 @@ class TrtllmAttentionWrapper:
                 raise ValueError("Unexpected attention mask type")
         else:
             # For DSA, use the same qkv hidden size for context and generation phases
-            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel() > 0
+            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel(
+            ) > 0
             if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
                 assert is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
@@ -1365,8 +1366,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_kv_offsets=sparse_kv_offsets,
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
-            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(metadata, 'sparse_mla_topk') else 0
-        )
+            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
+                metadata, 'sparse_mla_topk') else 0)
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:
