@@ -45,12 +45,11 @@ int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool 
 class MLACacheFormatter final : public BaseCacheFormatter
 {
 public:
-    MLACacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    MLACacheFormatter(BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> cacheTransBufferManagers)
         : mCacheManager{cacheManager}
-        , mCacheTransBufferManager{cacheTransBufferManager}
+        , mCacheTransBufferManagers{cacheTransBufferManagers}
     {
         TLLM_CHECK(mCacheManager);
-        TLLM_CHECK(mCacheTransBufferManager);
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;
@@ -76,7 +75,7 @@ public:
 
 private:
     BaseKVCacheManager* mCacheManager;
-    CacheTransBufferManager* mCacheTransBufferManager;
+    std::vector<CacheTransBufferManager*> mCacheTransBufferManagers;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
