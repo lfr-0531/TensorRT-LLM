@@ -155,10 +155,10 @@ struct KernelParams
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // // The flag to use block sparse attention.
-    // bool mUseBlockSparseAttention;
     // The top k value for sparse MLA.
     int32_t mSparseMlaTopK;
+    // The flag to use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -702,10 +702,11 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
 
-        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv, headDimQk).
-        if(options.mSparseMla) {
-            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
-                                           static_cast<uint64_t>(INT_MAX)};
+        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
+        // headDimQk).
+        if (options.mSparseMla)
+        {
+            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
             tileShapeKv[1] = 1;
         }
@@ -823,7 +824,7 @@ struct KernelParams
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
-        // params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
+        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
         // The top k value for sparse MLA.
         params.mSparseMlaTopK = options.mSparseMlaTopK;
