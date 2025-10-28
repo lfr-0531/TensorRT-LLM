@@ -1,7 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-
+import triton.language.core as core
+from triton.language.standard import _log2, sum, zeros_like
 
 @triton.jit
 def _index_gather_kernel(output_ptr, input_ptr, index_ptr, in_row_stride,
@@ -447,3 +448,303 @@ def triton_convert_req_index_to_global_index(
         out_stride1,
     )
     return out
+
+
+@triton.jit
+def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
+    n_outer: core.constexpr = x.numel >> n_dims
+    shape: core.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    y = core.reshape(x, shape)
+    # slice left/right with 'stride' 2**(n_dims - i - 1)
+    mask = core.arange(0, 2)[None, :, None]
+    left = core.broadcast_to(sum(y * (1 - mask), 1)[:, None, :], shape)
+    right = core.broadcast_to(sum(y * mask, 1)[:, None, :], shape)
+    left = core.reshape(left, x.shape)
+    right = core.reshape(right, x.shape)
+
+    # idx
+    y_idx = core.reshape(ids, shape)
+    left_idx = core.broadcast_to(sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = core.broadcast_to(sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = core.reshape(left_idx, x.shape)
+    right_idx = core.reshape(right_idx, x.shape)
+
+    # actual compare-and-swap
+    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth,
+                                signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+
+    cond = (left > right) ^ flip
+
+    ret = ix ^ core.where(cond, ileft ^ iright, zeros_like(ix))
+
+    new_ids = ids ^ core.where(cond, left_idx ^ right_idx, zeros_like(ids))
+
+    return ret.to(x.dtype, bitcast=True), new_ids
+
+
+@triton.jit
+def _bitonic_merge(x, ids, stage: core.constexpr, order: core.constexpr,
+                   n_dims: core.constexpr):
+    '''
+    order_type 0 == ascending
+    order_type 1 == descending
+    order_type 2 == alternating
+    '''
+    n_outer: core.constexpr = x.numel >> n_dims
+    core.static_assert(stage <= n_dims)
+    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
+    # descending order.
+    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
+    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
+    # a stride of 2) at this stage
+    if order == 2:
+        shape: core.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        # Create boolean flip pattern instead of integer
+        flip = core.reshape(
+            core.broadcast_to(core.arange(0, 2)[None, :, None], shape),
+            x.shape) != 0
+    else:
+        # Ensure flip is boolean for XOR operations
+        flip = order != 0
+    # perform `stage` rounds of `compare-and-swap`
+    for i in core.static_range(stage):
+        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+    return x, ids
+
+
+@triton.jit
+def argsort(x,
+            ids,
+            dim: core.constexpr = None,
+            descending: core.constexpr = core.CONSTEXPR_0):
+    # handle default dimension or check that it is the most minor dim
+    _dim: core.constexpr = len(x.shape) - 1 if dim is None else dim
+    core.static_assert(_dim == len(x.shape) - 1,
+                       "only minor dimension is currently supported")
+    # iteratively run bitonic merge-sort steps
+    n_dims: core.constexpr = _log2(x.shape[_dim])
+
+    for i in core.static_range(1, n_dims + 1):
+        x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending,
+                                n_dims)
+    return x, ids
+
+
+@triton.jit
+def topk_kernel(
+    input_ptr,
+    output_indices_ptr,
+    temp_values_ptr,
+    temp_indices_ptr,
+    input_offsets_ptr,
+    output_offsets_ptr,
+    batch_size,
+    num_kv_heads,
+    topk,
+    total_input_tokens,
+    total_sparse_indices,
+    max_seq_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Perform topk operation on each batch independently using efficient argsort implementation.
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    if batch_idx >= batch_size or head_idx >= num_kv_heads:
+        return
+
+    input_start = tl.load(input_offsets_ptr + batch_idx)
+    input_end = tl.load(input_offsets_ptr + batch_idx + 1)
+    input_len = input_end - input_start
+
+    output_start = tl.load(output_offsets_ptr + batch_idx)
+    output_end = tl.load(output_offsets_ptr + batch_idx + 1)
+    output_len = output_end - output_start
+
+    if input_len <= 0 or output_len <= 0:
+        return
+
+    actual_topk = tl.minimum(topk, input_len)
+    actual_topk = tl.minimum(actual_topk, output_len)
+
+    # Base addresses
+    input_base = head_idx * total_input_tokens + input_start
+    temp_base = batch_idx * num_kv_heads * max_seq_len * 2 + head_idx * max_seq_len * 2
+    output_base = head_idx * total_sparse_indices + output_start
+
+    # Process sequence in chunks to handle variable lengths efficiently
+    max_process_len = tl.cdiv(input_len, BLOCK_SIZE) * BLOCK_SIZE
+
+    for block_start in tl.range(0, max_process_len, BLOCK_SIZE):
+        block_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        block_mask = block_offsets < input_len
+
+        values = tl.load(input_ptr + input_base + block_offsets,
+                         mask=block_mask,
+                         other=0.0)
+
+        # Store values to temporary storage
+        tl.store(temp_values_ptr + temp_base + block_offsets,
+                 values,
+                 mask=block_mask)
+        # Store original indices
+        tl.store(temp_indices_ptr + temp_base + block_offsets,
+                 block_offsets,
+                 mask=block_mask)
+
+    # Multi-round iterative argsort approach
+    # This works for both short and long sequences uniformly
+    current_len = input_len.to(tl.int32)
+    current_base = temp_base
+    round_num = 0
+
+    while current_len > BLOCK_SIZE:
+        round_num += 1
+
+        num_chunks = tl.cdiv(current_len, BLOCK_SIZE)
+
+        # Alternate between two halves of temp storage to avoid conflicts
+        if round_num % 2 == 1:
+            next_base = temp_base + max_seq_len
+        else:
+            next_base = temp_base
+
+        next_len = 0
+
+        # Process each chunk in this round
+        for chunk_id in tl.range(0, num_chunks):
+            chunk_start = chunk_id * BLOCK_SIZE
+            chunk_end = tl.minimum(chunk_start + BLOCK_SIZE, current_len)
+            chunk_len = chunk_end - chunk_start
+
+            if chunk_len > 0:
+                # Load chunk data from current round's storage
+                chunk_offsets = tl.arange(0, BLOCK_SIZE)
+                chunk_mask = chunk_offsets < chunk_len
+
+                chunk_values = tl.load(temp_values_ptr + current_base +
+                                       chunk_start + chunk_offsets,
+                                       mask=chunk_mask,
+                                       other=0.0)
+                chunk_indices = tl.load(temp_indices_ptr + current_base +
+                                        chunk_start + chunk_offsets,
+                                        mask=chunk_mask,
+                                        other=0.0).to(tl.int32)
+
+                # Sort this chunk using argsort
+                chunk_sorted_values, chunk_sorted_indices = argsort(
+                    chunk_values, chunk_indices, dim=0, descending=True)
+
+                # Extract top-k candidates from this chunk
+                chunk_topk = tl.minimum(actual_topk, chunk_len).to(tl.int32)
+                chunk_topk_mask = chunk_offsets < chunk_topk
+
+                # Store top-k candidates to next round's storage
+                next_offsets = next_len + chunk_offsets
+                next_store_mask = chunk_topk_mask & (next_offsets < max_seq_len)
+
+                tl.store(temp_values_ptr + next_base + next_offsets,
+                         chunk_sorted_values,
+                         mask=next_store_mask)
+                tl.store(temp_indices_ptr + next_base + next_offsets,
+                         chunk_sorted_indices,
+                         mask=next_store_mask)
+
+                next_len += chunk_topk
+
+        # Update parameters for next round
+        current_len = next_len
+        current_base = next_base
+
+    final_offsets = tl.arange(0, BLOCK_SIZE)
+    final_mask = final_offsets < current_len
+
+    final_values = tl.load(temp_values_ptr + current_base + final_offsets,
+                           mask=final_mask,
+                           other=-1e10)
+    final_indices = tl.load(temp_indices_ptr + current_base + final_offsets,
+                            mask=final_mask,
+                            other=-1).to(tl.int32)
+
+    final_sorted_values, final_sorted_indices = argsort(final_values,
+                                                        final_indices,
+                                                        dim=0,
+                                                        descending=True)
+
+    result_offsets = tl.arange(0, BLOCK_SIZE)
+    result_mask = result_offsets < actual_topk
+
+    selected_indices = tl.where(result_mask, final_sorted_indices,
+                                tl.zeros_like(final_sorted_indices))
+    tl.store(output_indices_ptr + output_base + result_offsets,
+             selected_indices,
+             mask=result_mask)
+
+
+def triton_topk(
+        input_tensor: torch.Tensor,
+        input_offsets: torch.Tensor,
+        output_offsets: torch.Tensor,
+        total_sparse_attn_indices: int,
+        max_seq_len: int,
+        topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform topk operation.
+
+    Args:
+        input_tensor: Input scores [num_kv_heads, sum(kt_lens)]
+        input_offsets: Input offsets [batch_size + 1]
+        output_offsets: Sparse offsets [batch_size + 1]
+        total_sparse_attn_indices: Total number of sparse attention indices
+        max_seq_len: Maximum sequence length
+        topk: scalar of TopK parameter
+
+    Returns:
+        output_indices: Selected indices [num_kv_heads, num_total_sparse_indices]
+    """
+
+    num_kv_heads = input_tensor.shape[0]
+    batch_size = input_offsets.shape[0] - 1
+    device = input_tensor.device
+    total_working_tokens = input_tensor.shape[1]
+
+    # Create output tensor
+    output_indices = torch.empty((num_kv_heads, total_sparse_attn_indices),
+                                 dtype=torch.int32,
+                                 device=device)
+
+    # Create temporary storage for topk algorithm (double size for dual-buffer design)
+    temp_values = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
+                              dtype=input_tensor.dtype,
+                              device=device)
+    temp_indices = torch.empty((batch_size, num_kv_heads, max_seq_len * 2),
+                               dtype=torch.int32,
+                               device=device)
+
+    grid = (batch_size, num_kv_heads)
+
+    assert topk & (topk - 1) == 0, "Topk must be a power of 2"
+    BLOCK_SIZE = max(512, 2 * topk)
+
+    topk_kernel[grid](
+        input_tensor,
+        output_indices,
+        temp_values,
+        temp_indices,
+        input_offsets,
+        output_offsets,
+        batch_size,
+        num_kv_heads,
+        topk,
+        total_working_tokens,
+        total_sparse_attn_indices,
+        max_seq_len,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return output_indices

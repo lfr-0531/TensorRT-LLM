@@ -33,7 +33,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .kernel import triton_convert_req_index_to_global_index
+from .kernel import triton_convert_req_index_to_global_index, triton_topk
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -524,7 +524,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
-        self.kv_cache_manager.indexer_k_cache_tokens_per_block
         # host
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
@@ -1047,9 +1046,23 @@ class Indexer(nn.Module):
             mask = positions <= index_end_pos
             # mask: [B * N, L]
             logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
-            topk_indices_decode = logits_decode.topk(
-                min(self.index_topk, logits_decode.shape[-1]),
-                dim=-1)[1].to(torch.int32)  # [B * N, K]
+            
+            # print(f"logits_decode: {logits_decode.shape}")
+            
+            base_offset = torch.arange(num_generations+1, device=logits_decode.device)
+            num_sparse_tokens = min(self.index_topk, logits_decode.shape[-1])
+            topk_indices_decode = triton_topk(
+                input_tensor=logits_decode.flatten(0, 1).unsqueeze(0),
+                input_offsets=base_offset * logits_decode.shape[-1],
+                output_offsets=base_offset * num_sparse_tokens,
+                total_sparse_attn_indices=num_generations * num_sparse_tokens,
+                max_seq_len=logits_decode.shape[-1],
+                topk=self.index_topk,
+            ).view(num_generations, -1)
+            
+            # topk_indices_decode = logits_decode.topk(
+            #     min(self.index_topk, logits_decode.shape[-1]),
+            #     dim=-1)[1].to(torch.int32)  # [B * N, K]
             # ensure we don't set indices for the top k
             # that is out of range(masked already)
             # this will happen if context length is shorter than K

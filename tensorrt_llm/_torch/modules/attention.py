@@ -1253,7 +1253,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.sm_version >= 100:
+        if False:
             return self.forward_generation(q,
                                            compressed_kv,
                                            k_pe,
@@ -1280,7 +1280,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.sm_version >= 100:
+        if False:
             return self.forward_generation(q, compressed_kv, k_pe,
                                            attn_metadata, output, latent_cache,
                                            topk_indices)
