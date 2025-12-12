@@ -193,7 +193,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     }
     else
     {
-        for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock)
+        for (size_t idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock)
         {
             float logit = logits[idx * stride1];
             distributeToBins(logit, idx);
@@ -411,7 +411,7 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
     // sorted by their corresponding logit.
     if (rowLen <= topK)
     {
-        for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
+        for (size_t rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
         {
             if constexpr (multipleBlocksPerRow)
             {
@@ -423,7 +423,7 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
                 outIndices[rowIt] = rowIt;
             }
         }
-        for (int rowIt = rowLen + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock)
+        for (size_t rowIt = rowLen + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock)
         {
             outIndices[rowIt] = -1;
             if constexpr (multipleBlocksPerRow)
@@ -593,7 +593,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
     static constexpr int kNumBins = 2048;
 
     // The row computed by this block.
-    int rowIdx = blockIdx.x + offsetIndex;
+    size_t rowIdx = blockIdx.x + offsetIndex;
 
     // The range of logits within the row.
     int rowStart = rowStarts[rowIdx];
@@ -601,7 +601,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 
     // Local pointers to this block
     outIndices += rowIdx * topK;
-    logits += rowIdx * stride0;
+    logits += size_t(rowIdx * stride0);
 
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
         nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
@@ -616,7 +616,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
     static constexpr int kNumBins = 2048;
 
     // The row computed by this block.
-    int rowIdx = blockIdx.x;
+    size_t rowIdx = blockIdx.x;
 
     // The range of logits within the row.
     int rowStart = 0;
@@ -642,7 +642,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
         indices += rowIdx * numBlocksToMerge * topK;
         outIndices += rowIdx * topK;
     }
-    logits += rowIdx * stride0;
+    logits += size_t(rowIdx * stride0);
 
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks>(
         indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
