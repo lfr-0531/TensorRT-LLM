@@ -234,7 +234,10 @@ class CutlassFusedMoE(MoE):
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
+        # If attention DP and chunked moe is enabled, no need to use AlltoAll.
         if self.mapping.dp_size == 1:
+            return AlltoallMethodType.NotEnabled
+        elif self.aux_stream is not None and self.event_dict is not None:
             return AlltoallMethodType.NotEnabled
 
         # AlltoAll cannot support MoE TP.
