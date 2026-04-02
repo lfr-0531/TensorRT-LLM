@@ -760,20 +760,40 @@ class Indexer(nn.Module):
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         use_custom_topk: bool = True,
+        is_generation: Optional[bool] = None,
     ) -> torch.Tensor:
+        """Run sparse attention indexing.
+
+        When ``is_generation`` is None (default), processes both context
+        and generation tokens (legacy full-batch mode).  When explicitly
+        set to False/True, only runs the corresponding phase — this is
+        the preferred mode when called from the trtllm backend where
+        ctx and gen are dispatched separately.
+
+        NOTE: _update_k_cache must be called BEFORE this method. It is
+        the caller's responsibility (e.g. via pre_attn_process) to ensure
+        the indexer k cache is up-to-date before indexing.
+        """
         assert (
             metadata.kv_cache_manager is None or metadata.kv_cache_manager.quant_block_size == 128
         ), "Only support quant_block_size = 128 for now"
-        # Update the indexer k cache before prefill chunks gather from it.
-        self._update_k_cache(k_fp8, k_scale, metadata)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
         num_tokens = metadata.num_tokens
 
-        has_decode = num_generations > 0
-        has_prefill = num_contexts > 0
+        # When phase is specified, only run that phase.
+        # token_offset adjusts buffer indexing: in full-batch mode gen tokens
+        # start at num_ctx_tokens, but in gen-only mode they start at 0.
+        if is_generation is not None:
+            has_prefill = not is_generation and num_contexts > 0
+            has_decode = is_generation and num_generations > 0
+            token_offset = 0 if is_generation else 0
+        else:
+            has_prefill = num_contexts > 0
+            has_decode = num_generations > 0
+            token_offset = num_ctx_tokens
         num_gen_tokens = num_tokens - num_ctx_tokens
 
         topk_indices_buffer = torch.empty(
@@ -922,7 +942,7 @@ class Indexer(nn.Module):
             )
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
-            q_decode = q_fp8[num_ctx_tokens : num_ctx_tokens + num_gen_tokens, ...]
+            q_decode = q_fp8[token_offset : token_offset + num_gen_tokens, ...]
             batch_size = num_generations
             next_n = num_gen_tokens // num_generations
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
@@ -948,7 +968,7 @@ class Indexer(nn.Module):
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
             assert num_gen_tokens == batch_size * next_n
-            weights_decode = weights[num_ctx_tokens : num_ctx_tokens + num_gen_tokens, ...]
+            weights_decode = weights[token_offset : token_offset + num_gen_tokens, ...]
 
             # Get k cache and call fp8_paged_mqa_logits with prepared decode metadata
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
@@ -979,7 +999,7 @@ class Indexer(nn.Module):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode,
                         gen_kv_lens_cuda,
-                        topk_indices_buffer[num_ctx_tokens : num_ctx_tokens + num_gen_tokens, :],
+                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                         self.index_topk,
                         next_n,
                     )
@@ -987,7 +1007,7 @@ class Indexer(nn.Module):
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode,
                         gen_kv_lens_cuda,
-                        topk_indices_buffer[num_ctx_tokens : num_ctx_tokens + num_gen_tokens, :],
+                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                         next_n,
                         self.index_topk,
                     )
@@ -1021,14 +1041,14 @@ class Indexer(nn.Module):
                 topk_indices_decode = topk_indices_decode.masked_fill(~mask_decode, -1)
                 # Store in buffer
                 topk_indices_buffer[
-                    num_ctx_tokens : num_ctx_tokens + num_gen_tokens,
+                    token_offset : token_offset + num_gen_tokens,
                     : topk_indices_decode.shape[-1],
                 ] = topk_indices_decode.to(dtype=torch.int32)
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
-            topk_indices_buffer[num_ctx_tokens:num_tokens, :] = metadata.topk_indices_buffer[
-                num_ctx_tokens:num_tokens, :
-            ]
+            topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
+                metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+            )
         return topk_indices_buffer
 
     def _weight_scale(self, weights: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
@@ -1101,6 +1121,9 @@ class Indexer(nn.Module):
         position_ids: torch.Tensor,
     ):
         q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(qr, hidden_states, position_ids)
+
+        # Scatter k values into indexer k cache before indexing
+        self._update_k_cache(k_fp8, k_scale, metadata)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
         return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8, k_scale, weights)
