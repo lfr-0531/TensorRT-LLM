@@ -2,8 +2,14 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
+
+# get_parameter_device/dtype removed in transformers 5.x
+def get_parameter_device(module):
+    return next(module.parameters()).device
+
+
+def get_parameter_dtype(module):
+    return next(module.parameters()).dtype
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)

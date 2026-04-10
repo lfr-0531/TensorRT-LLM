@@ -7,7 +7,25 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
+
+# load_sharded_checkpoint removed in transformers 5.x
+def load_sharded_checkpoint(model, folder, strict=True):
+    """Load a sharded safetensors checkpoint into a model (compat shim)."""
+    import glob
+    import json
+    import os
+    from safetensors.torch import load_file
+    index_file = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            shard_files = set(json.load(f)["weight_map"].values())
+        state_dict = {}
+        for sf in shard_files:
+            state_dict.update(load_file(os.path.join(folder, sf)))
+    else:
+        sf = os.path.join(folder, "model.safetensors")
+        state_dict = load_file(sf)
+    model.load_state_dict(state_dict, strict=strict)
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,

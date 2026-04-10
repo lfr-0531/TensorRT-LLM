@@ -34,9 +34,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
 
-from tensorrt_llm._torch.configs.gemma4 import (Gemma4AudioConfig,
-                                                  Gemma4Config,
-                                                  Gemma4VisionConfig)
+from transformers import Gemma4AudioConfig, Gemma4Config, Gemma4VisionConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 

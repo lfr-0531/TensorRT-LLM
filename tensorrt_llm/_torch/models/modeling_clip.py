@@ -4,8 +4,14 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
+
+# get_parameter_device/dtype removed in transformers 5.x
+def get_parameter_device(module):
+    return next(module.parameters()).device
+
+
+def get_parameter_dtype(module):
+    return next(module.parameters()).dtype
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
