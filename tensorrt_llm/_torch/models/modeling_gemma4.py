@@ -1,0 +1,814 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
+
+import math
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from tensorrt_llm._torch.configs.gemma4 import Gemma4TextConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+from tensorrt_llm._torch.modules.fused_moe.routing import \
+    BaseMoeRoutingMethod
+from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.mapping import Mapping
+
+from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
+                                           PositionalEmbeddingParams,
+                                           PredefinedAttentionMask, RopeParams)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.rms_norm import RMSNorm
+from ..utils import ActivationType
+from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
+                             register_auto_model)
+
+
+# ---------------------------------------------------------------------------
+# Scaled embedding (reused from Gemma3 pattern)
+# ---------------------------------------------------------------------------
+class Gemma4TextScaledWordEmbedding(Embedding):
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        dtype: Optional[torch.dtype] = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
+        embed_scale: Optional[float] = None,
+    ):
+        super().__init__(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
+        )
+        if embed_scale is None:
+            embed_scale = math.sqrt(hidden_size)
+        self.embed_scale = torch.tensor(embed_scale, dtype=self.dtype)
+
+    @torch.inference_mode()
+    def forward(self, input_ids):
+        return super().forward(input_ids) * self.embed_scale
+
+
+# ---------------------------------------------------------------------------
+# Activation helper (same as Gemma3)
+# ---------------------------------------------------------------------------
+def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+    if IS_FLASHINFER_AVAILABLE:
+        return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(gate_x)
+    gate, x = gate_x.chunk(2, dim=-1)
+    return nn.functional.gelu(gate, approximate="tanh") * x
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 Attention
+# ---------------------------------------------------------------------------
+class Gemma4Attention(QKNormRoPEAttention):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+        layer_idx: Optional[int] = None,
+        is_sliding: bool = False,
+    ):
+        self.is_sliding = is_sliding
+        config = model_config.pretrained_config
+
+        # Per-layer head_dim and kv heads
+        if is_sliding:
+            layer_head_dim = config.head_dim
+            layer_num_kv_heads = config.num_key_value_heads
+        else:
+            layer_head_dim = getattr(config, 'global_head_dim',
+                                     config.head_dim)
+            layer_num_kv_heads = getattr(config, 'num_global_key_value_heads',
+                                         None) or config.num_key_value_heads
+
+        # Build RoPE params per layer type
+        rope_params = RopeParams()
+        rope_params.max_positions = config.max_position_embeddings
+        if is_sliding:
+            # Sliding: default RoPE, theta=10K, full rotation
+            rope_config = config.rope_parameters.get(
+                'sliding_attention', {}) if config.rope_parameters else {}
+            rope_params.theta = rope_config.get('rope_theta', 10_000.0)
+            rope_params.scale_type = RotaryScalingType.none
+            rope_params.scale = 1.0
+            rope_params.dim = layer_head_dim
+        else:
+            # Full: proportional RoPE, theta=1M, partial_rotary_factor=0.25
+            rope_config = config.rope_parameters.get(
+                'full_attention', {}) if config.rope_parameters else {}
+            rope_params.theta = rope_config.get('rope_theta', 1_000_000.0)
+            rope_params.scale_type = RotaryScalingType.none
+            rope_params.scale = 1.0
+            partial_rotary_factor = rope_config.get('partial_rotary_factor',
+                                                    0.25)
+            rope_params.dim = int(layer_head_dim * partial_rotary_factor)
+
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=rope_params,
+        )
+
+        self.attention_window_size = None
+        if is_sliding:
+            self.attention_window_size = config.sliding_window
+
+        # Gemma4 uses scaling=1.0 (no query_pre_attn_scalar).
+        # Attention base: softmax_scale = 1 / (sqrt(head_dim) * q_scaling)
+        # For scaling=1.0: q_scaling = 1 / sqrt(head_dim)
+        q_scaling = 1.0 / math.sqrt(layer_head_dim)
+
+        # K=V flag for non-sliding layers
+        self.use_k_eq_v = (getattr(config, 'attention_k_eq_v', False)
+                           and not is_sliding)
+
+        # Temporarily override config.head_dim so the Attention base class
+        # picks up the correct per-layer head_dim.
+        original_head_dim = config.head_dim
+        config.head_dim = layer_head_dim
+
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=layer_num_kv_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=False,
+            pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=False,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+            q_scaling=q_scaling,
+        )
+
+        # Restore original config head_dim
+        config.head_dim = original_head_dim
+
+        # For K=V: add v_norm (no learnable scale) to normalize the
+        # value states derived from key states after k_norm.
+        if self.use_k_eq_v:
+            self.v_norm = RMSNorm(
+                hidden_size=layer_head_dim,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+                has_weights=False,
+            )
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        # Split QKV, apply QK norm
+        if not self.fuse_qk_norm_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
+
+            # K=V: derive value from key after k_norm
+            if self.use_k_eq_v:
+                v = self.v_norm(k.reshape(-1, self.head_dim)).reshape(
+                    -1, self.kv_size)
+
+            if not self.skip_rope:
+                return super(QKNormRoPEAttention,
+                             self).apply_rope(q, k, v, position_ids)
+            else:
+                return q, k, v
+
+        # Fused path (not expected for Gemma4 since fuse_qk_norm_rope=False)
+        qkv = q
+        if k is not None and v is not None:
+            qkv = torch.concat([q, k, v], dim=-1)
+        return self.apply_qk_norm_rope(qkv, position_ids)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        position_ids: Optional[torch.IntTensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        attention_mask_data: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if attention_mask_data is not None:
+            assert isinstance(
+                attn_metadata, FlashInferAttentionMetadata
+            ), "Only FlashInfer backend supports custom attention mask currently."
+            assert attention_mask == CustomAttentionMask.CUSTOM
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=attention_mask,
+            attention_window_size=self.attention_window_size,
+            attention_mask_data=attention_mask_data,
+            **kwargs,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 MoE routing
+# ---------------------------------------------------------------------------
+class Gemma4Router(nn.Module):
+    """Router for Gemma4 MoE.
+
+    Applies: RMSNorm(no weight) -> scale * hidden_size^{-0.5} -> Linear proj
+    to produce raw logits for expert selection.
+    """
+
+    def __init__(self, config: Gemma4TextConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.scalar_root_size = self.hidden_size**-0.5
+
+        self.norm = RMSNorm(
+            hidden_size=self.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            has_weights=False,
+        )
+        self.scale = nn.Parameter(
+            torch.ones(self.hidden_size, dtype=config.torch_dtype))
+        self.proj = nn.Linear(config.hidden_size,
+                              config.num_experts,
+                              bias=False,
+                              dtype=config.torch_dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states * self.scale * self.scalar_root_size
+        return self.proj(hidden_states)
+
+
+class Gemma4MoeRoutingMethod(BaseMoeRoutingMethod):
+    """Gemma4 routing: softmax -> topk -> renormalize -> per_expert_scale.
+
+    The per_expert_scale is fetched at runtime via a callable so the parameter
+    stays on the correct device.
+    """
+
+    def __init__(self, top_k: int,
+                 callable_per_expert_scale: callable,
+                 output_dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.top_k = top_k
+        self.callable_per_expert_scale = callable_per_expert_scale
+        self.output_dtype = output_dtype
+
+    def apply(
+            self,
+            router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # softmax over all experts
+        router_probs = F.softmax(router_logits.to(self.output_dtype), dim=-1)
+        # top-k selection
+        topk_weights, topk_indices = torch.topk(router_probs,
+                                                 k=self.top_k,
+                                                 dim=-1)
+        # renormalize so selected weights sum to 1
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) +
+                                       1e-20)
+        # apply per-expert scale
+        per_expert_scale = self.callable_per_expert_scale()
+        expert_scales = per_expert_scale[topk_indices].to(topk_weights.dtype)
+        topk_weights = topk_weights * expert_scales
+        return topk_indices.to(torch.int32), topk_weights
+
+
+class Gemma4MoE(nn.Module):
+    """Gemma4 Mixture of Experts block.
+
+    Contains a router (for logit computation) and fused experts
+    dispatched via the custom Gemma4 routing method.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.router = Gemma4Router(config)
+        self.per_expert_scale = nn.Parameter(
+            torch.ones(config.num_experts, dtype=config.torch_dtype))
+
+        routing_method = Gemma4MoeRoutingMethod(
+            top_k=config.top_k_experts,
+            callable_per_expert_scale=lambda: self.per_expert_scale,
+        )
+
+        self.experts = create_moe(
+            routing_method=routing_method,
+            num_experts=config.num_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            dtype=config.torch_dtype,
+            reduce_results=True,
+            model_config=model_config,
+            layer_idx=layer_idx,
+            activation_type=ActivationType.Geglu,
+        )
+
+    def forward(self, hidden_states: torch.Tensor,
+                router_input: torch.Tensor) -> torch.Tensor:
+        router_logits = self.router(router_input)
+        return self.experts(hidden_states, router_logits)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 Decoder Layer
+# ---------------------------------------------------------------------------
+class Gemma4DecoderLayer(DecoderLayer):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+        layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        super().__init__()
+        self.layer_idx = layer_idx
+        config = model_config.pretrained_config
+
+        is_sliding = (config.layer_types[layer_idx] == "sliding_attention")
+        self.is_sliding = is_sliding
+
+        # Determine if this is a KV-shared layer
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers -
+            getattr(config, 'num_kv_shared_layers', 0))
+        self.is_kv_shared_layer = (layer_idx >= first_kv_shared_layer_idx > 0)
+
+        # Double-wide MLP for KV-shared layers when configured
+        intermediate_size = config.intermediate_size
+        if (getattr(config, 'use_double_wide_mlp', False)
+                and self.is_kv_shared_layer):
+            intermediate_size = config.intermediate_size * 2
+
+        # Attention
+        self.self_attn = Gemma4Attention(
+            model_config,
+            layer_idx=layer_idx,
+            is_sliding=is_sliding,
+        )
+
+        # Dense MLP
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            bias=False,
+            activation=gelu_tanh,
+            dtype=config.torch_dtype,
+            config=model_config,
+            layer_idx=layer_idx,
+        )
+
+        # Layer norms (same pattern as Gemma3)
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.pre_feedforward_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+
+        # Layer scalar
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+        # MoE block (parallel with dense MLP)
+        self.enable_moe_block = getattr(config, 'enable_moe_block', False)
+        if self.enable_moe_block:
+            self.moe = Gemma4MoE(model_config, layer_idx=layer_idx)
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.pre_feedforward_layernorm_2 = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+
+        # Per-Layer Embedding (PLE) components in decoder layer
+        self.hidden_size_per_layer_input = getattr(
+            config, 'hidden_size_per_layer_input', 0)
+        if self.hidden_size_per_layer_input:
+            ple_dim = self.hidden_size_per_layer_input
+            self.per_layer_input_gate = nn.Linear(config.hidden_size,
+                                                  ple_dim,
+                                                  bias=False,
+                                                  dtype=config.torch_dtype)
+            self.per_layer_projection = nn.Linear(ple_dim,
+                                                  config.hidden_size,
+                                                  bias=False,
+                                                  dtype=config.torch_dtype)
+            self.post_per_layer_input_norm = RMSNorm(
+                hidden_size=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
+        attention_mask_data: Optional[torch.Tensor] = None,
+        per_layer_input: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        # Self-attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=CustomAttentionMask.CUSTOM
+            if attention_mask_data is not None else
+            PredefinedAttentionMask.CAUSAL,
+            attention_mask_data=attention_mask_data,
+            **kwargs,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # Feed-forward (dense MLP + optional MoE in parallel)
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_params=kwargs.get("lora_params", None))
+
+        if self.enable_moe_block:
+            # MLP path: post-norm the MLP output
+            hidden_states_mlp = self.post_feedforward_layernorm_1(hidden_states)
+            # MoE path: router input is the residual (before MLP layernorm)
+            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
+            moe_input = self.pre_feedforward_layernorm_2(hidden_states_flat)
+            hidden_states_moe = self.moe(moe_input, hidden_states_flat)
+            hidden_states_moe = hidden_states_moe.reshape(residual.shape)
+            hidden_states_moe = self.post_feedforward_layernorm_2(
+                hidden_states_moe)
+            # Combine MLP + MoE
+            hidden_states = hidden_states_mlp + hidden_states_moe
+        else:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+
+        hidden_states = residual + hidden_states
+
+        # Per-Layer Embedding (PLE) injection
+        if self.hidden_size_per_layer_input and per_layer_input is not None:
+            residual = hidden_states
+            gate = F.gelu(self.per_layer_input_gate(hidden_states),
+                          approximate="tanh")
+            gated = gate * per_layer_input
+            projected = self.per_layer_projection(gated)
+            hidden_states = self.post_per_layer_input_norm(projected) + residual
+
+        # Layer scalar
+        hidden_states = hidden_states * self.layer_scalar
+
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 Text Model
+# ---------------------------------------------------------------------------
+class Gemma4TextModel(DecoderModel):
+
+    def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
+        super().__init__(model_config)
+        config = self.model_config
+        pretrained = config.pretrained_config
+        self.hidden_size = pretrained.hidden_size
+
+        self.embed_tokens = Gemma4TextScaledWordEmbedding(
+            pretrained.vocab_size,
+            pretrained.hidden_size,
+            dtype=pretrained.torch_dtype,
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
+            embed_scale=math.sqrt(pretrained.hidden_size),
+        )
+
+        self.layers = nn.ModuleList([
+            Gemma4DecoderLayer(model_config, layer_idx)
+            for layer_idx in range(pretrained.num_hidden_layers)
+        ])
+
+        self.norm = RMSNorm(
+            hidden_size=pretrained.hidden_size,
+            eps=pretrained.rms_norm_eps,
+            dtype=pretrained.torch_dtype,
+        )
+
+        # Per-Layer Embedding (PLE) model-level components
+        self.hidden_size_per_layer_input = getattr(
+            pretrained, 'hidden_size_per_layer_input', 0)
+        if self.hidden_size_per_layer_input:
+            ple_dim = self.hidden_size_per_layer_input
+            num_layers = pretrained.num_hidden_layers
+            vocab_size_ple = getattr(pretrained, 'vocab_size_per_layer_input',
+                                     pretrained.vocab_size)
+
+            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                vocab_size_ple,
+                num_layers * ple_dim,
+                dtype=pretrained.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                embed_scale=math.sqrt(ple_dim),
+            )
+
+            self.per_layer_model_projection = nn.Linear(
+                pretrained.hidden_size,
+                num_layers * ple_dim,
+                bias=False,
+                dtype=pretrained.torch_dtype,
+            )
+            self.per_layer_model_projection_scale = pretrained.hidden_size**-0.5
+            self.per_layer_projection_norm = RMSNorm(
+                hidden_size=ple_dim,
+                eps=pretrained.rms_norm_eps,
+                dtype=pretrained.torch_dtype,
+            )
+            self.per_layer_input_scale = 2.0**-0.5
+
+    def _compute_per_layer_inputs(
+        self,
+        input_ids: Optional[torch.Tensor],
+        inputs_embeds: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Compute combined per-layer embeddings + projections."""
+        if not self.hidden_size_per_layer_input:
+            return None
+        if input_ids is None:
+            return None
+
+        config = self.model_config.pretrained_config
+        num_layers = config.num_hidden_layers
+        ple_dim = self.hidden_size_per_layer_input
+
+        # Per-layer token embeddings: [N, num_layers * ple_dim]
+        per_layer_embed = self.embed_tokens_per_layer(input_ids)
+        per_layer_embed = per_layer_embed.reshape(-1, num_layers, ple_dim)
+
+        # Project main embeddings: [N, hidden_size] -> [N, num_layers * ple_dim]
+        projection = (self.per_layer_model_projection(inputs_embeds) *
+                      self.per_layer_model_projection_scale)
+        projection = projection.reshape(-1, num_layers, ple_dim)
+        projection = self.per_layer_projection_norm(projection)
+
+        # Combine and scale
+        per_layer_inputs = (projection +
+                            per_layer_embed) * self.per_layer_input_scale
+        return per_layer_inputs
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        local_attention_mask_data: Optional[torch.Tensor] = None,
+        global_attention_mask_data: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the "
+                "same time, and must specify either one")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = inputs_embeds.to(self.dtype)
+
+        # Compute PLE inputs
+        per_layer_inputs = self._compute_per_layer_inputs(
+            input_ids, hidden_states)
+
+        for i, decoder_layer in enumerate(self.layers):
+            per_layer_input = (per_layer_inputs[:, i, :]
+                               if per_layer_inputs is not None else None)
+
+            hidden_states = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask_data=local_attention_mask_data
+                if decoder_layer.is_sliding else global_attention_mask_data,
+                per_layer_input=per_layer_input,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 For Causal LM
+# ---------------------------------------------------------------------------
+@register_auto_model("Gemma4ForCausalLM")
+class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
+                                                Gemma4TextConfig]):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+    ):
+        super().__init__(
+            Gemma4TextModel(model_config),
+            config=model_config,
+            hidden_size=model_config.pretrained_config.hidden_size,
+            vocab_size=model_config.pretrained_config.vocab_size,
+        )
+
+    def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
+        """Build bidirectional attention mask from mm_token_type_ids.
+
+        mm_token_type_ids: 0=text, 1=image, 2=video (or any positive int for
+        a modality blob). Tokens within the same contiguous blob of the same
+        modality attend bidirectionally to each other.
+        """
+        device = mm_token_type_ids.device
+        sequence_length = len(mm_token_type_ids)
+
+        token_type_ids = mm_token_type_ids.clone()
+        # We only care about non-zero (multimodal) tokens
+        is_mm = (token_type_ids > 0)
+
+        # Detect blob boundaries: positions where type changes or goes 0->nonzero
+        padded = torch.cat(
+            (torch.tensor([0], device=device, dtype=token_type_ids.dtype),
+             token_type_ids))
+        # A new blob starts whenever the type changes and the current is nonzero
+        changes = (padded[1:] != padded[:-1]) & is_mm
+        blob_ids = torch.cumsum(changes.int(), dim=0)
+        # Mask out text tokens
+        blob_ids = blob_ids * is_mm.int()
+
+        # Tokens with the same non-zero blob_id attend bidirectionally
+        token_type_mask = blob_ids.unsqueeze(0) == blob_ids.unsqueeze(1)
+        # Only apply bidirectional mask for multimodal tokens
+        token_type_mask = torch.where(blob_ids == 0, False, token_type_mask)
+
+        return token_type_mask
+
+    def get_context_mask(
+        self,
+        mm_token_type_ids: torch.Tensor,
+        effective_sliding_window: Optional[int] = None,
+    ):
+        """Build context mask with causal + bidirectional for MM tokens."""
+        device = mm_token_type_ids.device
+        sequence_length = len(mm_token_type_ids)
+
+        if (effective_sliding_window is None
+                or effective_sliding_window >= sequence_length):
+            causal_mask = torch.arange(
+                sequence_length, device=device).unsqueeze(0) <= torch.arange(
+                    sequence_length, device=device).unsqueeze(1)
+        else:
+            pos = torch.arange(sequence_length, device=device)
+            causal_mask = ((pos.unsqueeze(0) <= pos.unsqueeze(1))
+                           & (pos.unsqueeze(0) >
+                              pos.unsqueeze(1) - effective_sliding_window))
+
+        token_type_mask = self._get_token_type_mask(mm_token_type_ids)
+        causal_mask = causal_mask.masked_fill(token_type_mask, True)
+        return causal_mask
+
+    def get_flashinfer_attention_mask(
+        self,
+        mm_token_type_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        effective_sliding_window: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Build FlashInfer custom mask for context requests."""
+        assert isinstance(
+            attn_metadata, FlashInferAttentionMetadata
+        ), "Only FlashInfer backend supports custom mask currently."
+        num_contexts = attn_metadata.num_contexts
+        assert num_contexts > 0
+
+        qo_indptr = attn_metadata.qo_indptr[:num_contexts + 1]
+        cached_token_lens = attn_metadata.cached_token_lens[:num_contexts]
+        assert (cached_token_lens == 0).all()
+
+        context_mask_list = []
+        for i in range(num_contexts):
+            mask_i = self.get_context_mask(
+                mm_token_type_ids=mm_token_type_ids[qo_indptr[i]:qo_indptr[i +
+                                                                            1]],
+                effective_sliding_window=effective_sliding_window,
+            )
+            context_mask_list.append(mask_i.flatten())
+        return torch.cat(context_mask_list, dim=0).contiguous()
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        local_attention_mask_data = None
+        global_attention_mask_data = None
+        if mm_token_type_ids is not None:
+            global_attention_mask_data = self.get_flashinfer_attention_mask(
+                mm_token_type_ids=mm_token_type_ids,
+                attn_metadata=attn_metadata,
+                effective_sliding_window=None,
+            )
+            local_attention_mask_data = self.get_flashinfer_attention_mask(
+                mm_token_type_ids=mm_token_type_ids,
+                attn_metadata=attn_metadata,
+                effective_sliding_window=self.config.sliding_window,
+            )
+
+        output = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            local_attention_mask_data=local_attention_mask_data,
+            global_attention_mask_data=global_attention_mask_data,
+            **kwargs,
+        )
+
+        logits = self.logits_processor.forward(
+            output,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
+
+        # Logit softcapping
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+
+        return logits
+
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
