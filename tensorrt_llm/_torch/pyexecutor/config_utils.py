@@ -257,7 +257,6 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
-# Gemma4 is natively supported by transformers>=5.5.0 via AutoConfig
 
 
 def load_pretrained_config(model_name_or_path: str,

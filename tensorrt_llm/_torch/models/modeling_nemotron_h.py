@@ -1071,6 +1071,3 @@ class NemotronHMTP(nn.Module):
                 lora_params=lora_params,
             )
         return hidden_states
-
-
-# nemotron_h is natively supported in transformers 5.x; skip manual registration.
