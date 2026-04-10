@@ -24,6 +24,7 @@ from transformers import Gemma4TextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -348,6 +349,8 @@ class Gemma4MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             activation_type=ActivationType.Geglu,
+            # VANILLA mode: preprocess_weights splits 3D gate_up_proj into per-expert w1/w3
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
 
     def forward(self, hidden_states: torch.Tensor, router_input: torch.Tensor) -> torch.Tensor:

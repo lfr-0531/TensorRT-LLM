@@ -429,6 +429,15 @@ GEMMA4_PLE_CONFIG = {
     "vocab_size_per_layer_input": 1024,
 }
 
+# MoE (Mixture of Experts) enabled
+GEMMA4_MOE_HF_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "enable_moe_block": True,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "moe_intermediate_size": 256,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
@@ -721,6 +730,17 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_ple_config(self):
         """Per-Layer Embeddings (PLE) enabled."""
         self._run_full_model_comparison(deepcopy(GEMMA4_PLE_CONFIG))
+
+    @torch.no_grad()
+    def test_moe_config(self):
+        """MoE (Mixture of Experts) enabled — tests router + expert dispatch."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_MOE_HF_CONFIG),
+            # MoE routing may differ slightly between fused and reference
+            atol=1.0,
+            rtol=1.0,
+            max_failed_frac=0.05,
+        )
 
 
 if __name__ == "__main__":
