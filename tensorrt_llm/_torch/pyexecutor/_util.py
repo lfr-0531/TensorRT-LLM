@@ -72,7 +72,11 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
         return MambaHybridCacheManager
     else:
-        return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
+        # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
+        # require KVCacheManagerV2 for per-layer buffer sizes.
+        needs_v2 = (kv_cache_config.use_kv_cache_manager_v2
+                    or is_gemma4_hybrid(config))
+        return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
 def is_vswa_enabled(kv_cache_config):
@@ -923,9 +927,9 @@ def _create_kv_cache_manager(
         head_dim = hidden_size // num_attention_heads
 
     # Gemma4: build per-layer head_dim and num_kv_heads for hybrid attention
-    layer_types = getattr(config, 'layer_types', None)
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    if layer_types and global_head_dim and global_head_dim != head_dim:
+    if is_gemma4_hybrid(config):
+        layer_types = config.layer_types
+        global_head_dim = config.global_head_dim
         attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
         num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
                                        None) or num_key_value_heads)

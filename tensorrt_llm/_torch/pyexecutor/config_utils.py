@@ -5,6 +5,14 @@ from typing import Optional
 import transformers
 
 
+def is_gemma4_hybrid(config):
+    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
+    global_head_dim = getattr(config, 'global_head_dim', None)
+    head_dim = getattr(config, 'head_dim', None)
+    return (global_head_dim is not None and isinstance(head_dim, int)
+            and global_head_dim != head_dim)
+
+
 def is_nemotron_hybrid(config):
     if hasattr(config, "hybrid_override_pattern"
                ) and config.hybrid_override_pattern is not None and len(
@@ -276,8 +284,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
     elif checkpoint_format in ("mistral", "mistral_large_3"):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
         model_config = getattr(
             MistralConfigLoader().load(model_name_or_path).pretrained_config,
             "text_config")

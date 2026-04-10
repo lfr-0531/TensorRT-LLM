@@ -472,6 +472,11 @@ class Gemma4DecoderLayer(DecoderLayer):
         per_layer_input: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Ensure dtype consistency (E2E warmup may pass float32)
+        target_dtype = self.input_layernorm.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
+
         # Self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -605,13 +610,16 @@ class Gemma4TextModel(DecoderModel):
 
         # Per-layer token embeddings: [N, num_layers * ple_dim]
         per_layer_embed = self.embed_tokens_per_layer(input_ids)
-        per_layer_embed = per_layer_embed.reshape(-1, num_layers, ple_dim)
+        per_layer_embed = per_layer_embed.reshape(-1, num_layers, ple_dim).to(self.dtype)
 
         # Project main embeddings: [N, hidden_size] -> [N, num_layers * ple_dim]
         projection = (
-            self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
+            self.per_layer_model_projection(
+                inputs_embeds.to(self.per_layer_model_projection.weight.dtype)
+            )
+            * self.per_layer_model_projection_scale
         )
-        projection = projection.reshape(-1, num_layers, ple_dim)
+        projection = projection.to(self.dtype).reshape(-1, num_layers, ple_dim)
         projection = self.per_layer_projection_norm(projection)
 
         # Combine and scale
@@ -826,3 +834,6 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights, weight_mapper)
+        # Ensure PLE nn.Linear modules match model dtype (weight loader may
+        # not handle raw nn.Linear correctly, leaving them as float32).
+        self.model._ensure_ple_dtype()
