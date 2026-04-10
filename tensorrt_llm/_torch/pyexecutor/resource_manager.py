@@ -1729,6 +1729,10 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.num_local_layers > 0:
                 for i in self.pp_layers:
                     self.head_dim_per_layer.append(head_dim[i])
+            if len(set(self.head_dim_per_layer)) > 1:
+                logger.info(
+                    f"Per-layer head_dim: {len(self.head_dim_per_layer)} layers, "
+                    f"unique values={set(self.head_dim_per_layer)}")
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 

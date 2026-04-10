@@ -422,6 +422,13 @@ GEMMA4_SOFTCAP_CONFIG = {
     "final_logit_softcapping": 30.0,
 }
 
+# PLE (Per-Layer Embeddings) enabled
+GEMMA4_PLE_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "hidden_size_per_layer_input": 32,
+    "vocab_size_per_layer_input": 1024,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
@@ -709,6 +716,11 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_softcap_config(self):
         """Logit softcapping enabled (cap=30.0)."""
         self._run_full_model_comparison(deepcopy(GEMMA4_SOFTCAP_CONFIG))
+
+    @torch.no_grad()
+    def test_ple_config(self):
+        """Per-Layer Embeddings (PLE) enabled."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_PLE_CONFIG))
 
 
 if __name__ == "__main__":
