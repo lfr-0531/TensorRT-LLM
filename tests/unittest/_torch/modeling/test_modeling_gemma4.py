@@ -23,12 +23,17 @@ import unittest
 from copy import deepcopy
 
 import torch
-
 from transformers import Gemma4Config, Gemma4TextConfig
+
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma4 import (
-    Gemma4Attention, Gemma4DecoderLayer, Gemma4ForCausalLM, Gemma4MoE,
-    Gemma4TextModel, Gemma4TextScaledWordEmbedding)
+    Gemma4Attention,
+    Gemma4DecoderLayer,
+    Gemma4ForCausalLM,
+    Gemma4MoE,
+    Gemma4TextModel,
+    Gemma4TextScaledWordEmbedding,
+)
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -137,13 +142,9 @@ class TestGemma4Config(unittest.TestCase):
         cfg = Gemma4TextConfig()
         self.assertIn("sliding_attention", cfg.rope_parameters)
         self.assertIn("full_attention", cfg.rope_parameters)
-        self.assertEqual(cfg.rope_parameters["sliding_attention"]["rope_theta"],
-                         10_000.0)
-        self.assertEqual(cfg.rope_parameters["full_attention"]["rope_theta"],
-                         1_000_000.0)
-        self.assertEqual(
-            cfg.rope_parameters["full_attention"]["partial_rotary_factor"],
-            0.25)
+        self.assertEqual(cfg.rope_parameters["sliding_attention"]["rope_theta"], 10_000.0)
+        self.assertEqual(cfg.rope_parameters["full_attention"]["rope_theta"], 1_000_000.0)
+        self.assertEqual(cfg.rope_parameters["full_attention"]["partial_rotary_factor"], 0.25)
 
     def test_gemma4_text_config_explicit_layer_types(self):
         """Explicitly provided layer_types should be preserved."""
@@ -219,11 +220,17 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         for i, layer in enumerate(model.model.layers):
             attn = layer.self_attn
             if config.layer_types[i] == "sliding_attention":
-                self.assertEqual(attn.head_dim, config.head_dim,
-                                 f"Layer {i} (sliding) should have head_dim={config.head_dim}")
+                self.assertEqual(
+                    attn.head_dim,
+                    config.head_dim,
+                    f"Layer {i} (sliding) should have head_dim={config.head_dim}",
+                )
             else:
-                self.assertEqual(attn.head_dim, config.global_head_dim,
-                                 f"Layer {i} (full) should have head_dim={config.global_head_dim}")
+                self.assertEqual(
+                    attn.head_dim,
+                    config.global_head_dim,
+                    f"Layer {i} (full) should have head_dim={config.global_head_dim}",
+                )
 
     def test_k_eq_v_attention(self):
         """Full attention layers with attention_k_eq_v=True should have v_norm."""
@@ -235,14 +242,13 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             attn = layer.self_attn
             if config.layer_types[i] == "full_attention":
                 # K=V should be active on full attention layers
-                self.assertTrue(attn.use_k_eq_v,
-                                f"Layer {i} (full) should have use_k_eq_v=True")
-                self.assertTrue(hasattr(attn, 'v_norm'),
-                                f"Layer {i} (full) should have v_norm")
+                self.assertTrue(attn.use_k_eq_v, f"Layer {i} (full) should have use_k_eq_v=True")
+                self.assertTrue(hasattr(attn, "v_norm"), f"Layer {i} (full) should have v_norm")
             else:
                 # Sliding layers should NOT use K=V
-                self.assertFalse(attn.use_k_eq_v,
-                                 f"Layer {i} (sliding) should have use_k_eq_v=False")
+                self.assertFalse(
+                    attn.use_k_eq_v, f"Layer {i} (sliding) should have use_k_eq_v=False"
+                )
 
     def test_k_eq_v_disabled(self):
         """When attention_k_eq_v=False, use_k_eq_v is False but v_norm still exists."""
@@ -254,7 +260,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         for layer in model.model.layers:
             self.assertFalse(layer.self_attn.use_k_eq_v)
             # v_norm is always present in Gemma4 (even when K!=V)
-            self.assertTrue(hasattr(layer.self_attn, 'v_norm'))
+            self.assertTrue(hasattr(layer.self_attn, "v_norm"))
 
     def test_layer_types(self):
         """Verify correct layer type assignment for default 5:1 pattern."""
@@ -263,12 +269,10 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         config = model_config.pretrained_config
 
         for i, layer in enumerate(model.model.layers):
-            expected_sliding = (config.layer_types[i] == "sliding_attention")
-            self.assertEqual(layer.is_sliding, expected_sliding,
-                             f"Layer {i} is_sliding mismatch")
+            expected_sliding = config.layer_types[i] == "sliding_attention"
+            self.assertEqual(layer.is_sliding, expected_sliding, f"Layer {i} is_sliding mismatch")
             if expected_sliding:
-                self.assertEqual(layer.self_attn.attention_window_size,
-                                 config.sliding_window)
+                self.assertEqual(layer.self_attn.attention_window_size, config.sliding_window)
             else:
                 self.assertIsNone(layer.self_attn.attention_window_size)
 
@@ -281,8 +285,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         embed = model.model.embed_tokens
         self.assertIsInstance(embed, Gemma4TextScaledWordEmbedding)
         expected_scale = math.sqrt(config.hidden_size)
-        self.assertAlmostEqual(embed.embed_scale.item(), expected_scale,
-                               places=4)
+        self.assertAlmostEqual(embed.embed_scale.item(), expected_scale, places=4)
 
     def test_logit_softcapping(self):
         """Verify final_logit_softcapping value is stored on the config."""
@@ -298,8 +301,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         # accessible through model.config (used in forward).
         # model_config.pretrained_config is stored as model.config
         # on DecoderModelForCausalLM subclasses (via model_config).
-        self.assertEqual(
-            model.model_config.pretrained_config.final_logit_softcapping, 30.0)
+        self.assertEqual(model.model_config.pretrained_config.final_logit_softcapping, 30.0)
 
     def test_no_logit_softcapping(self):
         """When softcapping is None, it should be stored as None."""
@@ -307,8 +309,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         config_dict["final_logit_softcapping"] = None
         model_config = _make_model_config(config_dict)
         model = Gemma4ForCausalLM(model_config)
-        self.assertIsNone(
-            model.model_config.pretrained_config.final_logit_softcapping)
+        self.assertIsNone(model.model_config.pretrained_config.final_logit_softcapping)
 
     def test_sliding_rope_params(self):
         """Sliding attention layers should use default RoPE with theta=10K."""
@@ -349,15 +350,18 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
                 expected_kv_heads = config.num_key_value_heads
             else:
                 expected_kv_heads = config.num_global_key_value_heads
-            self.assertEqual(attn.num_key_value_heads, expected_kv_heads,
-                             f"Layer {i} kv_heads mismatch")
+            self.assertEqual(
+                attn.num_key_value_heads, expected_kv_heads, f"Layer {i} kv_heads mismatch"
+            )
 
 
 # ---------------------------------------------------------------------------
 # HF reference comparison tests (sub-module + full model)
 # ---------------------------------------------------------------------------
 
-# Uniform head_dim config for comparisons (avoids per-layer head_dim issues)
+# --- Test configs for HF comparison ---
+
+# Uniform head_dim (baseline)
 GEMMA4_UNIFORM_CONFIG = {
     "model_type": "gemma4_text",
     "vocab_size": 1024,
@@ -390,23 +394,77 @@ GEMMA4_UNIFORM_CONFIG = {
     "attention_dropout": 0.0,
 }
 
+# Hybrid head_dim: sliding=64, full=128 (tests per-layer head_dim in KV cache)
+GEMMA4_HYBRID_HEADDIM_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "num_hidden_layers": 6,
+    "global_head_dim": 128,
+    "num_global_key_value_heads": 1,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {
+            "rope_type": "proportional",
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+        },
+    },
+}
+
+# K=V attention (full layers share k->v, no v_proj)
+GEMMA4_KEV_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "attention_k_eq_v": True,
+}
+
+# Logit softcapping enabled
+GEMMA4_SOFTCAP_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "final_logit_softcapping": 30.0,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
 
-    def _get_kv_cache_manager(self, config, num_blocks=1,
-                               tokens_per_block=128, batch_size=1):
+    def _get_kv_cache_manager(self, config, num_blocks=1, tokens_per_block=128, batch_size=1):
+        """Create KVCacheManagerV2 supporting per-layer head_dim."""
         import tensorrt_llm
-        from tensorrt_llm._torch.pyexecutor.resource_manager import \
-            KVCacheManagerV2
-        from tensorrt_llm.llmapi.llm_args import \
-            KvCacheConfig as KvCacheConfigV2
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
         dtype = config.torch_dtype
         if dtype == torch.half:
             kv_dtype = tensorrt_llm.bindings.DataType.HALF
         else:
             kv_dtype = tensorrt_llm.bindings.DataType.BF16
+
+        # Build per-layer head_dim and num_kv_heads lists
+        # (must match Gemma4Attention logic: global kv heads only for K=V layers)
+        layer_types = config.layer_types
+        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
+        head_dim_per_layer = []
+        num_kv_heads_per_layer = []
+        for lt in layer_types:
+            is_sliding = lt == "sliding_attention"
+            use_k_eq_v = attention_k_eq_v and not is_sliding
+            if is_sliding:
+                head_dim_per_layer.append(config.head_dim)
+                num_kv_heads_per_layer.append(config.num_key_value_heads)
+            else:
+                head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
+                if use_k_eq_v:
+                    num_kv_heads_per_layer.append(
+                        getattr(config, "num_global_key_value_heads", None)
+                        or config.num_key_value_heads
+                    )
+                else:
+                    num_kv_heads_per_layer.append(config.num_key_value_heads)
+
+        # Use scalar if all layers have same value
+        unique_hd = set(head_dim_per_layer)
+        head_dim = head_dim_per_layer if len(unique_hd) > 1 else head_dim_per_layer[0]
+        unique_kv = set(num_kv_heads_per_layer)
+        num_kv_heads = num_kv_heads_per_layer if len(unique_kv) > 1 else num_kv_heads_per_layer[0]
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         max_seq_len = num_blocks * tokens_per_block
@@ -418,8 +476,8 @@ class TestGemma4HFComparison(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=batch_size,
@@ -427,28 +485,30 @@ class TestGemma4HFComparison(unittest.TestCase):
             dtype=kv_dtype,
         )
 
-    def _assert_most_elems_close(self, actual, ref, atol=0.5, rtol=0.5,
-                                  max_failed_frac=0.01):
+    def _assert_most_elems_close(self, actual, ref, atol=0.5, rtol=0.5, max_failed_frac=0.01):
         matches = torch.isclose(actual, ref, atol=atol, rtol=rtol)
         failed = (~matches).float().mean().item()
         self.assertLessEqual(
-            failed, max_failed_frac,
-            f"{failed*100:.2f}% of elements differ (max {max_failed_frac*100}%)")
+            failed,
+            max_failed_frac,
+            f"{failed * 100:.2f}% of elements differ (max {max_failed_frac * 100}%)",
+        )
 
     def _make_hf_and_trt_models(self, config_dict=None):
         """Create paired HF and TRT-LLM models with shared weights."""
         from transformers import Gemma4ForCausalLM as HFGemma4
-        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import \
-            Gemma4HfWeightMapper
+
+        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import (
+            Gemma4HfWeightMapper,
+        )
 
         config_dict = config_dict or deepcopy(GEMMA4_UNIFORM_CONFIG)
         config = Gemma4TextConfig(**config_dict)
         dtype = config.torch_dtype
-        device = torch.device('cuda')
+        device = torch.device("cuda")
 
         hf_model = HFGemma4(config).to(dtype).to(device).eval()
-        model_config = ModelConfig(pretrained_config=config,
-                                    attn_backend="FLASHINFER")
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
         trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
 
         wm = Gemma4HfWeightMapper()
@@ -463,47 +523,47 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_embedding_matches_hf(self):
         """Embedding layer: scaled by sqrt(hidden_size)."""
         hf, trt, config = self._make_hf_and_trt_models()
-        ids = torch.tensor([100, 200, 300, 400], dtype=torch.int32, device='cuda')
+        ids = torch.tensor([100, 200, 300, 400], dtype=torch.int32, device="cuda")
 
         with torch.inference_mode():
             hf_out = hf.model.embed_tokens(ids.unsqueeze(0)).squeeze(0)
             trt_out = trt.model.embed_tokens(ids)
 
-        self.assertTrue(torch.allclose(hf_out, trt_out, atol=1e-3),
-                         f"Embedding max diff: {(hf_out - trt_out).abs().max()}")
+        self.assertTrue(
+            torch.allclose(hf_out, trt_out, atol=1e-3),
+            f"Embedding max diff: {(hf_out - trt_out).abs().max()}",
+        )
 
     @torch.no_grad()
     def test_mlp_matches_hf(self):
         """MLP (GatedMLP with gelu_tanh) output comparison."""
         hf, trt, config = self._make_hf_and_trt_models()
-        x = torch.randn(4, config.hidden_size, device='cuda',
-                          dtype=config.torch_dtype)
+        x = torch.randn(4, config.hidden_size, device="cuda", dtype=config.torch_dtype)
 
         with torch.inference_mode():
             hf_out = hf.model.layers[0].mlp(x.unsqueeze(0)).squeeze(0)
             trt_out = trt.model.layers[0].mlp(x)
 
-        self._assert_most_elems_close(trt_out.float(), hf_out.float(),
-                                       atol=0.01, rtol=0.01)
+        self._assert_most_elems_close(trt_out.float(), hf_out.float(), atol=0.01, rtol=0.01)
 
     @torch.no_grad()
     def test_rms_norm_matches_hf(self):
         """RMSNorm with Gemma +1 offset convention."""
         hf, trt, config = self._make_hf_and_trt_models()
-        x = torch.randn(4, config.hidden_size, device='cuda',
-                          dtype=config.torch_dtype)
+        x = torch.randn(4, config.hidden_size, device="cuda", dtype=config.torch_dtype)
 
         with torch.inference_mode():
             hf_out = hf.model.layers[0].input_layernorm(x.unsqueeze(0)).squeeze(0)
             trt_out = trt.model.layers[0].input_layernorm(x)
 
-        self.assertTrue(torch.allclose(hf_out, trt_out, atol=1e-2),
-                         f"Norm max diff: {(hf_out - trt_out).abs().max()}")
+        self.assertTrue(
+            torch.allclose(hf_out, trt_out, atol=1e-2),
+            f"Norm max diff: {(hf_out - trt_out).abs().max()}",
+        )
 
     @torch.no_grad()
     def test_logit_softcapping_matches_hf(self):
         """Final logit softcapping: tanh(x/cap) * cap."""
-        from transformers import Gemma4ForCausalLM as HFGemma4
 
         config_dict = deepcopy(GEMMA4_UNIFORM_CONFIG)
         config_dict["final_logit_softcapping"] = 30.0
@@ -511,63 +571,43 @@ class TestGemma4HFComparison(unittest.TestCase):
         config = Gemma4TextConfig(**config_dict)
 
         # Just test the softcapping math directly
-        logits = torch.randn(1, config.vocab_size, device='cuda')
+        logits = torch.randn(1, config.vocab_size, device="cuda")
         cap = config.final_logit_softcapping
         capped = torch.tanh(logits / cap) * cap
         # Verify values are bounded
         self.assertTrue((capped.abs() <= cap).all())
         # Verify small values are approximately unchanged
-        small = torch.tensor([[0.1, -0.1, 0.5]], device='cuda')
+        small = torch.tensor([[0.1, -0.1, 0.5]], device="cuda")
         small_capped = torch.tanh(small / cap) * cap
         self.assertTrue(torch.allclose(small, small_capped, atol=0.01))
 
-    @torch.no_grad()
-    def test_gemma4_allclose_to_hf(self):
-        """Compare context + generation logits between TRT-LLM and HF."""
-        from transformers import \
-            Gemma4ForCausalLM as HFGemma4ForCausalLM
+    # ---- Full model E2E comparison (context + generation) ----
+
+    def _run_full_model_comparison(self, config_dict, atol=0.5, rtol=0.5, max_failed_frac=0.01):
+        """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import \
-            get_attention_backend
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
-        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import \
-            Gemma4HfWeightMapper
 
         torch.random.manual_seed(42)
-
-        config_dict = deepcopy(GEMMA4_UNIFORM_CONFIG)
-        gemma4_config = Gemma4TextConfig(**config_dict)
-
-        dtype = gemma4_config.torch_dtype
-        device = torch.device('cuda')
-        backend = "FLASHINFER"
-
-        # Create HF reference model
-        hf_model = HFGemma4ForCausalLM(gemma4_config).to(dtype).to(
-            device).eval()
+        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
         hf_cache = DynamicCache()
 
-        # Create TRT-LLM model
-        model_config = ModelConfig(pretrained_config=gemma4_config,
-                                    attn_backend=backend)
-        trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
-
-        # Transfer weights HF -> TRT-LLM
-        weight_mapper = Gemma4HfWeightMapper()
-        weight_mapper.init_model_and_config(trt_model, model_config)
-        trt_model.load_weights(hf_model.state_dict(), weight_mapper)
+        device = torch.device("cuda")
+        backend = "FLASHINFER"
 
         # Set up KV cache
         num_blocks = 1
         tokens_per_block = 128
         kv_cache_manager = self._get_kv_cache_manager(
-            gemma4_config, num_blocks=num_blocks,
-            tokens_per_block=tokens_per_block)
+            gemma4_config, num_blocks=num_blocks, tokens_per_block=tokens_per_block
+        )
 
         # -- Context phase --
-        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
-                                  dtype=torch.int32, device=device)
+        input_ids = torch.tensor(
+            [100, 200, 300, 400, 500, 600, 700, 800], dtype=torch.int32, device=device
+        )
         request_ids = [1]
         token_nums = [input_ids.size(-1)]
         prompt_lens = [input_ids.size(-1)]
@@ -588,17 +628,17 @@ class TestGemma4HFComparison(unittest.TestCase):
             prompt_lens=prompt_lens,
         )
         position_ids = torch.arange(
-            0, input_ids.size(-1), dtype=torch.int32,
-            device=device).unsqueeze(0)
+            0, input_ids.size(-1), dtype=torch.int32, device=device
+        ).unsqueeze(0)
 
         with torch.inference_mode():
             attn_metadata.prepare()
-            trt_logits = trt_model.forward(
+            trt_logits = trt.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attn_metadata=attn_metadata,
             )
-            hf_out = hf_model.forward(
+            hf_out = hf.forward(
                 input_ids=input_ids.unsqueeze(0),
                 position_ids=position_ids,
                 past_key_values=hf_cache,
@@ -606,17 +646,18 @@ class TestGemma4HFComparison(unittest.TestCase):
             )
             hf_logits = hf_out.logits[:, -1].float()
 
-        self._assert_most_elems_close(trt_logits, hf_logits)
+        self._assert_most_elems_close(
+            trt_logits, hf_logits, atol=atol, rtol=rtol, max_failed_frac=max_failed_frac
+        )
 
         # -- Generation phase --
         gen_input_ids = torch.tensor([900], dtype=torch.int32, device=device)
-        num_cached_tokens_per_seq = [input_ids.size(-1)]
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+            seq_lens=torch.tensor([1], dtype=torch.int),
             num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                num_cached_tokens_per_seq=[input_ids.size(-1)],
             ),
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
@@ -624,20 +665,18 @@ class TestGemma4HFComparison(unittest.TestCase):
             max_num_requests=1,
             max_num_tokens=8192,
         )
-
         gen_position_ids = torch.arange(
-            input_ids.size(-1),
-            input_ids.size(-1) + gen_input_ids.size(-1),
-            dtype=torch.int32, device=device).unsqueeze(0)
+            input_ids.size(-1), input_ids.size(-1) + 1, dtype=torch.int32, device=device
+        ).unsqueeze(0)
 
         with torch.inference_mode():
             attn_metadata.prepare()
-            trt_logits = trt_model.forward(
+            trt_logits = trt.forward(
                 input_ids=gen_input_ids,
                 position_ids=gen_position_ids,
                 attn_metadata=attn_metadata,
             )
-            hf_out = hf_model.forward(
+            hf_out = hf.forward(
                 input_ids=gen_input_ids.unsqueeze(0),
                 position_ids=gen_position_ids,
                 past_key_values=hf_cache,
@@ -645,9 +684,31 @@ class TestGemma4HFComparison(unittest.TestCase):
             )
             hf_logits = hf_out.logits[:, -1].float()
 
-        self._assert_most_elems_close(trt_logits, hf_logits)
+        self._assert_most_elems_close(
+            trt_logits, hf_logits, atol=atol, rtol=rtol, max_failed_frac=max_failed_frac
+        )
 
         kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_uniform_config(self):
+        """Baseline: uniform head_dim, no K=V, no MoE, no PLE."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_UNIFORM_CONFIG))
+
+    @torch.no_grad()
+    def test_hybrid_headdim_config(self):
+        """Hybrid head_dim: sliding=64, full=128 (per-layer KV cache)."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_HYBRID_HEADDIM_CONFIG))
+
+    @torch.no_grad()
+    def test_kev_config(self):
+        """K=V attention: full layers share key→value, v_norm applied."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_KEV_CONFIG))
+
+    @torch.no_grad()
+    def test_softcap_config(self):
+        """Logit softcapping enabled (cap=30.0)."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_SOFTCAP_CONFIG))
 
 
 if __name__ == "__main__":

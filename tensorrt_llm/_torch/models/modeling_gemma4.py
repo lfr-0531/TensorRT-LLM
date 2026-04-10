@@ -20,38 +20,38 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from transformers import Gemma4TextConfig
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
-from tensorrt_llm._torch.modules.fused_moe.routing import \
-    BaseMoeRoutingMethod
+from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
-from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention_backend.interface import (
+    AttentionMask,
+    CustomAttentionMask,
+    PositionalEmbeddingParams,
+    PredefinedAttentionMask,
+    RopeParams,
+)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 
 # ---------------------------------------------------------------------------
 # Scaled embedding (reused from Gemma3 pattern)
 # ---------------------------------------------------------------------------
 class Gemma4TextScaledWordEmbedding(Embedding):
-
     def __init__(
         self,
         vocab_size: int,
@@ -93,7 +93,6 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
 # Gemma4 Attention
 # ---------------------------------------------------------------------------
 class Gemma4Attention(QKNormRoPEAttention):
-
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -104,35 +103,45 @@ class Gemma4Attention(QKNormRoPEAttention):
         config = model_config.pretrained_config
 
         # Per-layer head_dim and kv heads
+        # Note: num_global_key_value_heads is only used when K=V (alternative
+        # attention). For non-K=V full layers, use regular num_key_value_heads.
+        use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
         if is_sliding:
             layer_head_dim = config.head_dim
             layer_num_kv_heads = config.num_key_value_heads
         else:
-            layer_head_dim = getattr(config, 'global_head_dim',
-                                     config.head_dim)
-            layer_num_kv_heads = getattr(config, 'num_global_key_value_heads',
-                                         None) or config.num_key_value_heads
+            layer_head_dim = getattr(config, "global_head_dim", config.head_dim)
+            if use_k_eq_v:
+                layer_num_kv_heads = (
+                    getattr(config, "num_global_key_value_heads", None)
+                    or config.num_key_value_heads
+                )
+            else:
+                layer_num_kv_heads = config.num_key_value_heads
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
         rope_params.max_positions = config.max_position_embeddings
         if is_sliding:
             # Sliding: default RoPE, theta=10K, full rotation
-            rope_config = config.rope_parameters.get(
-                'sliding_attention', {}) if config.rope_parameters else {}
-            rope_params.theta = rope_config.get('rope_theta', 10_000.0)
+            rope_config = (
+                config.rope_parameters.get("sliding_attention", {})
+                if config.rope_parameters
+                else {}
+            )
+            rope_params.theta = rope_config.get("rope_theta", 10_000.0)
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
             rope_params.dim = layer_head_dim
         else:
             # Full: proportional RoPE, theta=1M, partial_rotary_factor=0.25
-            rope_config = config.rope_parameters.get(
-                'full_attention', {}) if config.rope_parameters else {}
-            rope_params.theta = rope_config.get('rope_theta', 1_000_000.0)
+            rope_config = (
+                config.rope_parameters.get("full_attention", {}) if config.rope_parameters else {}
+            )
+            rope_params.theta = rope_config.get("rope_theta", 1_000_000.0)
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
-            partial_rotary_factor = rope_config.get('partial_rotary_factor',
-                                                    0.25)
+            partial_rotary_factor = rope_config.get("partial_rotary_factor", 0.25)
             rope_params.dim = int(layer_head_dim * partial_rotary_factor)
 
         pos_embd_params = PositionalEmbeddingParams(
@@ -149,9 +158,8 @@ class Gemma4Attention(QKNormRoPEAttention):
         # For scaling=1.0: q_scaling = 1 / sqrt(head_dim)
         q_scaling = 1.0 / math.sqrt(layer_head_dim)
 
-        # K=V flag for non-sliding layers
-        self.use_k_eq_v = (getattr(config, 'attention_k_eq_v', False)
-                           and not is_sliding)
+        # K=V flag (already computed above)
+        self.use_k_eq_v = use_k_eq_v
 
         # Temporarily override config.head_dim so the Attention base class
         # picks up the correct per-layer head_dim.
@@ -186,8 +194,13 @@ class Gemma4Attention(QKNormRoPEAttention):
             has_weights=False,
         )
 
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+    def apply_rope(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+    ):
         # Split QKV, apply QK norm
         if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)
@@ -198,12 +211,10 @@ class Gemma4Attention(QKNormRoPEAttention):
                 v = k.clone()
 
             # Always apply v_norm (Gemma4 normalizes values regardless of K=V)
-            v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(
-                -1, self.kv_size)
+            v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(-1, self.kv_size)
 
             if not self.skip_rope:
-                return super(QKNormRoPEAttention,
-                             self).apply_rope(q, k, v, position_ids)
+                return super(QKNormRoPEAttention, self).apply_rope(q, k, v, position_ids)
             else:
                 return q, k, v
 
@@ -224,9 +235,9 @@ class Gemma4Attention(QKNormRoPEAttention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
-            assert isinstance(
-                attn_metadata, FlashInferAttentionMetadata
-            ), "Only FlashInfer backend supports custom attention mask currently."
+            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
+                "Only FlashInfer backend supports custom attention mask currently."
+            )
             assert attention_mask == CustomAttentionMask.CUSTOM
         return super().forward(
             position_ids=position_ids,
@@ -260,12 +271,10 @@ class Gemma4Router(nn.Module):
             dtype=config.torch_dtype,
             has_weights=False,
         )
-        self.scale = nn.Parameter(
-            torch.ones(self.hidden_size, dtype=config.torch_dtype))
-        self.proj = nn.Linear(config.hidden_size,
-                              config.num_experts,
-                              bias=False,
-                              dtype=config.torch_dtype)
+        self.scale = nn.Parameter(torch.ones(self.hidden_size, dtype=config.torch_dtype))
+        self.proj = nn.Linear(
+            config.hidden_size, config.num_experts, bias=False, dtype=config.torch_dtype
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.norm(hidden_states)
@@ -280,26 +289,24 @@ class Gemma4MoeRoutingMethod(BaseMoeRoutingMethod):
     stays on the correct device.
     """
 
-    def __init__(self, top_k: int,
-                 callable_per_expert_scale: callable,
-                 output_dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        top_k: int,
+        callable_per_expert_scale: callable,
+        output_dtype: torch.dtype = torch.float32,
+    ):
         super().__init__()
         self.top_k = top_k
         self.callable_per_expert_scale = callable_per_expert_scale
         self.output_dtype = output_dtype
 
-    def apply(
-            self,
-            router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def apply(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # softmax over all experts
         router_probs = F.softmax(router_logits.to(self.output_dtype), dim=-1)
         # top-k selection
-        topk_weights, topk_indices = torch.topk(router_probs,
-                                                 k=self.top_k,
-                                                 dim=-1)
+        topk_weights, topk_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
         # renormalize so selected weights sum to 1
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) +
-                                       1e-20)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
         # apply per-expert scale
         per_expert_scale = self.callable_per_expert_scale()
         expert_scales = per_expert_scale[topk_indices].to(topk_weights.dtype)
@@ -323,7 +330,8 @@ class Gemma4MoE(nn.Module):
         config = model_config.pretrained_config
         self.router = Gemma4Router(config)
         self.per_expert_scale = nn.Parameter(
-            torch.ones(config.num_experts, dtype=config.torch_dtype))
+            torch.ones(config.num_experts, dtype=config.torch_dtype)
+        )
 
         routing_method = Gemma4MoeRoutingMethod(
             top_k=config.top_k_experts,
@@ -342,8 +350,7 @@ class Gemma4MoE(nn.Module):
             activation_type=ActivationType.Geglu,
         )
 
-    def forward(self, hidden_states: torch.Tensor,
-                router_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, router_input: torch.Tensor) -> torch.Tensor:
         router_logits = self.router(router_input)
         return self.experts(hidden_states, router_logits)
 
@@ -352,7 +359,6 @@ class Gemma4MoE(nn.Module):
 # Gemma4 Decoder Layer
 # ---------------------------------------------------------------------------
 class Gemma4DecoderLayer(DecoderLayer):
-
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -362,19 +368,18 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
 
-        is_sliding = (config.layer_types[layer_idx] == "sliding_attention")
+        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.is_sliding = is_sliding
 
         # Determine if this is a KV-shared layer
-        first_kv_shared_layer_idx = (
-            config.num_hidden_layers -
-            getattr(config, 'num_kv_shared_layers', 0))
-        self.is_kv_shared_layer = (layer_idx >= first_kv_shared_layer_idx > 0)
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
 
         # Double-wide MLP for KV-shared layers when configured
         intermediate_size = config.intermediate_size
-        if (getattr(config, 'use_double_wide_mlp', False)
-                and self.is_kv_shared_layer):
+        if getattr(config, "use_double_wide_mlp", False) and self.is_kv_shared_layer:
             intermediate_size = config.intermediate_size * 2
 
         # Attention
@@ -421,7 +426,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.register_buffer("layer_scalar", torch.ones(1))
 
         # MoE block (parallel with dense MLP)
-        self.enable_moe_block = getattr(config, 'enable_moe_block', False)
+        self.enable_moe_block = getattr(config, "enable_moe_block", False)
         if self.enable_moe_block:
             self.moe = Gemma4MoE(model_config, layer_idx=layer_idx)
             self.post_feedforward_layernorm_1 = RMSNorm(
@@ -441,18 +446,15 @@ class Gemma4DecoderLayer(DecoderLayer):
             )
 
         # Per-Layer Embedding (PLE) components in decoder layer
-        self.hidden_size_per_layer_input = getattr(
-            config, 'hidden_size_per_layer_input', 0)
+        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
         if self.hidden_size_per_layer_input:
             ple_dim = self.hidden_size_per_layer_input
-            self.per_layer_input_gate = nn.Linear(config.hidden_size,
-                                                  ple_dim,
-                                                  bias=False,
-                                                  dtype=config.torch_dtype)
-            self.per_layer_projection = nn.Linear(ple_dim,
-                                                  config.hidden_size,
-                                                  bias=False,
-                                                  dtype=config.torch_dtype)
+            self.per_layer_input_gate = nn.Linear(
+                config.hidden_size, ple_dim, bias=False, dtype=config.torch_dtype
+            )
+            self.per_layer_projection = nn.Linear(
+                ple_dim, config.hidden_size, bias=False, dtype=config.torch_dtype
+            )
             self.post_per_layer_input_norm = RMSNorm(
                 hidden_size=config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -470,7 +472,6 @@ class Gemma4DecoderLayer(DecoderLayer):
         per_layer_input: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         # Self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -479,8 +480,8 @@ class Gemma4DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=CustomAttentionMask.CUSTOM
-            if attention_mask_data is not None else
-            PredefinedAttentionMask.CAUSAL,
+            if attention_mask_data is not None
+            else PredefinedAttentionMask.CAUSAL,
             attention_mask_data=attention_mask_data,
             **kwargs,
         )
@@ -490,8 +491,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Feed-forward (dense MLP + optional MoE in parallel)
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states,
-                                 lora_params=kwargs.get("lora_params", None))
+        hidden_states = self.mlp(hidden_states, lora_params=kwargs.get("lora_params", None))
 
         if self.enable_moe_block:
             # MLP path: post-norm the MLP output
@@ -501,8 +501,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             moe_input = self.pre_feedforward_layernorm_2(hidden_states_flat)
             hidden_states_moe = self.moe(moe_input, hidden_states_flat)
             hidden_states_moe = hidden_states_moe.reshape(residual.shape)
-            hidden_states_moe = self.post_feedforward_layernorm_2(
-                hidden_states_moe)
+            hidden_states_moe = self.post_feedforward_layernorm_2(hidden_states_moe)
             # Combine MLP + MoE
             hidden_states = hidden_states_mlp + hidden_states_moe
 
@@ -512,8 +511,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Per-Layer Embedding (PLE) injection
         if self.hidden_size_per_layer_input and per_layer_input is not None:
             residual = hidden_states
-            gate = F.gelu(self.per_layer_input_gate(hidden_states),
-                          approximate="tanh")
+            gate = F.gelu(self.per_layer_input_gate(hidden_states), approximate="tanh")
             gated = gate * per_layer_input
             projected = self.per_layer_projection(gated)
             hidden_states = self.post_per_layer_input_norm(projected) + residual
@@ -528,7 +526,6 @@ class Gemma4DecoderLayer(DecoderLayer):
 # Gemma4 Text Model
 # ---------------------------------------------------------------------------
 class Gemma4TextModel(DecoderModel):
-
     def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -545,10 +542,12 @@ class Gemma4TextModel(DecoderModel):
             embed_scale=math.sqrt(pretrained.hidden_size),
         )
 
-        self.layers = nn.ModuleList([
-            Gemma4DecoderLayer(model_config, layer_idx)
-            for layer_idx in range(pretrained.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Gemma4DecoderLayer(model_config, layer_idx)
+                for layer_idx in range(pretrained.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             hidden_size=pretrained.hidden_size,
@@ -557,13 +556,13 @@ class Gemma4TextModel(DecoderModel):
         )
 
         # Per-Layer Embedding (PLE) model-level components
-        self.hidden_size_per_layer_input = getattr(
-            pretrained, 'hidden_size_per_layer_input', 0)
+        self.hidden_size_per_layer_input = getattr(pretrained, "hidden_size_per_layer_input", 0)
         if self.hidden_size_per_layer_input:
             ple_dim = self.hidden_size_per_layer_input
             num_layers = pretrained.num_hidden_layers
-            vocab_size_ple = getattr(pretrained, 'vocab_size_per_layer_input',
-                                     pretrained.vocab_size)
+            vocab_size_ple = getattr(
+                pretrained, "vocab_size_per_layer_input", pretrained.vocab_size
+            )
 
             self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
                 vocab_size_ple,
@@ -609,14 +608,14 @@ class Gemma4TextModel(DecoderModel):
         per_layer_embed = per_layer_embed.reshape(-1, num_layers, ple_dim)
 
         # Project main embeddings: [N, hidden_size] -> [N, num_layers * ple_dim]
-        projection = (self.per_layer_model_projection(inputs_embeds) *
-                      self.per_layer_model_projection_scale)
+        projection = (
+            self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
+        )
         projection = projection.reshape(-1, num_layers, ple_dim)
         projection = self.per_layer_projection_norm(projection)
 
         # Combine and scale
-        per_layer_inputs = (projection +
-                            per_layer_embed) * self.per_layer_input_scale
+        per_layer_inputs = (projection + per_layer_embed) * self.per_layer_input_scale
         return per_layer_inputs
 
     def _ensure_ple_dtype(self):
@@ -625,15 +624,17 @@ class Gemma4TextModel(DecoderModel):
         if not self.hidden_size_per_layer_input:
             return
         target = self.dtype
-        for mod in [self.per_layer_model_projection,
-                     self.per_layer_projection_norm]:
-            if hasattr(mod, 'weight') and mod.weight.dtype != target:
+        for mod in [self.per_layer_model_projection, self.per_layer_projection_norm]:
+            if hasattr(mod, "weight") and mod.weight.dtype != target:
                 mod.to(target)
         for layer in self.layers:
-            for name in ['per_layer_input_gate', 'per_layer_projection',
-                         'post_per_layer_input_norm']:
+            for name in [
+                "per_layer_input_gate",
+                "per_layer_projection",
+                "post_per_layer_input_norm",
+            ]:
                 mod = getattr(layer, name, None)
-                if mod is not None and hasattr(mod, 'weight') and mod.weight.dtype != target:
+                if mod is not None and hasattr(mod, "weight") and mod.weight.dtype != target:
                     mod.to(target)
 
     @torch.inference_mode()
@@ -650,7 +651,8 @@ class Gemma4TextModel(DecoderModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the "
-                "same time, and must specify either one")
+                "same time, and must specify either one"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -658,19 +660,18 @@ class Gemma4TextModel(DecoderModel):
         hidden_states = inputs_embeds.to(self.dtype)
 
         # Compute PLE inputs
-        per_layer_inputs = self._compute_per_layer_inputs(
-            input_ids, hidden_states)
+        per_layer_inputs = self._compute_per_layer_inputs(input_ids, hidden_states)
 
         for i, decoder_layer in enumerate(self.layers):
-            per_layer_input = (per_layer_inputs[:, i, :]
-                               if per_layer_inputs is not None else None)
+            per_layer_input = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
 
             hidden_states = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 attention_mask_data=local_attention_mask_data
-                if decoder_layer.is_sliding else global_attention_mask_data,
+                if decoder_layer.is_sliding
+                else global_attention_mask_data,
                 per_layer_input=per_layer_input,
                 **kwargs,
             )
@@ -683,9 +684,7 @@ class Gemma4TextModel(DecoderModel):
 # Gemma4 For Causal LM
 # ---------------------------------------------------------------------------
 @register_auto_model("Gemma4ForCausalLM")
-class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
-                                                Gemma4TextConfig]):
-
+class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -705,16 +704,14 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
         modality attend bidirectionally to each other.
         """
         device = mm_token_type_ids.device
-        sequence_length = len(mm_token_type_ids)
-
         token_type_ids = mm_token_type_ids.clone()
         # We only care about non-zero (multimodal) tokens
-        is_mm = (token_type_ids > 0)
+        is_mm = token_type_ids > 0
 
         # Detect blob boundaries: positions where type changes or goes 0->nonzero
         padded = torch.cat(
-            (torch.tensor([0], device=device, dtype=token_type_ids.dtype),
-             token_type_ids))
+            (torch.tensor([0], device=device, dtype=token_type_ids.dtype), token_type_ids)
+        )
         # A new blob starts whenever the type changes and the current is nonzero
         changes = (padded[1:] != padded[:-1]) & is_mm
         blob_ids = torch.cumsum(changes.int(), dim=0)
@@ -737,16 +734,15 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
         device = mm_token_type_ids.device
         sequence_length = len(mm_token_type_ids)
 
-        if (effective_sliding_window is None
-                or effective_sliding_window >= sequence_length):
-            causal_mask = torch.arange(
-                sequence_length, device=device).unsqueeze(0) <= torch.arange(
-                    sequence_length, device=device).unsqueeze(1)
+        if effective_sliding_window is None or effective_sliding_window >= sequence_length:
+            causal_mask = torch.arange(sequence_length, device=device).unsqueeze(0) <= torch.arange(
+                sequence_length, device=device
+            ).unsqueeze(1)
         else:
             pos = torch.arange(sequence_length, device=device)
-            causal_mask = ((pos.unsqueeze(0) <= pos.unsqueeze(1))
-                           & (pos.unsqueeze(0) >
-                              pos.unsqueeze(1) - effective_sliding_window))
+            causal_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)) & (
+                pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window
+            )
 
         token_type_mask = self._get_token_type_mask(mm_token_type_ids)
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
@@ -759,21 +755,20 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
         """Build FlashInfer custom mask for context requests."""
-        assert isinstance(
-            attn_metadata, FlashInferAttentionMetadata
-        ), "Only FlashInfer backend supports custom mask currently."
+        assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
+            "Only FlashInfer backend supports custom mask currently."
+        )
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
-        qo_indptr = attn_metadata.qo_indptr[:num_contexts + 1]
+        qo_indptr = attn_metadata.qo_indptr[: num_contexts + 1]
         cached_token_lens = attn_metadata.cached_token_lens[:num_contexts]
         assert (cached_token_lens == 0).all()
 
         context_mask_list = []
         for i in range(num_contexts):
             mask_i = self.get_context_mask(
-                mm_token_type_ids=mm_token_type_ids[qo_indptr[i]:qo_indptr[i +
-                                                                            1]],
+                mm_token_type_ids=mm_token_type_ids[qo_indptr[i] : qo_indptr[i + 1]],
                 effective_sliding_window=effective_sliding_window,
             )
             context_mask_list.append(mask_i.flatten())
@@ -790,7 +785,6 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         local_attention_mask_data = None
         global_attention_mask_data = None
         if mm_token_type_ids is not None:
