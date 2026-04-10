@@ -14,9 +14,8 @@
 # limitations under the License.
 """Unit tests for the Gemma4 model (PyTorch backend).
 
-Since the installed transformers==4.57.3 does not support Gemma4, we cannot
-perform HF comparison tests. Instead these tests validate config parsing,
-model instantiation, and structural correctness.
+Includes structural tests and HF reference comparison tests using native
+transformers>=5.5.0 Gemma4 support.
 """
 
 import math
@@ -246,7 +245,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
                                  f"Layer {i} (sliding) should have use_k_eq_v=False")
 
     def test_k_eq_v_disabled(self):
-        """When attention_k_eq_v=False, no layers should have v_norm."""
+        """When attention_k_eq_v=False, use_k_eq_v is False but v_norm still exists."""
         config_dict = deepcopy(GEMMA4_SMALL_CONFIG)
         config_dict["attention_k_eq_v"] = False
         model_config = _make_model_config(config_dict)
@@ -254,7 +253,8 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
 
         for layer in model.model.layers:
             self.assertFalse(layer.self_attn.use_k_eq_v)
-            self.assertFalse(hasattr(layer.self_attn, 'v_norm'))
+            # v_norm is always present in Gemma4 (even when K!=V)
+            self.assertTrue(hasattr(layer.self_attn, 'v_norm'))
 
     def test_layer_types(self):
         """Verify correct layer type assignment for default 5:1 pattern."""
@@ -351,6 +351,218 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
                 expected_kv_heads = config.num_global_key_value_heads
             self.assertEqual(attn.num_key_value_heads, expected_kv_heads,
                              f"Layer {i} kv_heads mismatch")
+
+
+# ---------------------------------------------------------------------------
+# HF reference comparison tests
+# ---------------------------------------------------------------------------
+
+# Config with UNIFORM head_dim (all sliding) to avoid per-layer head_dim
+# issues before C++ rebuild. This tests core model logic.
+GEMMA4_UNIFORM_CONFIG = {
+    "model_type": "gemma4_text",
+    "vocab_size": 1024,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "num_hidden_layers": 6,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "global_head_dim": 64,  # Same as head_dim -> uniform
+    "num_global_key_value_heads": 2,  # Same as num_key_value_heads
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 1024,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 128,
+    "attention_k_eq_v": False,
+    "enable_moe_block": False,
+    "num_kv_shared_layers": 0,
+    "hidden_size_per_layer_input": 0,
+    "use_double_wide_mlp": False,
+    "final_logit_softcapping": None,
+    "use_bidirectional_attention": None,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {"rope_type": "default", "rope_theta": 10000.0},
+    },
+    "torch_dtype": "bfloat16",
+    "tie_word_embeddings": True,
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+}
+
+
+class TestGemma4HFComparison(unittest.TestCase):
+    """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
+
+    def _get_kv_cache_manager(self, config, num_blocks=1,
+                               tokens_per_block=128, batch_size=1):
+        import tensorrt_llm
+        from tensorrt_llm._torch.pyexecutor.resource_manager import \
+            KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import \
+            KvCacheConfig as KvCacheConfigV2
+
+        dtype = config.torch_dtype
+        if dtype == torch.half:
+            kv_dtype = tensorrt_llm.bindings.DataType.HALF
+        else:
+            kv_dtype = tensorrt_llm.bindings.DataType.BF16
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        max_seq_len = num_blocks * tokens_per_block
+        kv_cache_config = KvCacheConfigV2(
+            max_tokens=num_blocks * tokens_per_block,
+            enable_block_reuse=False,
+        )
+        return KVCacheManagerV2(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_dtype,
+        )
+
+    def _assert_most_elems_close(self, actual, ref, atol=0.5, rtol=0.5,
+                                  max_failed_frac=0.01):
+        matches = torch.isclose(actual, ref, atol=atol, rtol=rtol)
+        failed = (~matches).float().mean().item()
+        self.assertLessEqual(
+            failed, max_failed_frac,
+            f"{failed*100:.2f}% of elements differ (max {max_failed_frac*100}%)")
+
+    @torch.no_grad()
+    def test_gemma4_allclose_to_hf(self):
+        """Compare context + generation logits between TRT-LLM and HF."""
+        from transformers import \
+            Gemma4ForCausalLM as HFGemma4ForCausalLM
+        from transformers.cache_utils import DynamicCache
+
+        from tensorrt_llm._torch.attention_backend.utils import \
+            get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import \
+            Gemma4HfWeightMapper
+
+        torch.random.manual_seed(42)
+
+        config_dict = deepcopy(GEMMA4_UNIFORM_CONFIG)
+        gemma4_config = Gemma4TextConfig(**config_dict)
+
+        dtype = gemma4_config.torch_dtype
+        device = torch.device('cuda')
+        backend = "FLASHINFER"
+
+        # Create HF reference model
+        hf_model = HFGemma4ForCausalLM(gemma4_config).to(dtype).to(
+            device).eval()
+        hf_cache = DynamicCache()
+
+        # Create TRT-LLM model
+        model_config = ModelConfig(pretrained_config=gemma4_config,
+                                    attn_backend=backend)
+        trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
+
+        # Transfer weights HF -> TRT-LLM
+        weight_mapper = Gemma4HfWeightMapper()
+        weight_mapper.init_model_and_config(trt_model, model_config)
+        trt_model.load_weights(hf_model.state_dict(), weight_mapper)
+
+        # Set up KV cache
+        num_blocks = 1
+        tokens_per_block = 128
+        kv_cache_manager = self._get_kv_cache_manager(
+            gemma4_config, num_blocks=num_blocks,
+            tokens_per_block=tokens_per_block)
+
+        # -- Context phase --
+        input_ids = torch.tensor([100, 200, 300, 400, 500, 600, 700, 800],
+                                  dtype=torch.int32, device=device)
+        request_ids = [1]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend(backend).Metadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+        position_ids = torch.arange(
+            0, input_ids.size(-1), dtype=torch.int32,
+            device=device).unsqueeze(0)
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            trt_logits = trt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attn_metadata=attn_metadata,
+            )
+            hf_out = hf_model.forward(
+                input_ids=input_ids.unsqueeze(0),
+                position_ids=position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
+            hf_logits = hf_out.logits[:, -1].float()
+
+        self._assert_most_elems_close(trt_logits, hf_logits)
+
+        # -- Generation phase --
+        gen_input_ids = torch.tensor([900], dtype=torch.int32, device=device)
+        num_cached_tokens_per_seq = [input_ids.size(-1)]
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_requests=1,
+            max_num_tokens=8192,
+        )
+
+        gen_position_ids = torch.arange(
+            input_ids.size(-1),
+            input_ids.size(-1) + gen_input_ids.size(-1),
+            dtype=torch.int32, device=device).unsqueeze(0)
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            trt_logits = trt_model.forward(
+                input_ids=gen_input_ids,
+                position_ids=gen_position_ids,
+                attn_metadata=attn_metadata,
+            )
+            hf_out = hf_model.forward(
+                input_ids=gen_input_ids.unsqueeze(0),
+                position_ids=gen_position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
+            hf_logits = hf_out.logits[:, -1].float()
+
+        self._assert_most_elems_close(trt_logits, hf_logits)
+
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":
