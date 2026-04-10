@@ -737,6 +737,8 @@ class Gemma4TextModel(DecoderModel):
                 **kwargs,
             )
 
+        if hidden_states.dtype != self.dtype:
+            hidden_states = hidden_states.to(self.dtype)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 

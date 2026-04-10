@@ -959,8 +959,15 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
-    # Use provided num_layers if available, otherwise use config
-    num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+    # Use provided num_layers if available, otherwise use config.
+    # When layer_mask is set (e.g., KV sharing), num_layers for the cache
+    # manager must equal the number of enabled (True) layers in the mask.
+    if num_layers is not None:
+        num_hidden_layers = num_layers
+    elif layer_mask is not None:
+        num_hidden_layers = sum(layer_mask)
+    else:
+        num_hidden_layers = config.num_hidden_layers
     # Only include draft KV heads in the per-layer list when draft layers
     # are NOT handled by a separate draft KV cache manager.  When layer_mask
     # is provided from the caller, it means the main KV cache covers only
