@@ -9,6 +9,8 @@ from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -51,6 +53,8 @@ __all__ = [
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
