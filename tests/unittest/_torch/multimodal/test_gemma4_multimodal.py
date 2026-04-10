@@ -78,6 +78,192 @@ SMALL_TEXT_CONFIG = {
 }
 
 
+MODEL_26B_PATH = "/home/scratch.fanrongl_coreai/models/gemma4/gemma-4-26B-A4B-it"
+
+
+def _model_available():
+    import os
+    return os.path.isfile(os.path.join(MODEL_26B_PATH, "config.json"))
+
+
+class TestGemma4InputProcessor(unittest.TestCase):
+    """Tests for Gemma4InputProcessor with real model tokenizer/processor files."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _model_available():
+            raise unittest.SkipTest(
+                f"Gemma4 model not found at {MODEL_26B_PATH}")
+
+        from transformers import AutoConfig, AutoTokenizer
+
+        cls.config = AutoConfig.from_pretrained(MODEL_26B_PATH)
+        cls.tokenizer = AutoTokenizer.from_pretrained(MODEL_26B_PATH)
+
+    def _make_processor(self):
+        from tensorrt_llm._torch.models.modeling_gemma4mm import (
+            Gemma4InputProcessor,
+        )
+        return Gemma4InputProcessor(
+            model_path=MODEL_26B_PATH,
+            config=self.config,
+            tokenizer=self.tokenizer,
+            trust_remote_code=True,
+        )
+
+    def test_instantiation(self):
+        """Input processor initializes with AutoProcessor."""
+        proc = self._make_processor()
+        self.assertIsNotNone(proc._processor)
+        self.assertIsNotNone(proc._image_processor)
+        self.assertEqual(proc.model_path, MODEL_26B_PATH)
+
+    def test_text_only_processing(self):
+        """Text-only input returns input_ids without multimodal data."""
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        inputs = {"prompt": "Hello, how are you?"}
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsInstance(input_ids, list)
+        self.assertGreater(len(input_ids), 0)
+        self.assertIsNone(mm_data)
+
+    def test_image_processing(self):
+        """Image input returns input_ids + pixel_values in multimodal data."""
+        import numpy as np
+        from PIL import Image
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        img = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
+        # Use chat template to properly format the prompt
+        prompt = proc._processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Describe."},
+            ]}],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"image": [img]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsInstance(input_ids, list)
+        self.assertGreater(len(input_ids), 0)
+        self.assertIsNotNone(mm_data)
+        self.assertIn("multimodal_data", mm_data)
+        self.assertIn("image", mm_data["multimodal_data"])
+        img_data = mm_data["multimodal_data"]["image"]
+        self.assertIn("pixel_values", img_data)
+        self.assertEqual(img_data["pixel_values"].dim(), 3)  # [num_images, patches, channels]
+
+    def test_image_token_expansion(self):
+        """Chat template expands <image> placeholder to image tokens."""
+        import numpy as np
+        from PIL import Image
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        img = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
+        prompt = proc._processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": "What is this?"},
+            ]}],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"image": [img]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, _ = proc(inputs, sp)
+
+        image_token_id = self.config.image_token_id
+        image_count = sum(1 for t in input_ids if t == image_token_id)
+        # Image should be expanded to multiple image tokens
+        self.assertGreater(image_count, 0,
+                           "Expected image tokens in expanded input_ids")
+
+    def test_multiple_images(self):
+        """Multiple images are handled correctly."""
+        import numpy as np
+        from PIL import Image
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        img1 = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+        img2 = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
+        prompt = proc._processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image"},
+                {"type": "image"},
+                {"type": "text", "text": "Compare these images."},
+            ]}],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"image": [img1, img2]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsNotNone(mm_data)
+        pv = mm_data["multimodal_data"]["image"]["pixel_values"]
+        # Two images should give batch dim of 2
+        self.assertEqual(pv.shape[0], 2)
+
+    def test_torch_tensor_image(self):
+        """Torch tensor images disable rescaling."""
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        # Create a float tensor image (already rescaled)
+        img_tensor = torch.randn(3, 224, 224)
+
+        prompt = proc._processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Describe."},
+            ]}],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"image": [img_tensor]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsNotNone(mm_data)
+        self.assertIn("pixel_values", mm_data["multimodal_data"]["image"])
+
+    def test_processor_properties(self):
+        """Verify processor property accessors."""
+        proc = self._make_processor()
+        self.assertIs(proc.config, self.config)
+        self.assertIs(proc.tokenizer, self.tokenizer)
+        self.assertEqual(proc.model_path, MODEL_26B_PATH)
+        self.assertIsNotNone(proc.processor)
+
+
 class TestGemma4MultimodalEmbedder(unittest.TestCase):
     """Test the multimodal embedder projection layer."""
 
@@ -103,6 +289,8 @@ class TestGemma4MultimodalEmbedder(unittest.TestCase):
             .to("cuda")
             .to(torch.bfloat16)
         )
+        # Initialize with non-zero weights to avoid zero-output edge cases
+        torch.nn.init.xavier_uniform_(embedder.embedding_projection.weight.data)
 
         x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
         with torch.inference_mode():
@@ -157,6 +345,104 @@ class TestGemma4VisionTower(unittest.TestCase):
         self.assertIsNotNone(tower)
         params = sum(p.numel() for p in tower.parameters())
         self.assertGreater(params, 0)
+
+    @torch.no_grad()
+    def test_vision_tower_forward(self):
+        """Vision tower forward pass produces valid output with correct shape."""
+        vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        dtype = torch.bfloat16
+        device = "cuda"
+
+        tower = AutoModel.from_config(vision_cfg).to(dtype).to(device).eval()
+
+        # 6x6 = 36 patches, pixel_values shape: [B, N_patches, patch_size^2 * 3]
+        B, side = 1, 6
+        N_patches = side * side
+        C_in = vision_cfg.patch_size ** 2 * 3  # 16*16*3 = 768
+        pixel_values = torch.randn(B, N_patches, C_in, device=device, dtype=dtype)
+        position_ids = torch.stack(
+            torch.meshgrid(
+                torch.arange(side, device=device),
+                torch.arange(side, device=device),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(1, -1, 2)
+
+        pooling_k2 = vision_cfg.pooling_kernel_size ** 2
+        output_length = N_patches // pooling_k2
+
+        with torch.inference_mode():
+            out = tower(pixel_values, position_ids, output_length=output_length)
+
+        hidden = out.last_hidden_state
+        self.assertEqual(hidden.shape, torch.Size([output_length, vision_cfg.hidden_size]))
+        self.assertFalse(hidden.isnan().any(), "Vision tower output contains NaN")
+
+    @torch.no_grad()
+    def test_vision_pipeline_matches_hf(self):
+        """Full vision pipeline (tower → embedder) matches HF reference."""
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4MultimodalEmbedder as HFEmbedder,
+            Gemma4VisionModel as HFVisionModel,
+        )
+
+        vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        text_cfg = Gemma4TextConfig(**SMALL_TEXT_CONFIG)
+        dtype = torch.bfloat16
+        device = "cuda"
+
+        # --- HF reference pipeline ---
+        hf_tower = HFVisionModel(vision_cfg).to(dtype).to(device).eval()
+        hf_embedder = HFEmbedder(vision_cfg, text_cfg).to(dtype).to(device).eval()
+
+        # --- TRT-LLM pipeline (same tower class + our embedder) ---
+        trt_tower = AutoModel.from_config(vision_cfg).to(dtype).to(device).eval()
+        trt_embedder = Gemma4MultimodalEmbedder(
+            mm_hidden_size=vision_cfg.hidden_size,
+            text_hidden_size=text_cfg.hidden_size,
+            eps=vision_cfg.rms_norm_eps,
+            dtype=dtype,
+        ).to(device)
+
+        # Copy weights: tower
+        trt_tower.load_state_dict(hf_tower.state_dict())
+        # Copy weights: embedder
+        trt_embedder.embedding_projection.weight.data.copy_(
+            hf_embedder.embedding_projection.weight.data
+        )
+
+        # Dummy input: 6x6 = 36 patches
+        side = 6
+        N_patches = side * side
+        C_in = vision_cfg.patch_size ** 2 * 3
+        pixel_values = torch.randn(1, N_patches, C_in, device=device, dtype=dtype)
+        position_ids = torch.stack(
+            torch.meshgrid(
+                torch.arange(side, device=device),
+                torch.arange(side, device=device),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(1, -1, 2)
+
+        pooling_k2 = vision_cfg.pooling_kernel_size ** 2
+        output_length = N_patches // pooling_k2
+
+        with torch.inference_mode():
+            # HF pipeline
+            hf_hidden = hf_tower(pixel_values, position_ids, output_length=output_length)
+            hf_out = hf_embedder(hf_hidden.last_hidden_state)
+
+            # TRT-LLM pipeline
+            trt_hidden = trt_tower(pixel_values, position_ids, output_length=output_length)
+            trt_out = trt_embedder(trt_hidden.last_hidden_state.unsqueeze(0)).squeeze(0)
+
+        self.assertEqual(hf_out.shape, trt_out.shape)
+        self.assertTrue(
+            torch.allclose(hf_out, trt_out, atol=1e-2),
+            f"Vision pipeline max diff: {(hf_out - trt_out).abs().max():.6f}",
+        )
 
 
 class TestGemma4ForConditionalGeneration(unittest.TestCase):
