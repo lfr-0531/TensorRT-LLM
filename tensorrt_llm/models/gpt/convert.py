@@ -29,8 +29,10 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq,
-                          AutoTokenizer)
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# AutoModelForVision2Seq was removed in transformers 5.x
+AutoModelForVision2Seq = None
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 

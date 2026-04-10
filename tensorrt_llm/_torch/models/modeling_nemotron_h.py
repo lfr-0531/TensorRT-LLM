@@ -1073,4 +1073,4 @@ class NemotronHMTP(nn.Module):
         return hidden_states
 
 
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)
+# nemotron_h is natively supported in transformers 5.x; skip manual registration.
