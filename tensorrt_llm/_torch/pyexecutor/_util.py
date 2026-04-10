@@ -5,11 +5,12 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (confidential_compute_enabled,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
+from tensorrt_llm._utils import (
+    confidential_compute_enabled,
+    str_dtype_to_binding,
+    torch_dtype_to_str,
+)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
@@ -20,17 +21,19 @@ from tensorrt_llm.llmapi.llm_args import (
     WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid)
+from ..speculative import (
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+    get_spec_decoder,
+    should_use_separate_draft_kv_cache,
+)
+from .config_utils import get_qwen3_hybrid_layer_masks, is_mla, is_nemotron_hybrid, is_qwen3_hybrid
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -39,14 +42,21 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, KVCacheManagerV2,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
-from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+from .resource_manager import (
+    KVCacheManager,
+    KVCacheManagerV2,
+    PeftCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler, TRTLLMSampler
+from .scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    KVCacheV2Scheduler,
+    SimpleScheduler,
+    SimpleUnifiedScheduler,
+)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -894,6 +904,28 @@ def _create_kv_cache_manager(
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
+    # Gemma4: build per-layer head_dim and num_kv_heads for hybrid attention
+    layer_types = getattr(config, 'layer_types', None)
+    global_head_dim = getattr(config, 'global_head_dim', None)
+    if layer_types and global_head_dim and global_head_dim != head_dim:
+        attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
+        num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
+                                       None) or num_key_value_heads)
+        head_dim_list = []
+        kv_heads_list = []
+        for lt in layer_types:
+            is_sliding = (lt == "sliding_attention")
+            if is_sliding:
+                head_dim_list.append(head_dim)
+                kv_heads_list.append(num_key_value_heads)
+            else:
+                head_dim_list.append(global_head_dim)
+                use_k_eq_v = attention_k_eq_v and not is_sliding
+                kv_heads_list.append(
+                    num_global_kv_heads if use_k_eq_v else num_key_value_heads)
+        head_dim = head_dim_list
+        num_key_value_heads = kv_heads_list
+
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
@@ -912,9 +944,14 @@ def _create_kv_cache_manager(
     if layer_mask is None:
         draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
                                if model_engine is not None else None)
-    per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
-        num_key_value_heads, num_hidden_layers, spec_config,
-        draft_config_for_kv)
+    # If num_key_value_heads is already a per-layer list (e.g., Gemma4 hybrid),
+    # use it directly; otherwise build from the scalar value.
+    if isinstance(num_key_value_heads, list):
+        per_layer_num_kv_heads = num_key_value_heads
+    else:
+        per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
+            num_key_value_heads, num_hidden_layers, spec_config,
+            draft_config_for_kv)
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -1083,12 +1120,17 @@ def _create_kv_cache_manager(
         binding_model_config = _model_config.get_bindings_model_config(
             tokens_per_block=tokens_per_block) if is_vswa else None
 
+        # KVCacheManager (V1) doesn't support per-layer head_dim lists;
+        # use max for estimation. KVCacheManagerV2 handles lists natively.
+        effective_head_dim = (
+            max(head_dim) if isinstance(head_dim, list)
+            and kv_cache_manager_cls.__name__ == "KVCacheManager" else head_dim)
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_hidden_layers,
             num_kv_heads=per_layer_num_kv_heads,
-            head_dim=head_dim,
+            head_dim=effective_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
