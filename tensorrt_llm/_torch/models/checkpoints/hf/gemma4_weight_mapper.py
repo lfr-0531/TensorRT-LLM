@@ -12,16 +12,67 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
+
+import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
+_LANG_PREFIX = "model.language_model."
+
 
 @register_mapper("HF", "Gemma4ForCausalLM")
 @register_mapper("HF", "Gemma4ForConditionalGeneration")
 class Gemma4HfWeightMapper(HfWeightMapper):
+
+    def preprocess_weights(self, weights: dict) -> dict:
+        """Rename HF checkpoint keys to TRT-LLM module names and handle
+        buffers / special tensors that the generic loader cannot handle.
+
+        Key transformations:
+        1. Strip ``model.language_model.`` → ``model.`` prefix.
+        2. Load ``layer_scalar`` buffers directly into the model (they are
+           registered with ``register_buffer`` and therefore invisible to the
+           parameter-based weight loader).
+        3. For ``attention_k_eq_v`` layers, duplicate ``k_proj`` into ``v_proj``
+           so the downstream ``qkv_proj`` fusing finds all three projections.
+        """
+        new_weights: dict = {}
+        for key in list(weights.keys()):
+            new_key = key
+            # 1. Strip VLM language-model prefix
+            if new_key.startswith(_LANG_PREFIX):
+                new_key = "model." + new_key[len(_LANG_PREFIX):]
+            new_weights[new_key] = weights[key]
+
+        # 2. Load layer_scalar buffers directly into model
+        layer_scalar_keys = [
+            k for k in new_weights if k.endswith(".layer_scalar")
+        ]
+        for key in layer_scalar_keys:
+            # key looks like "model.layers.N.layer_scalar"
+            m = re.match(r"model\.layers\.(\d+)\.layer_scalar", key)
+            if m:
+                layer_idx = int(m.group(1))
+                layer = self.model.model.layers[layer_idx]
+                layer.layer_scalar.copy_(new_weights[key])
+            del new_weights[key]
+
+        # 3. Duplicate k_proj -> v_proj for k_eq_v layers
+        config = self.model.config
+        if getattr(config, "attention_k_eq_v", False):
+            layer_types = getattr(config, "layer_types", [])
+            for layer_idx, lt in enumerate(layer_types):
+                if lt == "full_attention":
+                    k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
+                    v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
+                    if k_key in new_weights and v_key not in new_weights:
+                        new_weights[v_key] = new_weights[k_key]
+
+        return new_weights
 
     def should_skip_module(self, module_name: str) -> bool:
         if self.model.config.tie_word_embeddings and module_name.startswith(

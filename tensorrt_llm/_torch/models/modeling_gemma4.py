@@ -502,9 +502,8 @@ class Gemma4DecoderLayer(DecoderLayer):
                 hidden_states_moe)
             # Combine MLP + MoE
             hidden_states = hidden_states_mlp + hidden_states_moe
-        else:
-            hidden_states = self.post_feedforward_layernorm(hidden_states)
 
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Per-Layer Embedding (PLE) injection
@@ -811,4 +810,5 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel,
         return logits
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights, weight_mapper)
