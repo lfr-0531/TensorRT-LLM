@@ -14,7 +14,6 @@
 # limitations under the License.
 import re
 
-import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
@@ -22,71 +21,143 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 _LANG_PREFIX = "model.language_model."
+_MODEL_PREFIX = "model."
 
 
 @register_mapper("HF", "Gemma4ForCausalLM")
 @register_mapper("HF", "Gemma4ForConditionalGeneration")
 class Gemma4HfWeightMapper(HfWeightMapper):
 
+    @property
+    def _is_vlm(self) -> bool:
+        """Check if the model is a VLM (has vision/audio towers) or text-only."""
+        return hasattr(self.model, "vision_tower")
+
     def preprocess_weights(self, weights: dict) -> dict:
         """Rename HF checkpoint keys to TRT-LLM module names and handle
         buffers / special tensors that the generic loader cannot handle.
 
-        Key transformations:
-        1. Strip ``model.language_model.`` → ``model.`` prefix.
-        2. Load ``layer_scalar`` buffers directly into the model (they are
-           registered with ``register_buffer`` and therefore invisible to the
-           parameter-based weight loader).
-        3. For ``attention_k_eq_v`` layers, duplicate ``k_proj`` into ``v_proj``
-           so the downstream ``qkv_proj`` fusing finds all three projections.
-        """
-        new_weights: dict = {}
-        for key in list(weights.keys()):
-            new_key = key
-            # 1. Strip VLM language-model prefix
-            if new_key.startswith(_LANG_PREFIX):
-                new_key = "model." + new_key[len(_LANG_PREFIX):]
-            new_weights[new_key] = weights[key]
+        For the text-only model (Gemma4ForCausalLM):
+        1. Strip ``model.language_model.`` -> ``model.`` prefix.
 
-        # 2. Load layer_scalar buffers directly into model
+        For the VLM (Gemma4ForConditionalGeneration):
+        1. Strip ``model.`` prefix from all keys so that the VLM's
+           ``load_weights`` can use ``filter_weights("language_model", ...)``
+           to split by component: ``language_model.*``, ``vision_tower.*``,
+           ``embed_vision.*``, etc.
+
+        This method is idempotent: if the weights have already been processed
+        (no key starts with the expected raw-checkpoint prefix), it returns
+        them unchanged.  This is important because ``Gemma4ForCausalLM.load_weights``
+        calls ``preprocess_weights`` again when invoked as a sub-model of the VLM.
+
+        Common transformations:
+        2. Load ``layer_scalar`` buffers directly into the model.
+        3. For ``attention_k_eq_v`` layers, duplicate ``k_proj`` into ``v_proj``.
+        """
+        # Detect if any key still has the raw checkpoint prefix.
+        # Raw Gemma4 checkpoint keys always start with "model.language_model.",
+        # "model.vision_tower.", or "model.embed_vision.".  Keys like
+        # "model.layers.*" (from the LLM after filter_weights) are already
+        # processed and should not be re-transformed.
+        _RAW_PREFIXES = (
+            _LANG_PREFIX, "model.vision_tower.", "model.embed_vision.",
+            "model.embed_audio.", "model.audio_tower.",
+        )
+        sample_keys = list(weights.keys())[:20]
+        has_raw_prefix = any(
+            any(k.startswith(rp) for rp in _RAW_PREFIXES)
+            for k in sample_keys
+        )
+        if not has_raw_prefix:
+            # Already preprocessed or text-only LLM sub-model call from VLM.
+            # Still need to handle layer_scalar and k_eq_v.
+            return self._handle_buffers_and_kvdup(weights)
+
+        new_weights: dict = {}
+        if self._is_vlm:
+            # VLM: strip top-level "model." prefix only.
+            for key in list(weights.keys()):
+                new_key = key
+                if new_key.startswith(_MODEL_PREFIX):
+                    new_key = new_key[len(_MODEL_PREFIX):]
+                new_weights[new_key] = weights[key]
+        else:
+            # Text-only: strip "model.language_model." -> "model."
+            for key in list(weights.keys()):
+                new_key = key
+                if new_key.startswith(_LANG_PREFIX):
+                    new_key = "model." + new_key[len(_LANG_PREFIX):]
+                new_weights[new_key] = weights[key]
+
+        return self._handle_buffers_and_kvdup(new_weights)
+
+    def _handle_buffers_and_kvdup(self, weights: dict) -> dict:
+        """Load layer_scalar buffers and duplicate k_proj for k_eq_v layers."""
+        # Determine the layer scalar key pattern and accessor based on
+        # whether any key starts with "language_model." (VLM sub-model
+        # weights after filter_weights) or "model." (text-only).
+        # Navigate to decoder layers regardless of model structure
+        # (multimodal wrapper has .llm.model.layers, text-only has .model.layers)
+        _root = self.model
+        if hasattr(_root, 'llm'):  # Gemma4ForConditionalGeneration
+            _layers = _root.llm.model.layers
+        elif hasattr(_root, 'model') and hasattr(_root.model, 'layers'):
+            _layers = _root.model.layers
+        else:
+            _layers = None
+
+        sample = next(iter(weights), "")
+        if sample.startswith("language_model."):
+            scalar_pattern = r"language_model\.model\.layers\.(\d+)\.layer_scalar"
+            get_layer = lambda idx: _layers[idx] if _layers else None
+            key_tmpl = "language_model.model.layers.{}.self_attn.{}_proj.weight"
+        else:
+            scalar_pattern = r"model\.layers\.(\d+)\.layer_scalar"
+            get_layer = lambda idx: _layers[idx] if _layers else None
+            key_tmpl = "model.layers.{}.self_attn.{}_proj.weight"
+
         layer_scalar_keys = [
-            k for k in new_weights if k.endswith(".layer_scalar")
+            k for k in weights if k.endswith(".layer_scalar")
         ]
         for key in layer_scalar_keys:
-            # key looks like "model.layers.N.layer_scalar"
-            m = re.match(r"model\.layers\.(\d+)\.layer_scalar", key)
+            m = re.match(scalar_pattern, key)
             if m:
                 layer_idx = int(m.group(1))
-                layer = self.model.model.layers[layer_idx]
-                layer.layer_scalar.copy_(new_weights[key])
-            del new_weights[key]
+                try:
+                    layer = get_layer(layer_idx)
+                    layer.layer_scalar.copy_(weights[key])
+                except (AttributeError, IndexError):
+                    pass
+            del weights[key]
 
-        # 3. Duplicate k_proj -> v_proj for k_eq_v layers
         config = self.model.config
         if getattr(config, "attention_k_eq_v", False):
             layer_types = getattr(config, "layer_types", [])
             for layer_idx, lt in enumerate(layer_types):
                 if lt == "full_attention":
-                    k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-                    v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-                    if k_key in new_weights and v_key not in new_weights:
-                        new_weights[v_key] = new_weights[k_key]
+                    k_key = key_tmpl.format(layer_idx, "k")
+                    v_key = key_tmpl.format(layer_idx, "v")
+                    if k_key in weights and v_key not in weights:
+                        weights[v_key] = weights[k_key]
 
-        return new_weights
+        return weights
 
     def should_skip_module(self, module_name: str) -> bool:
-        if self.model.config.tie_word_embeddings and module_name.startswith(
-                "lm_head"):
+        config = self.model.config
+        if getattr(config, 'tie_word_embeddings', False) and module_name.startswith("lm_head"):
             return True
 
-        # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
-        if hasattr(self.model, "model") and hasattr(
-                self.model.model, 'has_custom_embed_tokens'
-        ) and self.model.model.has_custom_embed_tokens and module_name == "model.embed_tokens":
+        # Determine the "inner" model (for VLM: self.model.llm, else: self.model)
+        inner = self.model.llm if hasattr(self.model, 'llm') else self.model
+
+        if (hasattr(inner, "model") and hasattr(inner.model, 'has_custom_embed_tokens')
+                and inner.model.has_custom_embed_tokens
+                and module_name == "model.embed_tokens"):
             return True
-        if hasattr(
-                self.model, 'has_custom_lm_head'
-        ) and self.model.has_custom_lm_head and module_name == "lm_head":
+        if (hasattr(inner, 'has_custom_lm_head')
+                and inner.has_custom_lm_head
+                and module_name == "lm_head"):
             return True
 
         return any(skip_module in module_name
