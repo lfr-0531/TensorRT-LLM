@@ -616,6 +616,23 @@ class Gemma4TextModel(DecoderModel):
                             per_layer_embed) * self.per_layer_input_scale
         return per_layer_inputs
 
+    def _ensure_ple_dtype(self):
+        """Ensure PLE nn.Linear modules match model dtype (they may be
+        float32 if the weight loader didn't handle nn.Linear correctly)."""
+        if not self.hidden_size_per_layer_input:
+            return
+        target = self.dtype
+        for mod in [self.per_layer_model_projection,
+                     self.per_layer_projection_norm]:
+            if hasattr(mod, 'weight') and mod.weight.dtype != target:
+                mod.to(target)
+        for layer in self.layers:
+            for name in ['per_layer_input_gate', 'per_layer_projection',
+                         'post_per_layer_input_norm']:
+                mod = getattr(layer, name, None)
+                if mod is not None and hasattr(mod, 'weight') and mod.weight.dtype != target:
+                    mod.to(target)
+
     @torch.inference_mode()
     def forward(
         self,
