@@ -76,11 +76,24 @@ class Gemma4HfWeightMapper(HfWeightMapper):
 
         new_weights: dict = {}
         if self._is_vlm:
-            # VLM: strip top-level "model." prefix only.
+            # VLM: strip top-level "model." prefix and re-nest the
+            # language_model sub-keys so that filter_weights("language_model")
+            # produces "model.X" (matching the LLM's internal structure).
+            #
+            # Checkpoint:  model.language_model.layers.0.X
+            # After strip: language_model.layers.0.X
+            # Re-nest:     language_model.model.layers.0.X
+            # After filter_weights("language_model"): model.layers.0.X  ← correct for LLM
+            #
+            # Non-language-model keys (vision_tower, embed_vision) just lose "model.".
+            _LANG_COMP = "language_model."
             for key in list(weights.keys()):
                 new_key = key
                 if new_key.startswith(_MODEL_PREFIX):
                     new_key = new_key[len(_MODEL_PREFIX):]
+                # Re-nest language model keys: language_model.X → language_model.model.X
+                if new_key.startswith(_LANG_COMP):
+                    new_key = _LANG_COMP + "model." + new_key[len(_LANG_COMP):]
                 new_weights[new_key] = weights[key]
         else:
             # Text-only: strip "model.language_model." -> "model."
@@ -108,7 +121,7 @@ class Gemma4HfWeightMapper(HfWeightMapper):
             _layers = None
 
         sample = next(iter(weights), "")
-        if sample.startswith("language_model."):
+        if sample.startswith("language_model.model."):
             scalar_pattern = r"language_model\.model\.layers\.(\d+)\.layer_scalar"
             get_layer = lambda idx: _layers[idx] if _layers else None
             key_tmpl = "language_model.model.layers.{}.self_attn.{}_proj.weight"
