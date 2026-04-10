@@ -438,6 +438,12 @@ GEMMA4_MOE_HF_CONFIG = {
     "moe_intermediate_size": 256,
 }
 
+# KV Sharing (last 2 layers share KV with earlier same-type layers)
+GEMMA4_KV_SHARING_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "num_kv_shared_layers": 2,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
@@ -741,6 +747,24 @@ class TestGemma4HFComparison(unittest.TestCase):
             rtol=1.0,
             max_failed_frac=0.05,
         )
+
+    @torch.no_grad()
+    def test_kv_sharing_instantiation(self):
+        """KV sharing: verify shared layers are configured correctly."""
+        config_dict = deepcopy(GEMMA4_KV_SHARING_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model = Gemma4ForCausalLM(model_config)
+
+        # E.g., 6 layers with last 2 shared → layers 4,5 are shared
+        num_shared = config.num_kv_shared_layers
+        first_shared = config.num_hidden_layers - num_shared
+        for i, layer in enumerate(model.model.layers):
+            if i >= first_shared:
+                self.assertTrue(layer.is_kv_shared_layer, f"Layer {i} should be KV shared")
+                self.assertTrue(layer.self_attn.is_kv_shared, f"Layer {i} attn should be KV shared")
+            else:
+                self.assertFalse(layer.is_kv_shared_layer, f"Layer {i} should NOT be KV shared")
 
 
 if __name__ == "__main__":

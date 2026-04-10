@@ -5,12 +5,10 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (
-    confidential_compute_enabled,
-    str_dtype_to_binding,
-    torch_dtype_to_str,
-)
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
+from tensorrt_llm._utils import (confidential_compute_enabled,
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
@@ -21,25 +19,17 @@ from tensorrt_llm.llmapi.llm_args import (
     WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import (
-    get_num_extra_kv_tokens,
-    get_num_spec_layers,
-    get_spec_decoder,
-    should_use_separate_draft_kv_cache,
-)
-from .config_utils import (
-    get_qwen3_hybrid_layer_masks,
-    is_gemma4_hybrid,
-    is_mla,
-    is_nemotron_hybrid,
-    is_qwen3_hybrid,
-)
+from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
+                           get_spec_decoder, should_use_separate_draft_kv_cache)
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_gemma4_hybrid,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -48,21 +38,14 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (
-    KVCacheManager,
-    KVCacheManagerV2,
-    PeftCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler, TRTLLMSampler
-from .scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    KVCacheV2Scheduler,
-    SimpleScheduler,
-    SimpleUnifiedScheduler,
-)
+from .resource_manager import (KVCacheManager, KVCacheManagerV2,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
+from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
+                      TRTLLMSampler)
+from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
+                        KVCacheV2Scheduler, SimpleScheduler,
+                        SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -936,6 +919,17 @@ def _create_kv_cache_manager(
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
 
+    # Gemma4 KV sharing: exclude shared layers from KV cache allocation
+    num_kv_shared_layers = getattr(config, 'num_kv_shared_layers', 0)
+    if num_kv_shared_layers > 0 and layer_mask is None:
+        num_layers_total = config.num_hidden_layers
+        first_shared_idx = num_layers_total - num_kv_shared_layers
+        layer_mask = [i < first_shared_idx for i in range(num_layers_total)]
+        logger.info(
+            f"Gemma4 KV sharing: {num_kv_shared_layers} shared layers "
+            f"(idx >= {first_shared_idx}), layer_mask has "
+            f"{sum(layer_mask)} active layers out of {num_layers_total}")
+
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
@@ -1159,6 +1153,23 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
         )
+    # Gemma4 KV sharing: remap shared layers to their target layer's cache slot
+    if num_kv_shared_layers > 0 and hasattr(kv_cache_manager, 'layer_offsets'):
+        layer_types = getattr(config, 'layer_types', None)
+        if layer_types:
+            num_layers_total = config.num_hidden_layers
+            first_shared_idx = num_layers_total - num_kv_shared_layers
+            prev_layers = layer_types[:first_shared_idx]
+            for shared_idx in range(first_shared_idx, num_layers_total):
+                if shared_idx not in kv_cache_manager.layer_offsets:
+                    # Find last non-shared layer of the same attention type
+                    current_type = layer_types[shared_idx]
+                    target_idx = (len(prev_layers) - 1 -
+                                  prev_layers[::-1].index(current_type))
+                    if target_idx in kv_cache_manager.layer_offsets:
+                        kv_cache_manager.layer_offsets[shared_idx] = (
+                            kv_cache_manager.layer_offsets[target_idx])
+
     return kv_cache_manager
 
 

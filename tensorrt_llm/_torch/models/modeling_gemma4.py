@@ -99,8 +99,10 @@ class Gemma4Attention(QKNormRoPEAttention):
         model_config: ModelConfig[Gemma4TextConfig],
         layer_idx: Optional[int] = None,
         is_sliding: bool = False,
+        is_kv_shared: bool = False,
     ):
         self.is_sliding = is_sliding
+        self.is_kv_shared = is_kv_shared
         config = model_config.pretrained_config
 
         # Per-layer head_dim and kv heads
@@ -205,6 +207,14 @@ class Gemma4Attention(QKNormRoPEAttention):
         # Split QKV, apply QK norm
         if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)
+
+            # KV shared layers: skip k/v computation, only process q
+            if self.is_kv_shared:
+                q, _ = self.apply_qk_norm(q, k)
+                if not self.skip_rope:
+                    q, _, _ = super(QKNormRoPEAttention, self).apply_rope(q, k, v, position_ids)
+                return q, None, None
+
             q, k = self.apply_qk_norm(q, k)
 
             # K=V: derive value from key after k_norm
@@ -390,6 +400,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
             is_sliding=is_sliding,
+            is_kv_shared=self.is_kv_shared_layer,
         )
 
         # Dense MLP
