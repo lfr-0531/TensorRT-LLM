@@ -25,8 +25,7 @@ from copy import deepcopy
 
 import torch
 
-from tensorrt_llm._torch.configs.gemma4 import (Gemma4Config,
-                                                 Gemma4TextConfig)
+from transformers import Gemma4Config, Gemma4TextConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4Attention, Gemma4DecoderLayer, Gemma4ForCausalLM, Gemma4MoE,
