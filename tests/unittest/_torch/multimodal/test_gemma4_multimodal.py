@@ -78,11 +78,22 @@ SMALL_TEXT_CONFIG = {
 }
 
 
-MODEL_26B_PATH = "/home/scratch.fanrongl_coreai/models/gemma4/gemma-4-26B-A4B-it"
+def _get_model_path():
+    import os
+
+    llm_models_root = os.environ.get("LLM_MODELS_ROOT")
+    if llm_models_root:
+        return os.path.join(llm_models_root, "gemma4/gemma-4-26B-A4B-it")
+    # Fallback for local development
+    return "/home/scratch.fanrongl_coreai/models/gemma4/gemma-4-26B-A4B-it"
+
+
+MODEL_26B_PATH = _get_model_path()
 
 
 def _model_available():
     import os
+
     return os.path.isfile(os.path.join(MODEL_26B_PATH, "config.json"))
 
 
@@ -92,8 +103,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not _model_available():
-            raise unittest.SkipTest(
-                f"Gemma4 model not found at {MODEL_26B_PATH}")
+            raise unittest.SkipTest(f"Gemma4 model not found at {MODEL_26B_PATH}")
 
         from transformers import AutoConfig, AutoTokenizer
 
@@ -101,9 +111,8 @@ class TestGemma4InputProcessor(unittest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(MODEL_26B_PATH)
 
     def _make_processor(self):
-        from tensorrt_llm._torch.models.modeling_gemma4mm import (
-            Gemma4InputProcessor,
-        )
+        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
         return Gemma4InputProcessor(
             model_path=MODEL_26B_PATH,
             config=self.config,
@@ -139,15 +148,19 @@ class TestGemma4InputProcessor(unittest.TestCase):
         from tensorrt_llm.sampling_params import SamplingParams
 
         proc = self._make_processor()
-        img = Image.fromarray(
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+        img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
 
         # Use chat template to properly format the prompt
         prompt = proc._processor.apply_chat_template(
-            [{"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": "Describe."},
-            ]}],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                }
+            ],
             add_generation_prompt=True,
         )
         inputs = {
@@ -174,14 +187,18 @@ class TestGemma4InputProcessor(unittest.TestCase):
         from tensorrt_llm.sampling_params import SamplingParams
 
         proc = self._make_processor()
-        img = Image.fromarray(
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+        img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
 
         prompt = proc._processor.apply_chat_template(
-            [{"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": "What is this?"},
-            ]}],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "What is this?"},
+                    ],
+                }
+            ],
             add_generation_prompt=True,
         )
         inputs = {
@@ -194,8 +211,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         image_token_id = self.config.image_token_id
         image_count = sum(1 for t in input_ids if t == image_token_id)
         # Image should be expanded to multiple image tokens
-        self.assertGreater(image_count, 0,
-                           "Expected image tokens in expanded input_ids")
+        self.assertGreater(image_count, 0, "Expected image tokens in expanded input_ids")
 
     def test_multiple_images(self):
         """Multiple images are handled correctly."""
@@ -205,17 +221,20 @@ class TestGemma4InputProcessor(unittest.TestCase):
         from tensorrt_llm.sampling_params import SamplingParams
 
         proc = self._make_processor()
-        img1 = Image.fromarray(
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
-        img2 = Image.fromarray(
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+        img1 = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+        img2 = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
 
         prompt = proc._processor.apply_chat_template(
-            [{"role": "user", "content": [
-                {"type": "image"},
-                {"type": "image"},
-                {"type": "text", "text": "Compare these images."},
-            ]}],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "image"},
+                        {"type": "text", "text": "Compare these images."},
+                    ],
+                }
+            ],
             add_generation_prompt=True,
         )
         inputs = {
@@ -239,10 +258,15 @@ class TestGemma4InputProcessor(unittest.TestCase):
         img_tensor = torch.randn(3, 224, 224)
 
         prompt = proc._processor.apply_chat_template(
-            [{"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": "Describe."},
-            ]}],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                }
+            ],
             add_generation_prompt=True,
         )
         inputs = {
@@ -358,7 +382,7 @@ class TestGemma4VisionTower(unittest.TestCase):
         # 6x6 = 36 patches, pixel_values shape: [B, N_patches, patch_size^2 * 3]
         B, side = 1, 6
         N_patches = side * side
-        C_in = vision_cfg.patch_size ** 2 * 3  # 16*16*3 = 768
+        C_in = vision_cfg.patch_size**2 * 3  # 16*16*3 = 768
         pixel_values = torch.randn(B, N_patches, C_in, device=device, dtype=dtype)
         position_ids = torch.stack(
             torch.meshgrid(
@@ -369,7 +393,7 @@ class TestGemma4VisionTower(unittest.TestCase):
             dim=-1,
         ).reshape(1, -1, 2)
 
-        pooling_k2 = vision_cfg.pooling_kernel_size ** 2
+        pooling_k2 = vision_cfg.pooling_kernel_size**2
         output_length = N_patches // pooling_k2
 
         with torch.inference_mode():
@@ -384,8 +408,8 @@ class TestGemma4VisionTower(unittest.TestCase):
         """Full vision pipeline (tower → embedder) matches HF reference."""
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4MultimodalEmbedder as HFEmbedder,
-            Gemma4VisionModel as HFVisionModel,
         )
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionModel as HFVisionModel
 
         vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
         text_cfg = Gemma4TextConfig(**SMALL_TEXT_CONFIG)
@@ -415,7 +439,7 @@ class TestGemma4VisionTower(unittest.TestCase):
         # Dummy input: 6x6 = 36 patches
         side = 6
         N_patches = side * side
-        C_in = vision_cfg.patch_size ** 2 * 3
+        C_in = vision_cfg.patch_size**2 * 3
         pixel_values = torch.randn(1, N_patches, C_in, device=device, dtype=dtype)
         position_ids = torch.stack(
             torch.meshgrid(
@@ -426,7 +450,7 @@ class TestGemma4VisionTower(unittest.TestCase):
             dim=-1,
         ).reshape(1, -1, 2)
 
-        pooling_k2 = vision_cfg.pooling_kernel_size ** 2
+        pooling_k2 = vision_cfg.pooling_kernel_size**2
         output_length = N_patches // pooling_k2
 
         with torch.inference_mode():

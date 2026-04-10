@@ -172,20 +172,15 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         else:
             _layers = None
 
+        def get_layer(idx):
+            return _layers[idx] if _layers else None
+
         sample = next(iter(weights), "")
         if sample.startswith("language_model.model."):
             scalar_pattern = r"language_model\.model\.layers\.(\d+)\.layer_scalar"
-
-            def get_layer(idx):
-                return _layers[idx] if _layers else None
-
             key_tmpl = "language_model.model.layers.{}.self_attn.{}_proj.weight"
         else:
             scalar_pattern = r"model\.layers\.(\d+)\.layer_scalar"
-
-            def get_layer(idx):
-                return _layers[idx] if _layers else None
-
             key_tmpl = "model.layers.{}.self_attn.{}_proj.weight"
 
         layer_scalar_keys = [k for k in weights if k.endswith(".layer_scalar")]

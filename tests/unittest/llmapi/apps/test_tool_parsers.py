@@ -27,7 +27,6 @@ from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
-from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
@@ -36,6 +35,12 @@ from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
+
+from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
+    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM, Gemma4ToolParser,
+    _extract_tool_calls, _find_matching_brace, _parse_gemma4_args,
+    _parse_gemma4_array, _parse_gemma4_value,
+)
 
 
 # Test fixtures for common tools
@@ -2677,12 +2682,6 @@ class TestInterleavedThinkingReasoningParsers:
 
 # Gemma4 helpers
 
-from tensorrt_llm.serve.tool_parser.gemma4_parser import (
-    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM,
-    _extract_tool_calls, _find_matching_brace,
-    _parse_gemma4_args, _parse_gemma4_array, _parse_gemma4_value,
-)
-
 
 def _g4_tc(func_name: str, args_str: str) -> str:
     """Build a Gemma4 tool call string."""
@@ -2705,7 +2704,7 @@ class TestGemma4ParsingHelpers:
         assert _find_matching_brace("{a:{b:1}}", 0) == 8
 
     def test_find_matching_brace_with_string_delim(self):
-        text = '{key:' + _g4_s('val{ue}') + '}'
+        text = '{key:' + _g4_s('v{al}') + '}'
         assert _find_matching_brace(text, 0) == len(text) - 1
 
     def test_find_matching_brace_unmatched(self):
@@ -2743,9 +2742,7 @@ class TestGemma4ParsingHelpers:
     def test_parse_array_nested_objects(self):
         text = (f'[{{name:{_g4_s("Alice")}}},'
                 f'{{name:{_g4_s("Bob")}}}]')
-        assert _parse_gemma4_array(text) == [
-            {"name": "Alice"}, {"name": "Bob"}
-        ]
+        assert _parse_gemma4_array(text) == [{"name": "Alice"}, {"name": "Bob"}]
 
     def test_parse_args_single_string(self):
         text = f'location:{_g4_s("Tokyo")}'
@@ -2755,20 +2752,26 @@ class TestGemma4ParsingHelpers:
         text = (f'location:{_g4_s("Tokyo")},'
                 f'unit:{_g4_s("celsius")}')
         assert _parse_gemma4_args(text) == {
-            "location": "Tokyo", "unit": "celsius",
+            "location": "Tokyo",
+            "unit": "celsius",
         }
 
     def test_parse_args_mixed_types(self):
         text = f'name:{_g4_s("test")},count:42,active:true'
         assert _parse_gemma4_args(text) == {
-            "name": "test", "count": 42, "active": True,
+            "name": "test",
+            "count": 42,
+            "active": True,
         }
 
     def test_parse_args_nested_object(self):
         text = (f'loc:{{city:{_g4_s("Tokyo")},'
                 f'country:{_g4_s("Japan")}}}')
         assert _parse_gemma4_args(text) == {
-            "loc": {"city": "Tokyo", "country": "Japan"},
+            "loc": {
+                "city": "Tokyo",
+                "country": "Japan"
+            },
         }
 
     def test_parse_args_with_array(self):
@@ -2789,17 +2792,14 @@ class TestGemma4ParsingHelpers:
         assert _parse_gemma4_args(text) == {"tpl": "Hello {name}"}
 
     def test_extract_tool_calls_single(self):
-        text = _g4_tc("get_weather",
-                          f'location:{_g4_s("Tokyo")}')
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
         calls = _extract_tool_calls(text)
         assert len(calls) == 1
         assert calls[0][0] == "get_weather"
 
     def test_extract_tool_calls_multiple(self):
-        text = (_g4_tc("get_weather",
-                           f'location:{_g4_s("Tokyo")}')
-                + _g4_tc("search_web",
-                             f'query:{_g4_s("AI")}'))
+        text = (_g4_tc("get_weather", f'location:{_g4_s("Tokyo")}') +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
         calls = _extract_tool_calls(text)
         assert len(calls) == 2
         assert calls[0][0] == "get_weather"
@@ -2821,41 +2821,31 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         return Gemma4ToolParser()
 
     def make_tool_parser_test_cases(self):
-        single_text = _g4_tc("get_weather",
-                                 f'location:{_g4_s("NYC")}')
+        single_text = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
         single_expected_normal = ""
         single_expected_name = "get_weather"
         single_expected_params = {"location": "NYC"}
 
-        multiple_text = (
-            _g4_tc("get_weather",
-                       f'location:{_g4_s("LA")}')
-            + _g4_tc("search_web",
-                         f'query:{_g4_s("AI")}')
-        )
+        multiple_text = (_g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+                         _g4_tc("search_web", f'query:{_g4_s("AI")}'))
         multiple_names = ("get_weather", "search_web")
 
         # Malformed: missing call: prefix, so no function name is found
-        malformed_text = (
-            f'{BOT_TOKEN}'
-            f'MALFORMED_NO_CALL_PREFIX{EOT_TOKEN}'
-        )
+        malformed_text = (f'{BOT_TOKEN}'
+                          f'MALFORMED_NO_CALL_PREFIX{EOT_TOKEN}')
 
-        with_parameters_text = _g4_tc(
-            "search_web", f'query:{_g4_s("test")}')
+        with_parameters_text = _g4_tc("search_web", f'query:{_g4_s("test")}')
         with_parameters_name = "search_web"
         with_parameters_params = {"query": "test"}
 
         partial_bot_token = "<|tool"
 
-        undefined_tool_text = _g4_tc(
-            "undefined_func", f'arg:{_g4_s("val")}')
+        undefined_tool_text = _g4_tc("undefined_func", f'arg:{_g4_s("val")}')
 
         return ToolParserTestCases(
             has_tool_call_true=(
                 f'Text {BOT_TOKEN}{CALL_PREFIX}'
-                f'get_weather{{loc:{_g4_s("NYC")}}}{EOT_TOKEN}'
-            ),
+                f'get_weather{{loc:{_g4_s("NYC")}}}{EOT_TOKEN}'),
             detect_and_parse_single_tool=(
                 single_text,
                 single_expected_normal,
@@ -2879,17 +2869,15 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         assert parser.needs_raw_special_tokens is True
 
     def test_detect_and_parse_with_text_before(self, sample_tools, parser):
-        text = ("Let me check. "
-                + _g4_tc("get_weather",
-                             f'location:{_g4_s("NYC")}'))
+        text = ("Let me check. " +
+                _g4_tc("get_weather", f'location:{_g4_s("NYC")}'))
         result = parser.detect_and_parse(text, sample_tools)
         assert result.normal_text == "Let me check."
         assert len(result.calls) == 1
 
     def test_detect_and_parse_multiple_params(self, sample_tools, parser):
-        text = _g4_tc(
-            "get_weather",
-            f'location:{_g4_s("NYC")},unit:{_g4_s("celsius")}')
+        text = _g4_tc("get_weather",
+                      f'location:{_g4_s("NYC")},unit:{_g4_s("celsius")}')
         result = parser.detect_and_parse(text, sample_tools)
         assert len(result.calls) == 1
         params = json.loads(result.calls[0].parameters)
@@ -2904,14 +2892,17 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
                     description="Create event",
                     parameters={
                         "type": "object",
-                        "properties": {"data": {"type": "object"}},
+                        "properties": {
+                            "data": {
+                                "type": "object"
+                            }
+                        },
                     },
                 ),
             ),
         ]
-        text = _g4_tc(
-            "create_event",
-            f'data:{{city:{_g4_s("Tokyo")},pop:1400}}')
+        text = _g4_tc("create_event",
+                      f'data:{{city:{_g4_s("Tokyo")},pop:1400}}')
         result = parser.detect_and_parse(text, tools)
         params = json.loads(result.calls[0].parameters)
         assert params == {"data": {"city": "Tokyo", "pop": 1400}}
@@ -2928,15 +2919,16 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
                         "properties": {
                             "tags": {
                                 "type": "array",
-                                "items": {"type": "string"},
+                                "items": {
+                                    "type": "string"
+                                },
                             },
                         },
                     },
                 ),
             ),
         ]
-        text = _g4_tc("add_tags",
-                          f'tags:[{_g4_s("py")},{_g4_s("ai")}]')
+        text = _g4_tc("add_tags", f'tags:[{_g4_s("py")},{_g4_s("ai")}]')
         result = parser.detect_and_parse(text, tools)
         params = json.loads(result.calls[0].parameters)
         assert params == {"tags": ["py", "ai"]}
@@ -2967,14 +2959,12 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
     def test_parse_streaming_increment_complete_tool_call(
             self, sample_tools, parser):
         """Complete tool call in a single streaming chunk."""
-        text = _g4_tc("get_weather",
-                          f'location:{_g4_s("Tokyo")}')
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
         result = parser.parse_streaming_increment(text, sample_tools)
         assert len(result.calls) >= 1
         assert result.calls[0].name == "get_weather"
 
-    def test_parse_streaming_increment_multi_chunk(
-            self, sample_tools, parser):
+    def test_parse_streaming_increment_multi_chunk(self, sample_tools, parser):
         """Tool call split across two chunks."""
         chunk1 = (f'{BOT_TOKEN}{CALL_PREFIX}'
                   f'get_weather{{location:')
@@ -2986,38 +2976,32 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         result2 = parser.parse_streaming_increment(chunk2, sample_tools)
         assert len(result2.calls) >= 1
 
-    def test_parse_streaming_increment_multiple_tools(
-            self, sample_tools, parser):
+    def test_parse_streaming_increment_multiple_tools(self, sample_tools,
+                                                      parser):
         """Multiple tool calls in streaming mode."""
-        tc1 = _g4_tc("get_weather",
-                         f'location:{_g4_s("Tokyo")}')
+        tc1 = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
         result1 = parser.parse_streaming_increment(tc1, sample_tools)
         assert len(result1.calls) >= 1
 
-        tc2 = _g4_tc("search_web",
-                         f'query:{_g4_s("weather")}')
+        tc2 = _g4_tc("search_web", f'query:{_g4_s("weather")}')
         result2 = parser.parse_streaming_increment(tc2, sample_tools)
         assert len(result2.calls) >= 1
 
-    def test_parse_streaming_increment_text_then_tool(
-            self, sample_tools, parser):
+    def test_parse_streaming_increment_text_then_tool(self, sample_tools,
+                                                      parser):
         """Normal text followed by tool call."""
-        result1 = parser.parse_streaming_increment(
-            "Checking...", sample_tools)
+        result1 = parser.parse_streaming_increment("Checking...", sample_tools)
         assert result1.normal_text == "Checking..."
 
-        tc = _g4_tc("get_weather",
-                        f'location:{_g4_s("NYC")}')
+        tc = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
         result2 = parser.parse_streaming_increment(tc, sample_tools)
         assert len(result2.calls) >= 1
 
     def test_real_world_weather_query(self, sample_tools, parser):
         """Simulate real model output: text + tool call."""
-        text = ("I'll check. "
-                + _g4_tc(
-                    "get_weather",
-                    (f'location:{_g4_s("San Francisco, CA")},'
-                     f'unit:{_g4_s("fahrenheit")}')))
+        text = ("I'll check. " +
+                _g4_tc("get_weather", (f'location:{_g4_s("San Francisco, CA")},'
+                                       f'unit:{_g4_s("fahrenheit")}')))
         result = parser.detect_and_parse(text, sample_tools)
         assert result.normal_text == "I'll check."
         params = json.loads(result.calls[0].parameters)

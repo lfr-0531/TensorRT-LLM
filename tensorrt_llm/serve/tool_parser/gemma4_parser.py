@@ -48,9 +48,9 @@ def _find_matching_brace(text: str, start: int) -> int:
             i += len(STRING_DELIM)
             continue
         if not in_string:
-            if text[i] == '{':
+            if text[i] == "{":
                 depth += 1
-            elif text[i] == '}':
+            elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
                     return i
@@ -69,33 +69,33 @@ def _parse_gemma4_value(text: str):
     if text.startswith(STRING_DELIM):
         end = text.find(STRING_DELIM, len(STRING_DELIM))
         if end == -1:
-            return text[len(STRING_DELIM):]
-        return text[len(STRING_DELIM):end]
+            return text[len(STRING_DELIM) :]
+        return text[len(STRING_DELIM) : end]
 
     # Nested object
-    if text.startswith('{'):
+    if text.startswith("{"):
         close = _find_matching_brace(text, 0)
         if close == -1:
             return text
         return _parse_gemma4_args(text[1:close])
 
     # Array
-    if text.startswith('['):
+    if text.startswith("["):
         return _parse_gemma4_array(text)
 
     # Boolean
-    if text == 'true':
+    if text == "true":
         return True
-    if text == 'false':
+    if text == "false":
         return False
 
     # Null
-    if text == 'null':
+    if text == "null":
         return None
 
     # Number
     try:
-        if '.' in text or 'e' in text.lower():
+        if "." in text or "e" in text.lower():
             return float(text)
         return int(text)
     except ValueError:
@@ -108,7 +108,7 @@ def _parse_gemma4_array(text: str) -> list:
     Handles nested objects, arrays, and string delimiters.
     """
     text = text.strip()
-    if not text.startswith('['):
+    if not text.startswith("["):
         return []
 
     # Find matching closing bracket
@@ -120,9 +120,9 @@ def _parse_gemma4_array(text: str) -> list:
             in_string = not in_string
             continue
         if not in_string:
-            if ch == '[':
+            if ch == "[":
                 depth += 1
-            elif ch == ']':
+            elif ch == "]":
                 depth -= 1
                 if depth == 0:
                     close_idx = i
@@ -146,11 +146,11 @@ def _parse_gemma4_array(text: str) -> list:
             i += len(STRING_DELIM)
             continue
         if not in_str:
-            if inner[i] in ('{', '['):
+            if inner[i] in ("{", "["):
                 depth += 1
-            elif inner[i] in ('}', ']'):
+            elif inner[i] in ("}", "]"):
                 depth -= 1
-            elif inner[i] == ',' and depth == 0:
+            elif inner[i] == "," and depth == 0:
                 elements.append(inner[elem_start:i].strip())
                 elem_start = i + 1
         i += 1
@@ -176,20 +176,19 @@ def _parse_gemma4_args(text: str) -> dict:
     i = 0
     while i < len(text):
         # Skip whitespace and commas
-        while i < len(text) and text[i] in (' ', '\t', '\n', '\r', ','):
+        while i < len(text) and text[i] in (" ", "\t", "\n", "\r", ","):
             i += 1
         if i >= len(text):
             break
 
         # Parse key (bare identifier up to ':')
-        colon_pos = text.find(':', i)
+        colon_pos = text.find(":", i)
         if colon_pos == -1:
             break
         key = text[i:colon_pos].strip()
         i = colon_pos + 1
 
         # Parse value
-        val_start = i
         if i < len(text) and text[i:].startswith(STRING_DELIM):
             # String value: find closing delimiter
             after_open = i + len(STRING_DELIM)
@@ -199,14 +198,14 @@ def _parse_gemma4_args(text: str) -> dict:
                 break
             result[key] = text[after_open:close_pos]
             i = close_pos + len(STRING_DELIM)
-        elif i < len(text) and text[i] == '{':
+        elif i < len(text) and text[i] == "{":
             # Nested object
             close = _find_matching_brace(text, i)
             if close == -1:
                 break
-            result[key] = _parse_gemma4_args(text[i + 1:close])
+            result[key] = _parse_gemma4_args(text[i + 1 : close])
             i = close + 1
-        elif i < len(text) and text[i] == '[':
+        elif i < len(text) and text[i] == "[":
             # Array value: find matching bracket
             depth = 0
             in_string = False
@@ -217,12 +216,12 @@ def _parse_gemma4_args(text: str) -> dict:
                     j += len(STRING_DELIM)
                     continue
                 if not in_string:
-                    if text[j] == '[':
+                    if text[j] == "[":
                         depth += 1
-                    elif text[j] == ']':
+                    elif text[j] == "]":
                         depth -= 1
                         if depth == 0:
-                            result[key] = _parse_gemma4_array(text[i:j + 1])
+                            result[key] = _parse_gemma4_array(text[i : j + 1])
                             i = j + 1
                             break
                 j += 1
@@ -236,13 +235,13 @@ def _parse_gemma4_args(text: str) -> dict:
             j = i
             depth = 0
             while j < len(text):
-                if text[j] in ('{', '['):
+                if text[j] in ("{", "["):
                     depth += 1
-                elif text[j] in ('}', ']'):
+                elif text[j] in ("}", "]"):
                     if depth == 0:
                         break
                     depth -= 1
-                elif text[j] == ',' and depth == 0:
+                elif text[j] == "," and depth == 0:
                     break
                 j += 1
             raw_val = text[i:j].strip()
@@ -267,19 +266,19 @@ def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
         if end == -1:
             break
 
-        inner = text[start + len(BOT_TOKEN):end].strip()
+        inner = text[start + len(BOT_TOKEN) : end].strip()
         if inner.startswith(CALL_PREFIX):
-            inner = inner[len(CALL_PREFIX):]
+            inner = inner[len(CALL_PREFIX) :]
             # Find function name (everything before the first '{')
-            brace_pos = inner.find('{')
+            brace_pos = inner.find("{")
             if brace_pos != -1:
                 func_name = inner[:brace_pos].strip()
                 # Find matching closing brace
                 close = _find_matching_brace(inner, brace_pos)
                 if close != -1:
-                    args_str = inner[brace_pos + 1:close]
+                    args_str = inner[brace_pos + 1 : close]
                 else:
-                    args_str = inner[brace_pos + 1:]
+                    args_str = inner[brace_pos + 1 :]
                 calls.append((func_name, args_str))
 
         search_from = end + len(EOT_TOKEN)
@@ -316,14 +315,12 @@ class Gemma4ToolParser(BaseToolParser):
         # Streaming state
         self._is_inside_tool_call = False
         self._current_func_name: Optional[str] = None
-        self._parsed_pos = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Gemma4 format tool call."""
         return BOT_TOKEN in text
 
-    def detect_and_parse(self, text: str,
-                         tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing: detect and parse all tool calls in text."""
         if BOT_TOKEN not in text:
             return StreamingParseResult(normal_text=text, calls=[])
@@ -336,22 +333,20 @@ class Gemma4ToolParser(BaseToolParser):
             try:
                 parsed_args = _parse_gemma4_args(args_str)
             except (ValueError, IndexError, TypeError, KeyError) as e:
-                logger.warning(
-                    f"Failed to parse Gemma4 tool call args: {args_str}, "
-                    f"error: {e}")
+                logger.warning(f"Failed to parse Gemma4 tool call args: {args_str}, error: {e}")
                 continue
 
             tool_index = tool_indices.get(func_name, -1)
             if tool_index == -1:
-                logger.warning(
-                    f"Model attempted to call undefined function: {func_name}")
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
 
             calls.append(
                 ToolCallItem(
                     tool_index=tool_index,
                     name=func_name,
                     parameters=json.dumps(parsed_args, ensure_ascii=False),
-                ))
+                )
+            )
 
         # Normal text is everything before the first tool call
         first_tc = text.find(BOT_TOKEN)
@@ -359,8 +354,7 @@ class Gemma4ToolParser(BaseToolParser):
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def parse_streaming_increment(self, new_text: str,
-                                  tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """Streaming incremental parsing for Gemma4 tool calls.
 
         Maintains state across chunks to handle tool calls that span
@@ -378,14 +372,16 @@ class Gemma4ToolParser(BaseToolParser):
                 bot_pos = current_text.find(BOT_TOKEN)
                 if bot_pos == -1:
                     # Check for partial start token at the end
-                    partial_len = self._ends_with_partial_token(
-                        current_text, BOT_TOKEN)
+                    partial_len = self._ends_with_partial_token(current_text, BOT_TOKEN)
                     if partial_len:
                         # Keep the partial match, emit everything before it
                         normal = current_text[:-partial_len]
                         self._buffer = current_text[-partial_len:]
-                        return StreamingParseResult(
-                            normal_text=normal) if normal else StreamingParseResult()
+                        return (
+                            StreamingParseResult(normal_text=normal)
+                            if normal
+                            else StreamingParseResult()
+                        )
                     # No tool call, emit everything
                     self._buffer = ""
                     # Strip any stray end tokens
@@ -414,8 +410,8 @@ class Gemma4ToolParser(BaseToolParser):
                 if self._current_func_name is None:
                     prefix = BOT_TOKEN + CALL_PREFIX
                     if current_text.startswith(prefix):
-                        rest = current_text[len(prefix):]
-                        brace_pos = rest.find('{')
+                        rest = current_text[len(prefix) :]
+                        brace_pos = rest.find("{")
                         if brace_pos != -1:
                             func_name = rest[:brace_pos].strip()
                             self._current_func_name = func_name
@@ -424,8 +420,7 @@ class Gemma4ToolParser(BaseToolParser):
                             if self.current_tool_id == -1:
                                 self.current_tool_id = 0
                             self.streamed_args_for_tool.append("")
-                            while len(self.prev_tool_call_arr
-                                      ) <= self.current_tool_id:
+                            while len(self.prev_tool_call_arr) <= self.current_tool_id:
                                 self.prev_tool_call_arr.append({})
                             self.prev_tool_call_arr[self.current_tool_id] = {
                                 "name": func_name,
@@ -433,48 +428,49 @@ class Gemma4ToolParser(BaseToolParser):
                             }
                             self.current_tool_name_sent = True
 
-                            return StreamingParseResult(calls=[
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=func_name,
-                                    parameters="",
-                                )
-                            ])
+                            return StreamingParseResult(
+                                calls=[
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        name=func_name,
+                                        parameters="",
+                                    )
+                                ]
+                            )
 
                 # Stream raw argument text incrementally
                 if self._current_func_name is not None:
                     prefix = BOT_TOKEN + CALL_PREFIX + self._current_func_name + "{"
-                    if current_text.startswith(prefix) and len(
-                            current_text) > len(prefix):
-                        args_so_far = current_text[len(prefix):]
-                        already_sent = self.streamed_args_for_tool[
-                            self.current_tool_id]
+                    if current_text.startswith(prefix) and len(current_text) > len(prefix):
+                        args_so_far = current_text[len(prefix) :]
+                        already_sent = self.streamed_args_for_tool[self.current_tool_id]
                         if len(args_so_far) > len(already_sent):
-                            diff = args_so_far[len(already_sent):]
-                            self.streamed_args_for_tool[
-                                self.current_tool_id] += diff
-                            return StreamingParseResult(calls=[
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    parameters=diff,
-                                )
-                            ])
+                            diff = args_so_far[len(already_sent) :]
+                            self.streamed_args_for_tool[self.current_tool_id] += diff
+                            return StreamingParseResult(
+                                calls=[
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        parameters=diff,
+                                    )
+                                ]
+                            )
 
                 return StreamingParseResult()
 
             # Found end token - complete the tool call
-            inner = current_text[len(BOT_TOKEN):eot_pos].strip()
-            remaining = current_text[eot_pos + len(EOT_TOKEN):]
+            inner = current_text[len(BOT_TOKEN) : eot_pos].strip()
+            remaining = current_text[eot_pos + len(EOT_TOKEN) :]
 
             if inner.startswith(CALL_PREFIX):
-                inner = inner[len(CALL_PREFIX):]
-                brace_pos = inner.find('{')
+                inner = inner[len(CALL_PREFIX) :]
+                brace_pos = inner.find("{")
                 if brace_pos != -1:
                     func_name = inner[:brace_pos].strip()
                     close = _find_matching_brace(inner, brace_pos)
-                    args_str = inner[brace_pos +
-                                     1:close] if close != -1 else inner[
-                                         brace_pos + 1:]
+                    args_str = (
+                        inner[brace_pos + 1 : close] if close != -1 else inner[brace_pos + 1 :]
+                    )
 
                     try:
                         parsed_args = _parse_gemma4_args(args_str)
@@ -488,30 +484,26 @@ class Gemma4ToolParser(BaseToolParser):
                         # We haven't sent the name yet (whole call in one chunk)
                         if self.current_tool_id == -1:
                             self.current_tool_id = 0
-                        while len(self.prev_tool_call_arr
-                                  ) <= self.current_tool_id:
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
                             self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool
-                                  ) <= self.current_tool_id:
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
                             self.streamed_args_for_tool.append("")
 
-                        tool_index = self._tool_indices.get(func_name, -1)
                         calls.append(
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 name=func_name,
                                 parameters=args_json,
-                            ))
+                            )
+                        )
                     else:
-                        # We already sent the name, now send final args
-                        already_sent = self.streamed_args_for_tool[
-                            self.current_tool_id]
-                        # Send the complete parsed JSON minus what was already streamed raw
+                        # We already sent the name, now send final parsed JSON
                         calls.append(
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 parameters=args_json,
-                            ))
+                            )
+                        )
 
                     # Store for serving layer
                     try:
