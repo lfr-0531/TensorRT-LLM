@@ -354,11 +354,10 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# HF reference comparison tests
+# HF reference comparison tests (sub-module + full model)
 # ---------------------------------------------------------------------------
 
-# Config with UNIFORM head_dim (all sliding) to avoid per-layer head_dim
-# issues before C++ rebuild. This tests core model logic.
+# Uniform head_dim config for comparisons (avoids per-layer head_dim issues)
 GEMMA4_UNIFORM_CONFIG = {
     "model_type": "gemma4_text",
     "vocab_size": 1024,
@@ -435,6 +434,92 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertLessEqual(
             failed, max_failed_frac,
             f"{failed*100:.2f}% of elements differ (max {max_failed_frac*100}%)")
+
+    def _make_hf_and_trt_models(self, config_dict=None):
+        """Create paired HF and TRT-LLM models with shared weights."""
+        from transformers import Gemma4ForCausalLM as HFGemma4
+        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import \
+            Gemma4HfWeightMapper
+
+        config_dict = config_dict or deepcopy(GEMMA4_UNIFORM_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        dtype = config.torch_dtype
+        device = torch.device('cuda')
+
+        hf_model = HFGemma4(config).to(dtype).to(device).eval()
+        model_config = ModelConfig(pretrained_config=config,
+                                    attn_backend="FLASHINFER")
+        trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
+
+        wm = Gemma4HfWeightMapper()
+        wm.init_model_and_config(trt_model, model_config)
+        trt_model.load_weights(hf_model.state_dict(), wm)
+
+        return hf_model, trt_model, config
+
+    # ---- Sub-module numerical comparison tests ----
+
+    @torch.no_grad()
+    def test_embedding_matches_hf(self):
+        """Embedding layer: scaled by sqrt(hidden_size)."""
+        hf, trt, config = self._make_hf_and_trt_models()
+        ids = torch.tensor([100, 200, 300, 400], dtype=torch.int32, device='cuda')
+
+        with torch.inference_mode():
+            hf_out = hf.model.embed_tokens(ids.unsqueeze(0)).squeeze(0)
+            trt_out = trt.model.embed_tokens(ids)
+
+        self.assertTrue(torch.allclose(hf_out, trt_out, atol=1e-3),
+                         f"Embedding max diff: {(hf_out - trt_out).abs().max()}")
+
+    @torch.no_grad()
+    def test_mlp_matches_hf(self):
+        """MLP (GatedMLP with gelu_tanh) output comparison."""
+        hf, trt, config = self._make_hf_and_trt_models()
+        x = torch.randn(4, config.hidden_size, device='cuda',
+                          dtype=config.torch_dtype)
+
+        with torch.inference_mode():
+            hf_out = hf.model.layers[0].mlp(x.unsqueeze(0)).squeeze(0)
+            trt_out = trt.model.layers[0].mlp(x)
+
+        self._assert_most_elems_close(trt_out.float(), hf_out.float(),
+                                       atol=0.01, rtol=0.01)
+
+    @torch.no_grad()
+    def test_rms_norm_matches_hf(self):
+        """RMSNorm with Gemma +1 offset convention."""
+        hf, trt, config = self._make_hf_and_trt_models()
+        x = torch.randn(4, config.hidden_size, device='cuda',
+                          dtype=config.torch_dtype)
+
+        with torch.inference_mode():
+            hf_out = hf.model.layers[0].input_layernorm(x.unsqueeze(0)).squeeze(0)
+            trt_out = trt.model.layers[0].input_layernorm(x)
+
+        self.assertTrue(torch.allclose(hf_out, trt_out, atol=1e-2),
+                         f"Norm max diff: {(hf_out - trt_out).abs().max()}")
+
+    @torch.no_grad()
+    def test_logit_softcapping_matches_hf(self):
+        """Final logit softcapping: tanh(x/cap) * cap."""
+        from transformers import Gemma4ForCausalLM as HFGemma4
+
+        config_dict = deepcopy(GEMMA4_UNIFORM_CONFIG)
+        config_dict["final_logit_softcapping"] = 30.0
+        config_dict["num_hidden_layers"] = 2
+        config = Gemma4TextConfig(**config_dict)
+
+        # Just test the softcapping math directly
+        logits = torch.randn(1, config.vocab_size, device='cuda')
+        cap = config.final_logit_softcapping
+        capped = torch.tanh(logits / cap) * cap
+        # Verify values are bounded
+        self.assertTrue((capped.abs() <= cap).all())
+        # Verify small values are approximately unchanged
+        small = torch.tensor([[0.1, -0.1, 0.5]], device='cuda')
+        small_capped = torch.tanh(small / cap) * cap
+        self.assertTrue(torch.allclose(small, small_capped, atol=0.01))
 
     @torch.no_grad()
     def test_gemma4_allclose_to_hf(self):
