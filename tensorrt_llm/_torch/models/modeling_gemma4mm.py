@@ -18,6 +18,7 @@ and the Gemma4ForConditionalGeneration wrapper.
 Vision and audio towers use native transformers models via
 AutoModel.from_config() (requires transformers>=5.5.0).
 """
+
 import copy
 import dataclasses
 import math
@@ -25,26 +26,27 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from transformers import (AutoModel, AutoTokenizer, Gemma4AudioConfig,
-                          Gemma4Config, Gemma4VisionConfig, PretrainedConfig,
-                          PreTrainedModel)
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
+from transformers import AutoModel, AutoTokenizer, Gemma4Config, PretrainedConfig, PreTrainedModel
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 
 from ..._utils import nvtx_range
-from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ContentFormat,
-                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
-                       MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor)
+from ...inputs import (
+    BaseMultimodalDummyInputsBuilder,
+    BaseMultimodalInputProcessor,
+    ContentFormat,
+    ExtraProcessedInputs,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+    TextPrompt,
+    register_input_processor,
+)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
-from ..modules.rms_norm import RMSNorm
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -68,10 +70,8 @@ class _RMSNormNoScale(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = x.float() * torch.pow(
-            x.float().pow(2).mean(-1, keepdim=True) + self.eps, -0.5)
+        normed = x.float() * torch.pow(x.float().pow(2).mean(-1, keepdim=True) + self.eps, -0.5)
         return normed.type_as(x)
-
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +99,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
         mapping=None,
     ):
         super().__init__()
-        self.embedding_pre_projection_norm = _RMSNormNoScale(
-            mm_hidden_size, eps=eps)
+        self.embedding_pre_projection_norm = _RMSNormNoScale(mm_hidden_size, eps=eps)
         self.embedding_projection = Linear(
             in_features=mm_hidden_size,
             out_features=text_hidden_size,
@@ -125,8 +124,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Gemma4InputProcessor(BaseMultimodalInputProcessor,
-                           BaseMultimodalDummyInputsBuilder):
+class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Preprocesses image inputs for Gemma4.
 
     Tries to use the HF ``Gemma4Processor`` if available in the installed
@@ -157,6 +155,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
         self._processor = None
         try:
             from transformers import AutoProcessor
+
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
                 trust_remote_code=trust_remote_code,
@@ -169,17 +168,17 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
             )
 
         self._image_processor = None
-        if self._processor is not None and hasattr(self._processor,
-                                                     'image_processor'):
+        if self._processor is not None and hasattr(self._processor, "image_processor"):
             self._image_processor = self._processor.image_processor
         elif self._processor is None:
             try:
                 from transformers import AutoImageProcessor
+
                 self._image_processor = AutoImageProcessor.from_pretrained(
-                    model_path, trust_remote_code=trust_remote_code)
+                    model_path, trust_remote_code=trust_remote_code
+                )
             except Exception:
-                logger.warning(
-                    "Could not load image processor for Gemma4.")
+                logger.warning("Could not load image processor for Gemma4.")
 
     @property
     def config(self) -> PretrainedConfig:
@@ -206,8 +205,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
         text_prompt = inputs.get("prompt")
         mm_data = inputs.get("multi_modal_data", {})
         if mm_data and "image" not in mm_data:
-            raise KeyError(
-                "Expected image data in multimodal data for Gemma4.")
+            raise KeyError("Expected image data in multimodal data for Gemma4.")
 
         images = mm_data.get("image")
         pixel_values = None
@@ -228,11 +226,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
             image_position_ids = proc_out.get("image_position_ids")
         else:
             input_ids = self._tokenizer(
-                text_prompt, return_tensors="pt",
+                text_prompt,
+                return_tensors="pt",
             )["input_ids"]
             if images is not None and self._image_processor is not None:
-                img_out = self._image_processor(
-                    images=images, return_tensors="pt")
+                img_out = self._image_processor(images=images, return_tensors="pt")
                 pixel_values = img_out.get("pixel_values")
                 if pixel_values is not None:
                     pixel_values = pixel_values.to(dtype=self.dtype)
@@ -242,7 +240,9 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
 
     @torch.inference_mode()
     def __call__(
-        self, inputs: TextPrompt, sampling_params: SamplingParams,
+        self,
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         input_ids, pixel_values, image_position_ids = self._preprocess(inputs)
         multimodal_data = None
@@ -269,7 +269,8 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor,
         placeholder_map={"image": "<start_of_image>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.STRING,
-    ))
+    ),
+)
 class Gemma4ForConditionalGeneration(PreTrainedModel):
     """Gemma4 multimodal model: LLM + vision tower + multimodal embedder.
 
@@ -297,51 +298,56 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self._top_config = config  # Preserve before post_config replaces it
 
         self.image_token_ids = torch.tensor(
-            [config.image_token_id],
-            dtype=torch.int32, device=self._device)
+            [config.image_token_id], dtype=torch.int32, device=self._device
+        )
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
 
         # --- Language model ---
-        llm_model_config = self.get_sub_model_config(
-            model_config_cp, "text_config")
+        llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
 
         # --- Vision tower (native transformers, eager mode) ---
         if config.vision_config is not None:
-            self.vision_tower = AutoModel.from_config(
-                config.vision_config).eval().to(self._device)
+            self.vision_tower = AutoModel.from_config(config.vision_config).eval().to(self._device)
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
             vision_eps = config.vision_config.rms_norm_eps
-            self.embed_vision = Gemma4MultimodalEmbedder(
-                mm_hidden_size=vision_hidden,
-                text_hidden_size=text_hidden,
-                eps=vision_eps,
-                dtype=self.model_dtype,
-                mapping=model_config.mapping,
-            ).eval().to(self._device)
+            self.embed_vision = (
+                Gemma4MultimodalEmbedder(
+                    mm_hidden_size=vision_hidden,
+                    text_hidden_size=text_hidden,
+                    eps=vision_eps,
+                    dtype=self.model_dtype,
+                    mapping=model_config.mapping,
+                )
+                .eval()
+                .to(self._device)
+            )
         else:
             self.vision_tower = None
             self.embed_vision = None
 
         # --- Audio tower (native transformers, eager mode) ---
         if config.audio_config is not None:
-            self.audio_tower = AutoModel.from_config(
-                config.audio_config).eval().to(self._device)
+            self.audio_tower = AutoModel.from_config(config.audio_config).eval().to(self._device)
             audio_hidden = getattr(
-                config.audio_config, "output_proj_dims",
-                config.audio_config.hidden_size)
+                config.audio_config, "output_proj_dims", config.audio_config.hidden_size
+            )
             text_hidden = config.text_config.hidden_size
             audio_eps = config.audio_config.rms_norm_eps
-            self.embed_audio = Gemma4MultimodalEmbedder(
-                mm_hidden_size=audio_hidden,
-                text_hidden_size=text_hidden,
-                eps=audio_eps,
-                dtype=self.model_dtype,
-                mapping=model_config.mapping,
-            ).eval().to(self._device)
+            self.embed_audio = (
+                Gemma4MultimodalEmbedder(
+                    mm_hidden_size=audio_hidden,
+                    text_hidden_size=text_hidden,
+                    eps=audio_eps,
+                    dtype=self.model_dtype,
+                    mapping=model_config.mapping,
+                )
+                .eval()
+                .to(self._device)
+            )
         else:
             self.audio_tower = None
             self.embed_audio = None
@@ -354,25 +360,24 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         model_config: ModelConfig[Gemma4Config],
         name: str,
     ) -> ModelConfig:
-        assert name in [
-            "text_config", "vision_config", "audio_config"
-        ], (f"Expected subconfig name to be 'text_config', 'vision_config', "
-            f"or 'audio_config'. Got {name} instead.")
+        assert name in ["text_config", "vision_config", "audio_config"], (
+            f"Expected subconfig name to be 'text_config', 'vision_config', "
+            f"or 'audio_config'. Got {name} instead."
+        )
         pretrained_config = getattr(model_config.pretrained_config, name)
-        quant_config = (
-            model_config.quant_config if name == "text_config" else None)
-        preferred_backend = (
-            "FLASHINFER" if name == "text_config" else "TRTLLM")
+        quant_config = model_config.quant_config if name == "text_config" else None
+        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
             attn_backend=preferred_backend,
             quant_config=quant_config,
         )
-        if (hasattr(sub_config.pretrained_config, "torch_dtype")
-                and sub_config.pretrained_config.torch_dtype is None):
-            sub_config.pretrained_config.torch_dtype = (
-                model_config.pretrained_config.torch_dtype)
+        if (
+            hasattr(sub_config.pretrained_config, "torch_dtype")
+            and sub_config.pretrained_config.torch_dtype is None
+        ):
+            sub_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
         return sub_config
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
@@ -382,16 +387,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         llm_weights = {}
         for k, v in weights.items():
             if k.startswith(_LANG):
-                llm_weights["model." + k[len(_LANG):]] = v
+                llm_weights["model." + k[len(_LANG) :]] = v
         self.llm.load_weights(llm_weights, weight_mapper)
 
         # Strip outer "model." for non-LLM components
-        stripped = {(k[len("model."):] if k.startswith("model.") else k): v
-                    for k, v in weights.items()}
+        stripped = {
+            (k[len("model.") :] if k.startswith("model.") else k): v for k, v in weights.items()
+        }
 
         if self.vision_tower is not None:
             vit_weights = filter_weights("vision_tower", stripped)
-            self.vision_tower.load_weights(vit_weights)
+            # Native transformers models use load_state_dict, not load_weights
+            self.vision_tower.load_state_dict(vit_weights, strict=False)
 
         if self.embed_vision is not None:
             embed_v_weights = filter_weights("embed_vision", stripped)
@@ -410,17 +417,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     @nvtx_range("[Vision] process")
     def _get_image_features(
-        self, pixel_values: torch.Tensor,
+        self,
+        pixel_values: torch.Tensor,
         image_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pooling_k2 = self._top_config.vision_config.pooling_kernel_size ** 2
+        pooling_k2 = self._top_config.vision_config.pooling_kernel_size**2
         target_dtype = self.embed_vision.embedding_projection.weight.dtype
 
         per_image_features = []
         for i in range(pixel_values.shape[0]):
             pv = pixel_values[i].unsqueeze(0)
-            pp = (image_position_ids[i].unsqueeze(0)
-                  if image_position_ids is not None else None)
+            pp = image_position_ids[i].unsqueeze(0) if image_position_ids is not None else None
 
             if pp is None:
                 max_patches = pv.shape[1]
@@ -429,7 +436,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     torch.meshgrid(
                         torch.arange(side, device=pv.device),
                         torch.arange(side, device=pv.device),
-                        indexing="ij"),
+                        indexing="ij",
+                    ),
                     dim=-1,
                 ).reshape(1, -1, 2)
 
@@ -437,10 +445,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             output_length = max_patches // pooling_k2
 
             with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-                hidden = self.vision_tower(
-                    pv, pp, output_length=output_length)
-                projected = self.embed_vision(
-                    hidden.unsqueeze(0).to(target_dtype)).squeeze(0)
+                hidden = self.vision_tower(pv, pp, output_length=output_length)
+                projected = self.embed_vision(hidden.unsqueeze(0).to(target_dtype)).squeeze(0)
             per_image_features.append(projected)
 
         return torch.cat(per_image_features, dim=0).contiguous()
@@ -455,11 +461,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
-        num_ctx, num_gen = (
-            attn_metadata.num_contexts, attn_metadata.num_generations)
-        logger.debug(
-            f"[Gemma4ForConditionalGeneration::forward] "
-            f"{num_ctx=}, {num_gen=}")
+        num_ctx, num_gen = (attn_metadata.num_contexts, attn_metadata.num_generations)
+        logger.debug(f"[Gemma4ForConditionalGeneration::forward] {num_ctx=}, {num_gen=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
 
