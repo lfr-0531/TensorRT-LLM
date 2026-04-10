@@ -1908,7 +1908,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache_pool_mapping_list.append([layer_group_id, offset])
 
         kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
-                                             dtype=torch.int64,
+                                             dtype=torch.int32,
                                              device="cpu",
                                              pin_memory=prefer_pinned())
         return kv_cache_pool_pointers, kv_cache_pool_mapping
