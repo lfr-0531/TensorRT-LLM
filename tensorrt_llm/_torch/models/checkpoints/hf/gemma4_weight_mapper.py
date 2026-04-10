@@ -182,16 +182,12 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                            n: str,
                            p: nn.Parameter,
                            allow_partial_loading: bool = False) -> None:
-        # Gemma uses weight+1 convention for RMSNorm weights.
-        if 'norm' in module_name:
-            if not allow_partial_loading:
-                assert n in module_weights
-            if n in module_weights:
-                p.data.copy_(module_weights[n][:] + 1)
-        else:
-            super().handle_manual_copy(
-                module_name,
-                module_weights,
-                n,
-                p,
-                allow_partial_loading=allow_partial_loading)
+        # Unlike Gemma2/Gemma3, Gemma4 does NOT use the weight+1 convention
+        # for RMSNorm. HF Gemma4RMSNorm initializes weights to ones and
+        # multiplies directly (no "+1" in forward), so we copy as-is.
+        super().handle_manual_copy(
+            module_name,
+            module_weights,
+            n,
+            p,
+            allow_partial_loading=allow_partial_loading)

@@ -176,15 +176,15 @@ class Gemma4Attention(QKNormRoPEAttention):
         # Restore original config head_dim
         config.head_dim = original_head_dim
 
-        # For K=V: add v_norm (no learnable scale) to normalize the
-        # value states derived from key states after k_norm.
-        if self.use_k_eq_v:
-            self.v_norm = RMSNorm(
-                hidden_size=layer_head_dim,
-                eps=config.rms_norm_eps,
-                dtype=config.torch_dtype,
-                has_weights=False,
-            )
+        # v_norm: always present in Gemma4 (no learnable scale).
+        # For K=V layers, value is derived from key after k_norm, then v_norm.
+        # For regular layers, v_norm is applied to the v_proj output.
+        self.v_norm = RMSNorm(
+            hidden_size=layer_head_dim,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            has_weights=False,
+        )
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
                    v: Optional[torch.Tensor], position_ids: torch.Tensor):
@@ -195,8 +195,11 @@ class Gemma4Attention(QKNormRoPEAttention):
 
             # K=V: derive value from key after k_norm
             if self.use_k_eq_v:
-                v = self.v_norm(k.reshape(-1, self.head_dim)).reshape(
-                    -1, self.kv_size)
+                v = k.clone()
+
+            # Always apply v_norm (Gemma4 normalizes values regardless of K=V)
+            v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(
+                -1, self.kv_size)
 
             if not self.skip_rope:
                 return super(QKNormRoPEAttention,
