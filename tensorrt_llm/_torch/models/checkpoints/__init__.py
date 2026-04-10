@@ -28,7 +28,7 @@ __all__ = [
     "MixtralHfWeightMapper", "Llama4HfWeightMapper", "Qwen2MoeHfWeightMapper",
     "Qwen3MoeHfWeightMapper", "Qwen2VLHfWeightMapper",
     "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
-    "Gemma4HfWeightMapper",
-    "LlavaNextHfWeightMapper", "MistralLarge3CheckpointLoader",
-    "MistralLarge3WeightMapper", "Qwen3VLHfWeightMapper"
+    "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
+    "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
+    "Qwen3VLHfWeightMapper"
 ]

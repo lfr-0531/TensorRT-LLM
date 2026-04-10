@@ -91,6 +91,23 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Q-only linear for KV shared layers
+# ---------------------------------------------------------------------------
+class _QOnlyLinear(nn.Linear):
+    """Q-only linear with load_weights compatible with QKV fused path.
+
+    Used by KV shared layers where HF doesn't create k/v projections.
+    """
+
+    def load_weights(self, weights, allow_partial_loading=False):
+        # weights is a list of [q_dict, k_dict, v_dict] from fused QKV mapper.
+        # Only load q_proj weights; ignore k/v (not present for shared layers).
+        q_weights = weights[0] if isinstance(weights, list) else weights
+        if isinstance(q_weights, dict) and "weight" in q_weights:
+            self.weight.data.copy_(q_weights["weight"])
+
+
+# ---------------------------------------------------------------------------
 # Gemma4 Attention
 # ---------------------------------------------------------------------------
 class Gemma4Attention(QKNormRoPEAttention):
@@ -161,7 +178,6 @@ class Gemma4Attention(QKNormRoPEAttention):
         # For scaling=1.0: q_scaling = 1 / sqrt(head_dim)
         q_scaling = 1.0 / math.sqrt(layer_head_dim)
 
-        # K=V flag (already computed above)
         self.use_k_eq_v = use_k_eq_v
 
         # Temporarily override config.head_dim so the Attention base class
@@ -190,17 +206,6 @@ class Gemma4Attention(QKNormRoPEAttention):
         # KV shared layers: replace fused QKV with Q-only projection.
         # HF doesn't create k/v for shared layers, so we match that.
         if is_kv_shared:
-
-            class _QOnlyLinear(nn.Linear):
-                """Q-only linear with load_weights compatible with QKV fused path."""
-
-                def load_weights(self, weights, allow_partial_loading=False):
-                    # weights is a list of [q_dict, k_dict, v_dict] from fused QKV mapper.
-                    # Only load q_proj weights; ignore k/v (not present for shared layers).
-                    q_weights = weights[0] if isinstance(weights, list) else weights
-                    if isinstance(q_weights, dict) and "weight" in q_weights:
-                        self.weight.data.copy_(q_weights["weight"])
-
             self.qkv_proj = _QOnlyLinear(
                 config.hidden_size,
                 self.q_size,
@@ -410,7 +415,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[Gemma4TextConfig],
         layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config

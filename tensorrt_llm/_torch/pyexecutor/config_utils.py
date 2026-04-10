@@ -284,7 +284,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
     elif checkpoint_format in ("mistral", "mistral_large_3"):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
         model_config = getattr(
             MistralConfigLoader().load(model_name_or_path).pretrained_config,
             "text_config")

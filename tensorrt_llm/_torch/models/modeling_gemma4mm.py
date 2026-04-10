@@ -45,7 +45,6 @@ from ...inputs import (
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
-from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
@@ -56,10 +55,6 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
-
-
-# Vision and audio towers use native transformers models via
-# AutoModel.from_config(). See Gemma4ForConditionalGeneration.__init__().
 
 
 class _RMSNormNoScale(nn.Module):
@@ -300,6 +295,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.image_token_ids = torch.tensor(
             [config.image_token_id], dtype=torch.int32, device=self._device
         )
+        self.audio_token_ids = (
+            torch.tensor([config.audio_token_id], dtype=torch.int32, device=self._device)
+            if getattr(config, "audio_token_id", None) is not None
+            else None
+        )
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -404,6 +404,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             embed_v_weights = filter_weights("embed_vision", stripped)
             self.embed_vision.load_weights(embed_v_weights)
 
+        if self.audio_tower is not None:
+            audio_weights = filter_weights("audio_tower", stripped)
+            self.audio_tower.load_state_dict(audio_weights, strict=False)
+
         if self.embed_audio is not None:
             embed_a_weights = filter_weights("embed_audio", stripped)
             self.embed_audio.load_weights(embed_a_weights)
@@ -429,8 +433,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             pv = pixel_values[i].unsqueeze(0)
             pp = image_position_ids[i].unsqueeze(0) if image_position_ids is not None else None
 
+            max_patches = pv.shape[1]
+
             if pp is None:
-                max_patches = pv.shape[1]
                 side = int(math.sqrt(max_patches))
                 pp = torch.stack(
                     torch.meshgrid(
@@ -441,15 +446,28 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     dim=-1,
                 ).reshape(1, -1, 2)
 
-            max_patches = pv.shape[1]
             output_length = max_patches // pooling_k2
 
             with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-                hidden = self.vision_tower(pv, pp, output_length=output_length)
+                output = self.vision_tower(pv, pp, output_length=output_length)
+                hidden = output.last_hidden_state
                 projected = self.embed_vision(hidden.unsqueeze(0).to(target_dtype)).squeeze(0)
             per_image_features.append(projected)
 
         return torch.cat(per_image_features, dim=0).contiguous()
+
+    @nvtx_range("[Audio] process")
+    def _get_audio_features(
+        self,
+        audio_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Process audio features through audio tower and embedder."""
+        target_dtype = self.embed_audio.embedding_projection.weight.dtype
+        with torch.autocast(device_type="cuda", dtype=self.model_dtype):
+            output = self.audio_tower(audio_features)
+            hidden = output.last_hidden_state
+            projected = self.embed_audio(hidden.to(target_dtype))
+        return projected.contiguous()
 
     @torch.inference_mode()
     def forward(
@@ -461,13 +479,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
-        num_ctx, num_gen = (attn_metadata.num_contexts, attn_metadata.num_generations)
-        logger.debug(f"[Gemma4ForConditionalGeneration::forward] {num_ctx=}, {num_gen=}")
-
         multimodal_params = kwargs.get("multimodal_params", [])
 
+        # --- Extract image data ---
         pixel_values_list = []
         image_position_ids_list = []
+        # --- Extract audio data ---
+        audio_features_list = []
         for mp in multimodal_params:
             img_data = mp.multimodal_data.get("image", {})
             pv = img_data.get("pixel_values")
@@ -477,8 +495,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 if pid is not None:
                     image_position_ids_list.append(pid)
 
+            aud_data = mp.multimodal_data.get("audio", {})
+            af = aud_data.get("audio_features")
+            if af is not None:
+                audio_features_list.append(af)
+
         mm_embeds = []
-        mm_token_mask = None
+        all_mm_token_ids = []
+        mm_token_type_ids = None
+
+        # --- Process image features ---
         if len(pixel_values_list) > 0:
             pixel_values = torch.cat(pixel_values_list)
             image_position_ids = (
@@ -490,14 +516,32 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
             )
-            mm_embeds = [image_features]
-            mm_token_mask = torch.isin(input_ids, self.image_token_ids)
+            mm_embeds.append(image_features)
+            all_mm_token_ids.append(self.image_token_ids)
+
+        # --- Process audio features ---
+        if len(audio_features_list) > 0 and self.audio_tower is not None:
+            audio_input = torch.cat(audio_features_list)
+            audio_embeds = self._get_audio_features(audio_input)
+            mm_embeds.append(audio_embeds)
+            if self.audio_token_ids is not None:
+                all_mm_token_ids.append(self.audio_token_ids)
+
+        # Build integer mm_token_type_ids: 0=text, 1=image, 2=audio
+        # _get_token_type_mask expects integer type IDs, not a boolean mask.
+        if len(mm_embeds) > 0:
+            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+            mm_token_type_ids[torch.isin(input_ids, self.image_token_ids)] = 1
+            if self.audio_token_ids is not None:
+                mm_token_type_ids[torch.isin(input_ids, self.audio_token_ids)] = 2
+
+        fuse_token_ids = torch.cat(all_mm_token_ids) if all_mm_token_ids else self.image_token_ids
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=self.image_token_ids,
+            mm_token_ids=fuse_token_ids,
             **kwargs,
         )
         logits = self.llm.forward(
@@ -506,11 +550,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
-            image_token_mask=mm_token_mask,
+            mm_token_type_ids=mm_token_type_ids,
             lora_params=kwargs.get("lora_params", None),
         )
         return logits
 
     @property
     def mm_token_ids(self):
-        return self.image_token_ids
+        ids = [self.image_token_ids]
+        if self.audio_token_ids is not None:
+            ids.append(self.audio_token_ids)
+        return torch.cat(ids) if len(ids) > 1 else self.image_token_ids
