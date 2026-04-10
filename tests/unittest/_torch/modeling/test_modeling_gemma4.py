@@ -444,6 +444,39 @@ GEMMA4_KV_SHARING_CONFIG = {
     "num_kv_shared_layers": 2,
 }
 
+# --- Mixed feature configs matching real model patterns ---
+
+# 26B-A4B-like: hybrid_hd + K=V + MoE + softcap
+GEMMA4_26B_LIKE_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "attention_k_eq_v": True,
+    "enable_moe_block": True,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "moe_intermediate_size": 256,
+    "final_logit_softcapping": 30.0,
+}
+
+# E2B-like: hybrid_hd + PLE + KV_share + double_MLP + softcap
+# Use 12 layers (5:1 pattern → 2 full layers at idx 5,11) so KV sharing
+# has non-shared full layers to share from.
+GEMMA4_E2B_LIKE_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "num_hidden_layers": 12,
+    "hidden_size_per_layer_input": 32,
+    "vocab_size_per_layer_input": 1024,
+    "num_kv_shared_layers": 4,
+    "use_double_wide_mlp": True,
+    "final_logit_softcapping": 30.0,
+}
+
+# 31B-like: hybrid_hd + K=V + softcap (subset of 26B, no MoE)
+GEMMA4_31B_LIKE_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "attention_k_eq_v": True,
+    "final_logit_softcapping": 30.0,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
@@ -747,6 +780,34 @@ class TestGemma4HFComparison(unittest.TestCase):
             rtol=1.0,
             max_failed_frac=0.05,
         )
+
+    # ---- Mixed feature tests (matching real model patterns) ----
+
+    @torch.no_grad()
+    def test_26b_like_config(self):
+        """26B-A4B pattern: hybrid head_dim + K=V + MoE + softcap."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_26B_LIKE_CONFIG),
+            atol=1.0,
+            rtol=1.0,
+            max_failed_frac=0.05,
+        )
+
+    @torch.no_grad()
+    def test_e2b_like_config(self):
+        """E2B pattern: hybrid head_dim + PLE + KV sharing + double MLP + softcap."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_E2B_LIKE_CONFIG),
+        )
+
+    @torch.no_grad()
+    def test_31b_like_config(self):
+        """31B pattern: hybrid head_dim + K=V + softcap."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_31B_LIKE_CONFIG),
+        )
+
+    # ---- Structural tests ----
 
     @torch.no_grad()
     def test_kv_sharing_instantiation(self):
