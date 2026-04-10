@@ -187,6 +187,27 @@ class Gemma4Attention(QKNormRoPEAttention):
         # Restore original config head_dim
         config.head_dim = original_head_dim
 
+        # KV shared layers: replace fused QKV with Q-only projection.
+        # HF doesn't create k/v for shared layers, so we match that.
+        if is_kv_shared:
+
+            class _QOnlyLinear(nn.Linear):
+                """Q-only linear with load_weights compatible with QKV fused path."""
+
+                def load_weights(self, weights, allow_partial_loading=False):
+                    # weights is a list of [q_dict, k_dict, v_dict] from fused QKV mapper.
+                    # Only load q_proj weights; ignore k/v (not present for shared layers).
+                    q_weights = weights[0] if isinstance(weights, list) else weights
+                    if isinstance(q_weights, dict) and "weight" in q_weights:
+                        self.weight.data.copy_(q_weights["weight"])
+
+            self.qkv_proj = _QOnlyLinear(
+                config.hidden_size,
+                self.q_size,
+                bias=False,
+                dtype=config.torch_dtype,
+            )
+
         # v_norm: always present in Gemma4 (no learnable scale).
         # For K=V layers, value is derived from key after k_norm, then v_norm.
         # For regular layers, v_norm is applied to the v_proj output.
@@ -206,15 +227,22 @@ class Gemma4Attention(QKNormRoPEAttention):
     ):
         # Split QKV, apply QK norm
         if not self.fuse_qk_norm_rope:
-            q, k, v = self.split_qkv(q, k, v)
-
-            # KV shared layers: skip k/v computation, only process q
+            # KV shared layers: only q was produced (no k/v proj).
+            # Pad with zeros to match expected q+k+v size so split_qkv works.
             if self.is_kv_shared:
-                q, _ = self.apply_qk_norm(q, k)
+                q_raw = self.q_norm(q.reshape(-1, self.head_dim)).reshape(-1, self.q_size)
+                # Pad with zeros for k/v to satisfy split_qkv in convert_qkv
+                kv_pad = q_raw.new_zeros(q_raw.shape[0], 2 * self.kv_size)
+                q_padded = torch.cat([q_raw, kv_pad], dim=-1)
+                q_padded, k_dummy, v_dummy = self.split_qkv(q_padded, None, None)
                 if not self.skip_rope:
-                    q, _, _ = super(QKNormRoPEAttention, self).apply_rope(q, k, v, position_ids)
-                return q, None, None
+                    q_padded, _, _ = super(QKNormRoPEAttention, self).apply_rope(
+                        q_padded, k_dummy, v_dummy, position_ids
+                    )
+                # Return None for k/v so FlashInfer skips cache append
+                return q_padded, None, None
 
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)
 
             # K=V: derive value from key after k_norm
@@ -234,6 +262,12 @@ class Gemma4Attention(QKNormRoPEAttention):
         if k is not None and v is not None:
             qkv = torch.concat([q, k, v], dim=-1)
         return self.apply_qk_norm_rope(qkv, position_ids)
+
+    def convert_qkv(self, q, k, v):
+        """Override: KV-shared layers return q-only, skip convert/split."""
+        if self.is_kv_shared and k is None and v is None:
+            return q, None, None
+        return super().convert_qkv(q, k, v)
 
     @torch.inference_mode()
     def forward(

@@ -210,6 +210,10 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                     if k_key in weights and v_key not in weights:
                         weights[v_key] = weights[k_key]
 
+        # KV shared layers: HF omits k_proj/v_proj for shared layers.
+        # The model uses Q-only projection for these layers, so no dummy
+        # weights needed — q_proj maps directly to the Q-only Linear.
+
         return weights
 
     def should_skip_module(self, module_name: str) -> bool:
