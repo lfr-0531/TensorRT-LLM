@@ -745,8 +745,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # --- Vision tower (eager) ---
         if config.vision_config is not None:
-            self.vision_tower = Gemma4VisionModel(
-                config.vision_config).eval().to(self._device)
+            try:
+                self.vision_tower = Gemma4VisionModel(
+                    config.vision_config).eval().to(self._device)
+            except Exception as e:
+                logger.warning(f"Failed to init vision tower: {e}. Disabling.")
+                self.vision_tower = None
 
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
