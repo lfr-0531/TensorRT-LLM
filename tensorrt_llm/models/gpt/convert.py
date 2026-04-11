@@ -30,9 +30,6 @@ import torch.nn as nn
 import yaml
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# AutoModelForVision2Seq was removed in transformers 5.x
-AutoModelForVision2Seq = None
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
@@ -43,6 +40,9 @@ from ..convert_utils import (generate_int8, get_weight, get_weight_and_bias,
                              load_calib_dataset,
                              retrieved_layer_index_from_name, smooth_gemm)
 from .config import GPTConfig
+
+# AutoModelForVision2Seq was removed in transformers 5.x
+AutoModelForVision2Seq = None
 
 
 def rename_keys(model_state, layer_rename_config: Dict[str, str]):

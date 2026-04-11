@@ -441,8 +441,9 @@ class Gemma4DecoderLayer(DecoderLayer):
             non_shared_types = config.layer_types[:first_kv_shared_layer_idx]
             current_type = config.layer_types[layer_idx]
             if current_type in non_shared_types:
-                cache_layer_idx = (len(non_shared_types) - 1 -
-                                   non_shared_types[::-1].index(current_type))
+                cache_layer_idx = (
+                    len(non_shared_types) - 1 - non_shared_types[::-1].index(current_type)
+                )
 
         # Double-wide MLP for KV-shared layers when configured
         intermediate_size = config.intermediate_size

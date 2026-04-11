@@ -2,14 +2,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-# get_parameter_device/dtype removed in transformers 5.x
-def get_parameter_device(module):
-    return next(module.parameters()).device
-
-
-def get_parameter_dtype(module):
-    return next(module.parameters()).dtype
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)
@@ -21,6 +13,16 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from .modeling_clip import CLIPEncoder
 from .modeling_utils import _load_weights_impl, register_auto_model
+
+
+# get_parameter_device/dtype removed in transformers 5.x
+def get_parameter_device(module):
+    return next(module.parameters()).device
+
+
+def get_parameter_dtype(module):
+    return next(module.parameters()).dtype
+
 
 SiglipEncoder = CLIPEncoder
 

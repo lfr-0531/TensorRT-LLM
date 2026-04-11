@@ -4,14 +4,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-
-# get_parameter_device/dtype removed in transformers 5.x
-def get_parameter_device(module):
-    return next(module.parameters()).device
-
-
-def get_parameter_dtype(module):
-    return next(module.parameters()).dtype
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
@@ -24,6 +16,15 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
 from .modeling_utils import _load_weights_impl, register_auto_model
+
+
+# get_parameter_device/dtype removed in transformers 5.x
+def get_parameter_device(module):
+    return next(module.parameters()).device
+
+
+def get_parameter_dtype(module):
+    return next(module.parameters()).dtype
 
 
 class CLIPAttention(Attention):
