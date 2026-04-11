@@ -976,6 +976,23 @@ def _create_kv_cache_manager(
     if layer_mask is None:
         draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
                                if model_engine is not None else None)
+    # When layer_mask is set (e.g., KV sharing), filter per-layer lists
+    # to only include enabled layers, matching num_hidden_layers.
+    if layer_mask is not None:
+        if isinstance(head_dim, list) and len(head_dim) > num_hidden_layers:
+            logger.info(
+                f"Filtering head_dim list from {len(head_dim)} to "
+                f"{num_hidden_layers} elements (layer_mask active)")
+            head_dim = [hd for hd, m in zip(head_dim, layer_mask) if m]
+        if isinstance(num_key_value_heads,
+                       list) and len(num_key_value_heads) > num_hidden_layers:
+            logger.info(
+                f"Filtering num_key_value_heads list from "
+                f"{len(num_key_value_heads)} to {num_hidden_layers} elements")
+            num_key_value_heads = [
+                kv for kv, m in zip(num_key_value_heads, layer_mask) if m
+            ]
+
     # If num_key_value_heads is already a per-layer list (e.g., Gemma4 hybrid),
     # use it directly; otherwise build from the scalar value.
     if isinstance(num_key_value_heads, list):

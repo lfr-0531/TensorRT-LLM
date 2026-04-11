@@ -137,8 +137,9 @@ def _make_dummy_config_dir(
             if tc.get("num_experts_per_tok") is not None:
                 tc["num_experts_per_tok"] = min(tc["num_experts_per_tok"], 4)
 
-        # Reduce sliding window
+        # Reduce sliding window and vocab for faster testing
         tc["sliding_window"] = 256
+        tc["vocab_size"] = min(tc.get("vocab_size", 32000), 32000)
 
     if is_nested:
         config["text_config"] = tc
