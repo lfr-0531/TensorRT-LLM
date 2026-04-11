@@ -117,6 +117,7 @@ class Gemma4Attention(QKNormRoPEAttention):
         layer_idx: Optional[int] = None,
         is_sliding: bool = False,
         is_kv_shared: bool = False,
+        cache_layer_idx: Optional[int] = None,
     ):
         self.is_sliding = is_sliding
         self.is_kv_shared = is_kv_shared
@@ -202,6 +203,11 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Restore original config head_dim
         config.head_dim = original_head_dim
+
+        # KV shared layers: use target layer's index for KV cache access
+        # so the attention backend reads from the target layer's cache slot.
+        if cache_layer_idx is not None and cache_layer_idx != layer_idx:
+            self.attn.layer_idx = cache_layer_idx
 
         # KV shared layers: replace fused QKV with Q-only projection.
         # HF doesn't create k/v for shared layers, so we match that.
@@ -424,10 +430,19 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.is_sliding = is_sliding
 
         # Determine if this is a KV-shared layer
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
-            config, "num_kv_shared_layers", 0
-        )
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+
+        # For shared layers, find the target layer to read KV cache from:
+        # last non-shared layer of the same attention type (sliding/full).
+        cache_layer_idx = layer_idx
+        if self.is_kv_shared_layer:
+            non_shared_types = config.layer_types[:first_kv_shared_layer_idx]
+            current_type = config.layer_types[layer_idx]
+            if current_type in non_shared_types:
+                cache_layer_idx = (len(non_shared_types) - 1 -
+                                   non_shared_types[::-1].index(current_type))
 
         # Double-wide MLP for KV-shared layers when configured
         intermediate_size = config.intermediate_size
@@ -440,6 +455,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
             is_sliding=is_sliding,
             is_kv_shared=self.is_kv_shared_layer,
+            cache_layer_idx=cache_layer_idx,
         )
 
         # Dense MLP

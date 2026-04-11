@@ -185,11 +185,6 @@ def test_e2e_text_26b_dummy():
 
 
 @pytest.mark.skipif(not _model_available("E2B"), reason="gemma-4-E2B-it not found")
-@pytest.mark.xfail(
-    reason="KV sharing + KVCacheManagerV2 layer_offset remapping "
-    "causes illegal memory access in FlashInfer paged KV cache",
-    strict=False,
-)
 def test_e2e_text_e2b_dummy():
     """E2E text generation for E2B (KV sharing + PLE + double-wide MLP)."""
     from tensorrt_llm.llmapi import LLM, SamplingParams
@@ -222,11 +217,6 @@ def test_e2e_text_31b_dummy():
 
 
 @pytest.mark.skipif(not _model_available("E4B"), reason="gemma-4-E4B-it not found")
-@pytest.mark.xfail(
-    reason="KV sharing + KVCacheManagerV2 layer_offset remapping "
-    "causes illegal memory access in FlashInfer paged KV cache",
-    strict=False,
-)
 def test_e2e_text_e4b_dummy():
     """E2E text generation for E4B (KV sharing + hybrid attn)."""
     from tensorrt_llm.llmapi import LLM, SamplingParams

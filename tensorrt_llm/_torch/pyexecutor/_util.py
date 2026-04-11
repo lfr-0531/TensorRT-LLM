@@ -919,16 +919,9 @@ def _create_kv_cache_manager(
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
 
-    # Gemma4 KV sharing: exclude shared layers from KV cache allocation
-    num_kv_shared_layers = getattr(config, 'num_kv_shared_layers', 0)
-    if num_kv_shared_layers > 0 and layer_mask is None:
-        num_layers_total = config.num_hidden_layers
-        first_shared_idx = num_layers_total - num_kv_shared_layers
-        layer_mask = [i < first_shared_idx for i in range(num_layers_total)]
-        logger.info(
-            f"Gemma4 KV sharing: {num_kv_shared_layers} shared layers "
-            f"(idx >= {first_shared_idx}), layer_mask has "
-            f"{sum(layer_mask)} active layers out of {num_layers_total}")
+    # Note: Gemma4 KV sharing is handled at the model level — shared layers
+    # use cache_layer_idx to read from the target layer's cache slot via
+    # Gemma4Attention. No layer_mask exclusion needed here.
 
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
@@ -955,23 +948,6 @@ def _create_kv_cache_manager(
     if layer_mask is None:
         draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
                                if model_engine is not None else None)
-    # When layer_mask is set (e.g., KV sharing), filter per-layer lists
-    # to only include enabled layers, matching num_hidden_layers.
-    if layer_mask is not None:
-        if isinstance(head_dim, list) and len(head_dim) > num_hidden_layers:
-            logger.info(
-                f"Filtering head_dim list from {len(head_dim)} to "
-                f"{num_hidden_layers} elements (layer_mask active)")
-            head_dim = [hd for hd, m in zip(head_dim, layer_mask) if m]
-        if isinstance(num_key_value_heads,
-                       list) and len(num_key_value_heads) > num_hidden_layers:
-            logger.info(
-                f"Filtering num_key_value_heads list from "
-                f"{len(num_key_value_heads)} to {num_hidden_layers} elements")
-            num_key_value_heads = [
-                kv for kv, m in zip(num_key_value_heads, layer_mask) if m
-            ]
-
     # If num_key_value_heads is already a per-layer list (e.g., Gemma4 hybrid),
     # use it directly; otherwise build from the scalar value.
     if isinstance(num_key_value_heads, list):
@@ -1177,22 +1153,9 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
         )
-    # Gemma4 KV sharing: remap shared layers to their target layer's cache slot
-    if num_kv_shared_layers > 0 and hasattr(kv_cache_manager, 'layer_offsets'):
-        layer_types = getattr(config, 'layer_types', None)
-        if layer_types:
-            num_layers_total = config.num_hidden_layers
-            first_shared_idx = num_layers_total - num_kv_shared_layers
-            prev_layers = layer_types[:first_shared_idx]
-            for shared_idx in range(first_shared_idx, num_layers_total):
-                if shared_idx not in kv_cache_manager.layer_offsets:
-                    # Find last non-shared layer of the same attention type
-                    current_type = layer_types[shared_idx]
-                    target_idx = (len(prev_layers) - 1 -
-                                  prev_layers[::-1].index(current_type))
-                    if target_idx in kv_cache_manager.layer_offsets:
-                        kv_cache_manager.layer_offsets[shared_idx] = (
-                            kv_cache_manager.layer_offsets[target_idx])
+    # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
+    # via cache_layer_idx — shared layers use target layer's index for
+    # get_buffers(). No layer_offsets remapping needed here.
 
     return kv_cache_manager
 

@@ -1634,11 +1634,6 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
-        # get_pp_layers returns total_num_layers (including masked layers) as
-        # num_layers. When layer_mask filters layers, use the input num_layers
-        # (= count of enabled layers) for per-layer list sizing/assertions.
-        if layer_mask is not None and self.num_layers != num_layers:
-            self.num_layers = num_layers
         self.is_draft = is_draft
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
