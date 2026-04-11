@@ -12,7 +12,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     PositionalEmbeddingParams,
@@ -43,7 +42,7 @@ from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 # fmt: off
 # TODO: Remove this once we have a proper transformers package
-from transformers import AutoConfig, PretrainedConfig  # isort: skip
+from transformers import PretrainedConfig  # isort: skip
 
 class ExaoneMoEConfig(PretrainedConfig):
     model_type = "exaone_moe"

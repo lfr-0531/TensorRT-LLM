@@ -27,8 +27,8 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 
 # Gemma4 special tokens for tool calling
-BOT_TOKEN = "<|tool_call>"
-EOT_TOKEN = "<tool_call|>"
+BOT_TOKEN = "<|tool_call>"  # nosec B105
+EOT_TOKEN = "<tool_call|>"  # nosec B105
 STRING_DELIM = '<|"|>'
 CALL_PREFIX = "call:"
 

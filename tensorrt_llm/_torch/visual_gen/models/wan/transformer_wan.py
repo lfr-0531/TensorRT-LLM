@@ -6,9 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-# get_parameter_device removed in transformers 5.x
-def get_parameter_device(module):
-    return next(module.parameters()).device
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
@@ -20,6 +17,12 @@ from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelis
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+
+# get_parameter_device removed in transformers 5.x
+def get_parameter_device(module):
+    return next(module.parameters()).device
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
