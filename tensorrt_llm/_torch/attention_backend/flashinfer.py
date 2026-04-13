@@ -868,6 +868,18 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 and metadata.flashinfer_backend != self.flashinfer_backend):
             metadata.flashinfer_backend = self.flashinfer_backend
 
+        # trtllm-gen does not support non-causal (bidirectional) attention used
+        # by multimodal models for image/audio tokens.  Fall back to causal
+        # when trtllm-gen is active and a custom mask is provided.  This is an
+        # approximation: only full attention layers (head_dim>256) are affected
+        # and only during multimodal prefill.
+        effective_mask_type = attention_mask_type
+        effective_mask_data = attention_mask_data
+        if (metadata.flashinfer_backend == "trtllm-gen"
+                and attention_mask_data is not None):
+            effective_mask_type = int(AttentionMaskType.causal)
+            effective_mask_data = None
+
         # this will do nothing if the last forward pass had the same parameters
         plan_params = metadata.plan(self.num_heads,
                                     self.num_kv_heads,
@@ -876,8 +888,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                     kv_dtype=kv_cache.dtype,
                                     q_scaling=self.q_scaling,
                                     attention_window_size=attention_window_size,
-                                    attention_mask_type=attention_mask_type,
-                                    attention_mask_data=attention_mask_data)
+                                    attention_mask_type=effective_mask_type,
+                                    attention_mask_data=effective_mask_data)
 
         if num_contexts == 0:
             decode_forward(plan_params, output)

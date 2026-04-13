@@ -261,9 +261,9 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     Gemma4InputProcessor,
     model_type="gemma4",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<start_of_image>"},
+        placeholder_map={"image": "<|image|>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        content_format=ContentFormat.STRING,
+        content_format=ContentFormat.OPENAI,
     ),
 )
 class Gemma4ForConditionalGeneration(PreTrainedModel):
