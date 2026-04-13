@@ -761,6 +761,94 @@ class TestGemma4HFComparison(unittest.TestCase):
         self._run_full_model_comparison(deepcopy(GEMMA4_KEV_CONFIG))
 
     @torch.no_grad()
+    def test_kev_vnorm_order(self):
+        """K=V: v_norm must apply to raw k_proj(x), NOT after k_norm.
+
+        Default init has k_norm weight=0 (scale=1+0=1), making rms_norm
+        idempotent and hiding ordering bugs.  This test randomizes k_norm
+        weights to expose incorrect v = k_norm(k_proj(x)) ordering.
+        """
+        from transformers import Gemma4ForCausalLM as HFGemma4
+
+        from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import (
+            Gemma4HfWeightMapper,
+        )
+
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_KEV_CONFIG))
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+
+        hf_model = HFGemma4(config).to(dtype).to(device).eval()
+
+        # Randomize all weights to break rms_norm idempotency
+        torch.manual_seed(123)
+        for p in hf_model.parameters():
+            p.data.normal_(0, 0.02)
+        # Ensure k_norm has non-trivial scale so k_norm != identity
+        for layer in hf_model.model.layers:
+            if hasattr(layer.self_attn, "k_norm"):
+                layer.self_attn.k_norm.weight.data.normal_(0, 0.5)
+
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
+
+        wm = Gemma4HfWeightMapper()
+        wm.init_model_and_config(trt_model, model_config)
+        trt_model.load_weights(hf_model.state_dict(), wm)
+
+        # Run context-phase comparison with tighter tolerance
+        from transformers.cache_utils import DynamicCache
+
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        hf_cache = DynamicCache()
+        input_ids = torch.tensor(
+            [100, 200, 300, 400, 500, 600, 700, 800], dtype=torch.int32, device=device
+        )
+        kv_cache_manager = self._get_kv_cache_manager(config)
+
+        request_ids = [1]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+        position_ids = torch.arange(
+            0, input_ids.size(-1), dtype=torch.int32, device=device
+        ).unsqueeze(0)
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            trt_logits = trt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attn_metadata=attn_metadata,
+            )
+            hf_out = hf_model.forward(
+                input_ids=input_ids.unsqueeze(0),
+                position_ids=position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
+            hf_logits = hf_out.logits[:, -1].float()
+
+        self._assert_most_elems_close(
+            trt_logits, hf_logits, atol=0.5, rtol=0.5, max_failed_frac=0.01
+        )
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
     def test_softcap_config(self):
         """Logit softcapping enabled (cap=30.0)."""
         self._run_full_model_comparison(deepcopy(GEMMA4_SOFTCAP_CONFIG))

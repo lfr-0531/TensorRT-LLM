@@ -220,7 +220,9 @@ class Gemma4Attention(QKNormRoPEAttention):
             )
 
         # v_norm: always present in Gemma4 (no learnable scale).
-        # For K=V layers, value is derived from key after k_norm, then v_norm.
+        # For K=V layers, weight mapper duplicates k_proj→v_proj, so v equals
+        # the raw k_proj output.  v_norm is applied to that raw value BEFORE
+        # k_norm/RoPE — matching HF semantics: V = v_norm(k_proj(x)).
         # For regular layers, v_norm is applied to the v_proj output.
         self.v_norm = RMSNorm(
             hidden_size=layer_head_dim,
@@ -254,14 +256,14 @@ class Gemma4Attention(QKNormRoPEAttention):
                 return q_padded, None, None
 
             q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
-
-            # K=V: derive value from key after k_norm
-            if self.use_k_eq_v:
-                v = k.clone()
-
-            # Always apply v_norm (Gemma4 normalizes values regardless of K=V)
+            # For K=V layers, weight mapper duplicates k_proj weights into
+            # v_proj, so after split_qkv v already equals k_proj(x).
+            # HF order: v_norm is applied to the raw k_proj output, NOT
+            # after k_norm.  So we must apply v_norm BEFORE qk_norm
+            # mutates k.
             v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(-1, self.kv_size)
+
+            q, k = self.apply_qk_norm(q, k)
 
             if not self.skip_rope:
                 return super(QKNormRoPEAttention, self).apply_rope(q, k, v, position_ids)
