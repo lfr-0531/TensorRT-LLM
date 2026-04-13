@@ -99,6 +99,16 @@ class _QOnlyLinear(nn.Linear):
     Used by KV shared layers where HF doesn't create k/v projections.
     """
 
+    # Satisfy weight loader attribute checks (must have quant_config with
+    # quant_mode for _duplicate_kv_weights callback in weight_mapper).
+    quant_method = None
+
+    @property
+    def quant_config(self):
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        return QuantConfig()
+
     def load_weights(self, weights, allow_partial_loading=False):
         # weights is a list of [q_dict, k_dict, v_dict] from fused QKV mapper.
         # Only load q_proj weights; ignore k/v (not present for shared layers).
@@ -203,6 +213,12 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Restore original config head_dim
         config.head_dim = original_head_dim
+
+        # Gemma4 hybrid attention needs trtllm-gen FlashInfer backend for
+        # head_dim > 256 (fa2 JIT kernels don't support head_dim=512).
+        global_hd = getattr(config, "global_head_dim", None)
+        if global_hd and global_hd > 256:
+            self.attn.flashinfer_backend = "trtllm-gen"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
