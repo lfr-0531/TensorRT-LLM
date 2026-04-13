@@ -410,6 +410,28 @@ GEMMA4_HYBRID_HEADDIM_CONFIG = {
     },
 }
 
+# Hybrid with different num_kv_heads per layer type (like real Gemma4 K=V models).
+# Sliding layers: kv_heads=4, Full (K=V) layers: kv_heads=1.
+# This tests V2 pool grouping — different kv_heads*head_dim means different page
+# sizes, requiring separate pools for sliding vs full attention layers.
+GEMMA4_DIFF_KV_HEADS_CONFIG = {
+    **GEMMA4_UNIFORM_CONFIG,
+    "num_hidden_layers": 6,
+    "num_key_value_heads": 4,
+    "head_dim": 64,
+    "global_head_dim": 128,
+    "num_global_key_value_heads": 1,
+    "attention_k_eq_v": True,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {
+            "rope_type": "proportional",
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+        },
+    },
+}
+
 # K=V attention (full layers share k->v, no v_proj)
 GEMMA4_KEV_CONFIG = {
     **GEMMA4_UNIFORM_CONFIG,
@@ -523,9 +545,20 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         max_seq_len = num_blocks * tokens_per_block
+
+        # Set per-layer max_attention_window when kv_heads differ across layers,
+        # so V2 creates separate pool groups (same fix as _util.py).
+        sliding_window = getattr(config, "sliding_window", None)
+        max_attn_window = None
+        if isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1 and sliding_window:
+            max_attn_window = [
+                sliding_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
+            ]
+
         kv_cache_config = KvCacheConfigV2(
             max_tokens=num_blocks * tokens_per_block,
             enable_block_reuse=False,
+            max_attention_window=max_attn_window,
         )
         return KVCacheManagerV2(
             kv_cache_config,
@@ -638,7 +671,13 @@ class TestGemma4HFComparison(unittest.TestCase):
 
     # ---- Full model E2E comparison (context + generation) ----
 
-    def _run_full_model_comparison(self, config_dict, atol=0.5, rtol=0.5, max_failed_frac=0.01):
+    def _run_full_model_comparison(
+        self,
+        config_dict,
+        atol=0.5,
+        rtol=0.5,
+        max_failed_frac=0.01,
+    ):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
 
@@ -653,11 +692,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         backend = "FLASHINFER"
 
         # Set up KV cache
-        num_blocks = 1
-        tokens_per_block = 128
-        kv_cache_manager = self._get_kv_cache_manager(
-            gemma4_config, num_blocks=num_blocks, tokens_per_block=tokens_per_block
-        )
+        kv_cache_manager = self._get_kv_cache_manager(gemma4_config)
 
         # -- Context phase --
         input_ids = torch.tensor(
@@ -754,6 +789,11 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_hybrid_headdim_config(self):
         """Hybrid head_dim: sliding=64, full=128 (per-layer KV cache)."""
         self._run_full_model_comparison(deepcopy(GEMMA4_HYBRID_HEADDIM_CONFIG))
+
+    @torch.no_grad()
+    def test_diff_kv_heads_config(self):
+        """Different num_kv_heads per layer type — tests V2 pool grouping."""
+        self._run_full_model_comparison(deepcopy(GEMMA4_DIFF_KV_HEADS_CONFIG))
 
     @torch.no_grad()
     def test_kev_config(self):

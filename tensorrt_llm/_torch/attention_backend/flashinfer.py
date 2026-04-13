@@ -67,6 +67,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
 
+    # FlashInfer kernel backend: "fa2" (default), "fa3", "trtllm-gen", or "auto".
+    # "trtllm-gen" uses pre-compiled FMHA kernels and supports head_dim=512.
+    flashinfer_backend: str = "fa2"
+
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
@@ -511,11 +515,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             prefill_wrapper = self._plan_params_to_wrappers[
                 plan_params].prefill_wrapper
         else:
-            # flashinfer fa3 backend has accuracy issue in H100 PCIe
             prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 self.kv_layout,
-                backend='fa2',
+                backend=self.flashinfer_backend,
                 qo_indptr_buf=self.qo_indptr,
                 paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
                 paged_kv_indices_buf=self._paged_kv_indices,
@@ -561,9 +564,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
                 paged_kv_indices_buffer=self._paged_kv_indices,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
-                use_tensor_cores=use_tensor_cores,
-                backend="fa2"
-                if torch.cuda.get_device_capability(0) == (9, 0) else "auto",
+                use_tensor_cores=use_tensor_cores
+                or self.flashinfer_backend == "trtllm-gen",
+                backend=self.flashinfer_backend if self.flashinfer_backend
+                != "fa2" else ("fa2" if torch.cuda.get_device_capability(0) == (
+                    9, 0) else "auto"),
             )
 
         def decode_plan():
@@ -621,6 +626,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
+        self.flashinfer_backend = kwargs.pop('flashinfer_backend', None)
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         if not skip_create_weights_in_init:
@@ -722,6 +728,12 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
+
+        # Override FlashInfer kernel backend if the attention layer requests it
+        # (e.g., Gemma4 uses trtllm-gen for head_dim=512 support).
+        if (self.flashinfer_backend is not None
+                and metadata.flashinfer_backend != self.flashinfer_backend):
+            metadata.flashinfer_backend = self.flashinfer_backend
 
         # this will do nothing if the last forward pass had the same parameters
         plan_params = metadata.plan(self.num_heads,

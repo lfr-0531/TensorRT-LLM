@@ -1,3 +1,4 @@
+import copy
 import os
 from typing import Dict, List, Optional, Union
 
@@ -918,13 +919,17 @@ def _create_kv_cache_manager(
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
-    # Gemma4: build per-layer head_dim and num_kv_heads for hybrid attention
+    # Gemma4: build per-layer head_dim, num_kv_heads, and sliding window
+    # for hybrid attention. Different layer types need different KV cache
+    # pool groups (via max_attention_window) so FlashInfer page indices
+    # are consistent within each group.
     if is_gemma4_hybrid(config):
         layer_types = config.layer_types
         global_head_dim = config.global_head_dim
         attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
         num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
                                        None) or num_key_value_heads)
+        sliding_window = getattr(config, 'sliding_window', None)
         head_dim_list = []
         kv_heads_list = []
         for lt in layer_types:
@@ -939,6 +944,17 @@ def _create_kv_cache_manager(
                     num_global_kv_heads if use_k_eq_v else num_key_value_heads)
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
+
+        # Set per-layer max_attention_window so V2 creates separate pool
+        # groups for sliding vs full attention layers (different page sizes).
+        if (kv_cache_config.max_attention_window is None
+                and sliding_window is not None):
+            kv_cache_config = copy.copy(kv_cache_config)
+            kv_cache_config.max_attention_window = [
+                int(sliding_window)
+                if lt == "sliding_attention" else int(max_seq_len)
+                for lt in layer_types
+            ]
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via
@@ -1143,9 +1159,12 @@ def _create_kv_cache_manager(
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
+        # Only needed for V1; V2 handles per-layer windows natively via life cycles.
         is_vswa = is_vswa_enabled(kv_cache_config)
-        binding_model_config = _model_config.get_bindings_model_config(
-            tokens_per_block=tokens_per_block) if is_vswa else None
+        binding_model_config = None
+        if is_vswa and kv_cache_manager_cls.__name__ == "KVCacheManager":
+            binding_model_config = _model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block)
 
         # KVCacheManager (V1) doesn't support per-layer head_dim lists;
         # use max for estimation. KVCacheManagerV2 handles lists natively.
