@@ -20,6 +20,7 @@ transformers>=5.5.0 Gemma4 support.
 
 import math
 import unittest
+import unittest.mock
 from copy import deepcopy
 
 import torch
@@ -499,6 +500,18 @@ GEMMA4_31B_LIKE_CONFIG = {
     "final_logit_softcapping": 30.0,
 }
 
+# E4B-like: hybrid_hd + NO K=V + same kv_heads for all layers.
+# This is the critical VSWA corner case: without K=V, full attention layers
+# have the SAME num_kv_heads as sliding layers, but head_dim doubles.  The
+# full pool's per-page bytes are 2× sliding → full pool has fewer pages.
+# Using sliding pool's page indices on the full pool buffer causes
+# out-of-bounds if max(sliding_index) >= num_full_pages.
+GEMMA4_E4B_LIKE_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "attention_k_eq_v": False,
+    "num_global_key_value_heads": None,  # inherit num_key_value_heads
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
@@ -546,11 +559,17 @@ class TestGemma4HFComparison(unittest.TestCase):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         max_seq_len = num_blocks * tokens_per_block
 
-        # Set per-layer max_attention_window when kv_heads differ across layers,
-        # so V2 creates separate pool groups (same fix as _util.py).
+        # Set per-layer max_attention_window when head_dim or kv_heads differ
+        # across layers, so V2 creates separate pool groups for different page
+        # sizes (same logic as _util.py::is_gemma4_hybrid).
         sliding_window = getattr(config, "sliding_window", None)
         max_attn_window = None
-        if isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1 and sliding_window:
+        needs_vswa = False
+        if isinstance(head_dim, list) and len(set(head_dim)) > 1:
+            needs_vswa = True
+        if isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1:
+            needs_vswa = True
+        if needs_vswa and sliding_window:
             max_attn_window = [
                 sliding_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
             ]
@@ -934,6 +953,253 @@ class TestGemma4HFComparison(unittest.TestCase):
         self._run_full_model_comparison(
             deepcopy(GEMMA4_31B_LIKE_CONFIG),
         )
+
+    @torch.no_grad()
+    def test_e4b_like_config(self):
+        """E4B pattern: hybrid head_dim + NO K=V (same kv_heads all layers).
+
+        This is the critical VSWA corner case.  Without K=V, full attention
+        layers have the SAME num_kv_heads as sliding layers but double the
+        head_dim.  The full pool has fewer pages than the sliding pool.
+        Before the VSWA fix, sliding pool page indices were used for full
+        pool buffers, causing out-of-bounds access.
+        """
+        self._run_full_model_comparison(deepcopy(GEMMA4_E4B_LIKE_CONFIG))
+
+    # ---- VSWA (Variable Sliding Window Attention) page index tests ----
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_vswa_per_pool_page_indices(self):
+        """VSWA: FlashInfer metadata builds separate page indices per pool.
+
+        When layers have different head_dim (hybrid attention), V2 creates
+        separate pools.  The FlashInfer metadata must fetch and store page
+        indices per pool so that each layer uses the correct indices during
+        append_paged_kv_cache and attention plan/run.
+        """
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        # E4B-like: sliding head_dim=64, full head_dim=128, kv_heads=2 both
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        # num_blocks must be > 1 so max_seq_len > sliding_window → VSWA.
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=2)
+
+        # The manager must be VSWA
+        self.assertTrue(kv_cache_manager.is_vswa, "Expected VSWA manager")
+
+        # Set up metadata
+        request_ids = [1]
+        token_nums = [8]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        metadata = metadata_cls(
+            seq_lens=torch.tensor([8], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=[8],
+        )
+
+        # VSWA detection must populate layer-to-pool mapping
+        self.assertIsNotNone(metadata._vswa_layer_to_pool, "VSWA layer_to_pool mapping not created")
+        # Sliding and full layers must map to different pools
+        sliding_pools = {
+            metadata._vswa_layer_to_pool[i]
+            for i in range(config.num_hidden_layers)
+            if config.layer_types[i] == "sliding_attention"
+        }
+        full_pools = {
+            metadata._vswa_layer_to_pool[i]
+            for i in range(config.num_hidden_layers)
+            if config.layer_types[i] == "full_attention"
+        }
+        self.assertEqual(len(sliding_pools), 1, "Sliding layers should share one pool")
+        self.assertEqual(len(full_pools), 1, "Full layers should share one pool")
+        self.assertNotEqual(sliding_pools, full_pools, "Sliding and full pools must be different")
+
+        # After prepare(), per-pool indices cache must exist
+        with torch.inference_mode():
+            metadata.prepare()
+
+        self.assertIsNotNone(
+            metadata._vswa_pool_indices_cache,
+            "Per-pool indices cache not populated after prepare()",
+        )
+        self.assertEqual(
+            len(metadata._vswa_pool_indices_cache), 2, "Expected 2 pool entries (sliding + full)"
+        )
+
+        # Each pool's indices are fetched via different layer_id → pool_id
+        # path.  Verify that buffers for different pools have different shapes
+        # (different head_dim → different page sizes → different page counts).
+        sliding_buf = kv_cache_manager.get_buffers(0, kv_layout=metadata.kv_layout)
+        full_layer_idx = next(
+            i for i, lt in enumerate(config.layer_types) if lt == "full_attention"
+        )
+        full_buf = kv_cache_manager.get_buffers(full_layer_idx, kv_layout=metadata.kv_layout)
+        # head_dim dimension should differ (64 vs 128)
+        self.assertNotEqual(
+            sliding_buf.shape[-1],
+            full_buf.shape[-1],
+            "Sliding and full pool buffers should have different head_dim",
+        )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_vswa_page_index_bounds(self):
+        """VSWA: page indices must be within each layer's pool buffer bounds.
+
+        Constructs a scenario where full pool has fewer pages than sliding
+        pool (E4B-like).  Verifies that after prepare(), the indices
+        returned by get_paged_kv_indices_for_layer are within each pool's
+        buffer size.
+        """
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=2)
+
+        request_ids = [1]
+        token_nums = [8]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        metadata = metadata_cls(
+            seq_lens=torch.tensor([8], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=[8],
+        )
+
+        with torch.inference_mode():
+            metadata.prepare()
+
+        # Check page index bounds for every layer
+        for layer_idx in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
+            if buf is None:
+                continue
+            max_pages = buf.shape[0]
+            indices = metadata.get_paged_kv_indices_for_layer(layer_idx)
+            if indices.numel() == 0:
+                continue
+            max_idx = indices.max().item()
+            self.assertLess(
+                max_idx,
+                max_pages,
+                f"Layer {layer_idx}: page index {max_idx} >= "
+                f"pool buffer pages {max_pages} "
+                f"(layer_type={config.layer_types[layer_idx]}, "
+                f"head_dim={'sliding' if config.layer_types[layer_idx] == 'sliding_attention' else 'full'})",
+            )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_vswa_swap_restores_correct_pool(self):
+        """VSWA: swapping indices between pools and back produces correct data.
+
+        Simulates the forward pass pattern: sliding layer → full layer →
+        sliding layer, verifying the shared buffer has the right pool's
+        indices at each step.
+        """
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=2)
+
+        request_ids = [1]
+        token_nums = [8]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        metadata = metadata_cls(
+            seq_lens=torch.tensor([8], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=[8],
+        )
+
+        with torch.inference_mode():
+            metadata.prepare()
+
+        total_blocks = metadata.num_generation_blocks + metadata.num_context_blocks
+        if total_blocks == 0:
+            kv_cache_manager.shutdown()
+            return
+
+        # Find one sliding and one full layer
+        sliding_layer = next(
+            i for i, lt in enumerate(config.layer_types) if lt == "sliding_attention"
+        )
+        full_layer = next(i for i, lt in enumerate(config.layer_types) if lt == "full_attention")
+
+        # Get expected indices for each pool
+        sliding_expected = metadata.get_paged_kv_indices_for_layer(sliding_layer).cpu().clone()
+        full_expected = metadata.get_paged_kv_indices_for_layer(full_layer).cpu().clone()
+
+        # Swap to sliding → check buffer matches sliding pool
+        metadata.swap_paged_kv_indices_for_layer(sliding_layer)
+        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        self.assertTrue(
+            torch.equal(actual, sliding_expected),
+            "After swap to sliding layer, buffer should match sliding pool",
+        )
+
+        # Swap to full → check buffer matches full pool
+        metadata.swap_paged_kv_indices_for_layer(full_layer)
+        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        self.assertTrue(
+            torch.equal(actual, full_expected),
+            "After swap to full layer, buffer should match full pool",
+        )
+
+        # Swap back to sliding → check buffer is restored
+        metadata.swap_paged_kv_indices_for_layer(sliding_layer)
+        actual = metadata._paged_kv_indices[:total_blocks].cpu()
+        self.assertTrue(
+            torch.equal(actual, sliding_expected),
+            "After swap back to sliding, buffer should be restored",
+        )
+
+        kv_cache_manager.shutdown()
 
     # ---- Structural tests ----
 
