@@ -2854,8 +2854,22 @@ class Qwen3_5MoeFactory(AutoModelForImageTextToTextFactory):
 # Registration
 # =============================================================================
 
-AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
-AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
+try:
+    AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig, exist_ok=True)
+except TypeError:
+    # Older transformers versions don't support exist_ok parameter
+    try:
+        AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
+    except ValueError:
+        pass  # Already registered natively in transformers 5.x
+
+try:
+    AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig, exist_ok=True)
+except TypeError:
+    try:
+        AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
+    except ValueError:
+        pass
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)
