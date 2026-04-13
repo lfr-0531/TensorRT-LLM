@@ -216,8 +216,9 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Gemma4 hybrid attention needs trtllm-gen FlashInfer backend for
         # head_dim > 256 (fa2 JIT kernels don't support head_dim=512).
-        global_hd = getattr(config, "global_head_dim", None)
-        if global_hd and global_hd > 256:
+        # Only set for THIS layer's head_dim — sliding layers (head_dim=256)
+        # should keep using the default fa2 backend.
+        if layer_head_dim > 256:
             self.attn.flashinfer_backend = "trtllm-gen"
 
         # KV shared layers: use target layer's index for KV cache access
