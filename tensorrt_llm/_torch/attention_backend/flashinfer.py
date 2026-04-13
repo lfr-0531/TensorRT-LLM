@@ -103,6 +103,57 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self._paged_kv_indices[:self.num_generation_blocks +
                                       self.num_context_blocks]
 
+    def get_paged_kv_indices_for_layer(self, layer_idx: int) -> torch.Tensor:
+        """Return page indices for the pool that *layer_idx* belongs to.
+
+        For non-VSWA models this returns the default shared indices.
+        For VSWA models it returns the pool-specific indices.
+        """
+        if (self._vswa_layer_to_pool is None
+                or self._vswa_pool_indices_cache is None):
+            return self.paged_kv_indices
+        pool_id = self._vswa_layer_to_pool.get(layer_idx)
+        if pool_id is None:
+            return self.paged_kv_indices
+        total_blocks = self.num_generation_blocks + self.num_context_blocks
+        return self._vswa_pool_indices_cache[pool_id][:total_blocks]
+
+    def _swap_indices_for_head_dim(self, head_dim: int) -> None:
+        """Swap _paged_kv_indices to the pool matching the given head_dim.
+
+        Used by prepare() to re-plan each cached wrapper with correct indices.
+        """
+        head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
+        if head_dim_to_pool is None or self._vswa_pool_indices_cache is None:
+            return
+        pool_id = head_dim_to_pool.get(head_dim)
+        if pool_id is None:
+            return
+        rep_layer = self._vswa_pool_to_rep_layer.get(pool_id)
+        if rep_layer is not None:
+            self.swap_paged_kv_indices_for_layer(rep_layer)
+
+    def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
+        """Copy pool-specific page indices into the shared buffer.
+
+        The FlashInfer wrappers reference ``_paged_kv_indices`` directly,
+        so we overwrite its contents with the correct pool's data before
+        each layer's plan/run cycle.  We track the currently active pool
+        so we only copy when the pool actually changes.
+        """
+        if self._vswa_layer_to_pool is None:
+            return
+        pool_id = self._vswa_layer_to_pool.get(layer_idx)
+        if pool_id is None:
+            return  # Layer not in VSWA mapping
+        active = getattr(self, '_vswa_active_pool_id', None)
+        if pool_id == active:
+            return  # Buffer already has the right data
+        total_blocks = self.num_generation_blocks + self.num_context_blocks
+        src = self._vswa_pool_indices_cache[pool_id][:total_blocks]
+        self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
+        self._vswa_active_pool_id = pool_id
+
     @property
     def paged_kv_last_page_len(self) -> torch.Tensor:
         return self._paged_kv_last_page_len[:self.num_contexts +
@@ -176,6 +227,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                       device='cuda')
         self._plan_params_to_wrappers = {}
 
+        # VSWA (Variable Sliding Window Attention): models with per-layer
+        # max_attention_window create separate V2 pool groups with independent
+        # page numbering.  We need per-pool paged_kv_indices so each layer can
+        # use the indices that match its pool's buffer.
+        self._vswa_layer_to_pool: Optional[Dict[int, int]] = None
+        self._vswa_pool_indices_cache: Optional[Dict[int, torch.Tensor]] = None
+
         if self.kv_cache_manager is not None:
             max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
             self._paged_kv_indices = self.get_empty(
@@ -185,6 +243,29 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 cache_name="_paged_kv_indices",
                 capture_graph=capture_graph,
             )
+
+            # Detect VSWA: check if the manager has multiple pools.
+            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
+            # managers also expose is_vswa but lack the per-pool infrastructure.
+            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
+                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
+                mgr = self.kv_cache_manager
+                self._vswa_layer_to_pool = {}
+                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                for layer_idx in getattr(mgr, 'layer_offsets', {}):
+                    layer_offset = mgr.layer_offsets[layer_idx]
+                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+                    self._vswa_layer_to_pool[layer_idx] = pool_id
+                    if pool_id not in self._vswa_pool_to_rep_layer:
+                        self._vswa_pool_to_rep_layer[pool_id] = layer_idx
+                # Build head_dim → pool_id mapping using V2 per-layer head_dim
+                self._vswa_head_dim_to_pool: Dict[int, int] = {}
+                if hasattr(mgr, 'head_dim_per_layer'):
+                    for layer_idx, pool_id in self._vswa_layer_to_pool.items():
+                        hd = mgr.head_dim_per_layer[
+                            mgr.layer_offsets[layer_idx]]
+                        if hd not in self._vswa_head_dim_to_pool:
+                            self._vswa_head_dim_to_pool[hd] = pool_id
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -261,6 +342,41 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
 
+        # VSWA: build per-pool page index CUDA tensors so each layer can use
+        # the indices that match its own pool's buffer.  Tensors live on CUDA
+        # so that forward_impl swap via copy_() is device-to-device (CUDA-graph
+        # capturable).
+        if self._vswa_layer_to_pool is not None:
+            unique_pools = set(self._vswa_layer_to_pool.values())
+            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            # Primary pool's CUDA copy is already in _paged_kv_indices.
+            self._vswa_pool_indices_cache = {
+                primary_pool_id: self._paged_kv_indices,
+            }
+            total_idx = paged_kv_indices.size(0)
+            for pool_id in unique_pools:
+                if pool_id == primary_pool_id:
+                    continue
+                rep_layer = self._vswa_pool_to_rep_layer[pool_id]
+                pool_block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                    self.request_ids, layer_id=rep_layer)
+                pool_idx_list = []
+                for i, blk_ids in enumerate(pool_block_ids):
+                    pool_idx_list.extend(blk_ids[:self.num_blocks[i]])
+                pool_indices = torch.tensor(pool_idx_list, dtype=torch.int32)
+                # Allocate or reuse a CUDA buffer for this pool.
+                buf_key = f'_vswa_pool_buf_{pool_id}'
+                buf = getattr(self, buf_key, None)
+                if buf is None or buf.size(0) < pool_indices.size(0):
+                    buf = torch.empty(max(pool_indices.size(0), total_idx),
+                                      dtype=torch.int,
+                                      device='cuda')
+                    setattr(self, buf_key, buf)
+                buf[:pool_indices.size(0)].copy_(pool_indices,
+                                                 non_blocking=True)
+                self._vswa_pool_indices_cache[pool_id] = buf
+            self._vswa_active_pool_id = primary_pool_id
+
         # number of tokens in the last cache block used by each sequence
         paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
@@ -324,10 +440,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             if plan_params.attention_mask_data is None:
                 # Re-plan the cached wrappers for a new set of requests.
+                # VSWA: swap to the correct pool before re-planning so the
+                # wrapper gets the right page indices for its head_dim.
+                if self._vswa_layer_to_pool is not None:
+                    self._swap_indices_for_head_dim(plan_params.head_dim)
                 self._plan_params_to_wrappers[plan_params].is_planned = False
                 self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
+
+        # VSWA: restore primary pool indices as the default.
+        if (self._vswa_layer_to_pool is not None
+                and self._vswa_pool_indices_cache is not None):
+            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            total_blocks = self.num_generation_blocks + self.num_context_blocks
+            src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
+            self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
+            self._vswa_active_pool_id = primary_pool_id
 
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
@@ -520,6 +649,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
+
+        # VSWA: swap in the correct pool's page indices for this layer
+        # before both the KV cache append and the attention plan/run.
+        metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
 
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)
