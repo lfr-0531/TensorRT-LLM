@@ -349,11 +349,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self._vswa_layer_to_pool is not None:
             unique_pools = set(self._vswa_layer_to_pool.values())
             primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            # Primary pool's CUDA copy is already in _paged_kv_indices.
-            self._vswa_pool_indices_cache = {
-                primary_pool_id: self._paged_kv_indices,
-            }
+            # Allocate a dedicated buffer for the primary pool's indices.
+            # Using _paged_kv_indices directly would be an alias: when a
+            # secondary pool swap overwrites _paged_kv_indices the primary
+            # pool's cached entry would also be corrupted.
             total_idx = paged_kv_indices.size(0)
+            buf_key_primary = f'_vswa_pool_buf_{primary_pool_id}'
+            primary_buf = getattr(self, buf_key_primary, None)
+            if primary_buf is None or primary_buf.size(0) < total_idx:
+                primary_buf = torch.empty(max(total_idx, 1),
+                                          dtype=torch.int,
+                                          device='cuda')
+                setattr(self, buf_key_primary, primary_buf)
+            primary_buf[:total_idx].copy_(self._paged_kv_indices[:total_idx],
+                                          non_blocking=True)
+            self._vswa_pool_indices_cache = {
+                primary_pool_id: primary_buf,
+            }
             for pool_id in unique_pools:
                 if pool_id == primary_pool_id:
                     continue

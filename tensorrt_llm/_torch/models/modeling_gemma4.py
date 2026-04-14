@@ -838,6 +838,16 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Gemma4-specific defaults.
+
+        CUDA graphs are disabled because the VSWA (variable sliding window
+        attention) per-pool page index swapping in ``forward_impl`` is not
+        compatible with CUDA graph capture/replay.
+        """
+        return {"cuda_graph_config": None}
+
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
 
