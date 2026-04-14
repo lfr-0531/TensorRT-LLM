@@ -548,13 +548,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # subsequent forward calls.
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             if plan_params.attention_mask_data is None:
-                # Re-plan the cached wrappers for a new set of requests.
-                # VSWA: swap to the correct pool before re-planning so the
-                # wrapper gets the right page indices for its head_dim.
-                if self._vswa_layer_to_pool is not None:
-                    self._swap_indices_for_head_dim(plan_params.head_dim)
+                # Mark as not-planned so forward_impl will re-plan just before
+                # use.  We intentionally do NOT re-plan here because multiple
+                # wrappers (e.g., different head_dim for hybrid attention) share
+                # the same workspace_buffer, and sequential re-planning would
+                # overwrite the first wrapper's workspace with the second's.
                 self._plan_params_to_wrappers[plan_params].is_planned = False
-                self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
