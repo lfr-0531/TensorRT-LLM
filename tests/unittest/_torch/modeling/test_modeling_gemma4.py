@@ -954,6 +954,219 @@ class TestGemma4HFComparison(unittest.TestCase):
             deepcopy(GEMMA4_31B_LIKE_CONFIG),
         )
 
+    # ---- Batched and mixed ctx+gen HF comparison tests ----
+
+    @torch.no_grad()
+    def test_batch_context_hf_comparison(self):
+        """Batch>1 context phase: logits must match HF for all requests.
+
+        Two identical sequences processed in a single batch.  Both must
+        produce the same logits as a single-sequence batch and match HF.
+        """
+        from transformers.cache_utils import DynamicCache
+
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        torch.random.manual_seed(42)
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+
+        device = torch.device("cuda")
+        kv_cache_manager = self._get_kv_cache_manager(gemma4_config, num_blocks=2, batch_size=2)
+
+        ids = torch.tensor(
+            [100, 200, 300, 400, 500, 600, 700, 800], dtype=torch.int32, device=device
+        )
+        seq_len = ids.size(0)
+
+        # HF reference (single)
+        hf_cache = DynamicCache()
+        pos = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
+        with torch.inference_mode():
+            hf_out = hf(
+                input_ids=ids.unsqueeze(0),
+                position_ids=pos,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
+            hf_logits = hf_out.logits[0, -1].float()
+
+        # TRT-LLM: batch=2 with the SAME input
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        kv_cache_manager.add_dummy_requests([1, 2], [seq_len, seq_len])
+        ids_batched = torch.cat([ids, ids])  # [16]
+        pos_batched = torch.cat(
+            [
+                torch.arange(seq_len, dtype=torch.int32, device=device),
+                torch.arange(seq_len, dtype=torch.int32, device=device),
+            ]
+        ).unsqueeze(0)
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([seq_len, seq_len], dtype=torch.int),
+            num_contexts=2,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0, 0]),
+            max_num_requests=2,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[1, 2],
+            prompt_lens=[seq_len, seq_len],
+        )
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            trt_logits = trt.forward(
+                input_ids=ids_batched, position_ids=pos_batched, attn_metadata=attn_metadata
+            )
+
+        # Both batch entries must match HF
+        self.assertEqual(trt_logits.shape[0], 2, "Expected 2 logit rows for batch=2")
+        for i in range(2):
+            self._assert_most_elems_close(
+                trt_logits[i : i + 1],
+                hf_logits.unsqueeze(0),
+                atol=0.5,
+                rtol=0.5,
+                max_failed_frac=0.01,
+            )
+        # Both batch entries must be identical to each other
+        diff = (trt_logits[0] - trt_logits[1]).abs().max().item()
+        self.assertLess(diff, 0.01, f"Batch entries differ: max_diff={diff}")
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_mixed_ctx_gen_hf_comparison(self):
+        """Mixed context+generation batch: logits must match HF.
+
+        Simulates the executor's inflight batching: request A already prefilled
+        (now in generation), request B just arrived (context).  Both must match
+        HF reference.  This is the pattern that triggers batch corruption if
+        model modules don't correctly handle mixed phases.
+        """
+        from transformers.cache_utils import DynamicCache
+
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        torch.random.manual_seed(42)
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+
+        device = torch.device("cuda")
+        kv_cache_manager = self._get_kv_cache_manager(gemma4_config, num_blocks=2, batch_size=4)
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+
+        ids_A = torch.tensor(
+            [100, 200, 300, 400, 500, 600, 700, 800], dtype=torch.int32, device=device
+        )
+        ids_B = torch.tensor(
+            [101, 201, 301, 401, 501, 601, 701, 801], dtype=torch.int32, device=device
+        )
+        seq_len = ids_A.size(0)
+
+        # === Step 1: Prefill request A (pure context) ===
+        kv_cache_manager.add_dummy_requests([1], [seq_len])
+        meta_ctx = metadata_cls(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            max_num_requests=4,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[1],
+            prompt_lens=[seq_len],
+        )
+        pos_A = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
+        with torch.inference_mode():
+            meta_ctx.prepare()
+            trt_ctx = trt.forward(input_ids=ids_A, position_ids=pos_A, attn_metadata=meta_ctx)
+        gen_token_A = trt_ctx[0].argmax().item() if trt_ctx.dim() == 2 else trt_ctx.argmax().item()
+
+        # HF reference: A prefill
+        hf_cache_A = DynamicCache()
+        with torch.inference_mode():
+            hf_out_A = hf(
+                input_ids=ids_A.unsqueeze(0),
+                position_ids=pos_A,
+                past_key_values=hf_cache_A,
+                use_cache=True,
+            )
+            _ = hf_out_A.logits  # populates HF's KV cache for A
+
+        # === Step 2: Mixed batch — A in generation + B in context ===
+        kv_cache_manager.add_dummy_requests([2], [seq_len])
+        gen_id_A = torch.tensor([gen_token_A], dtype=torch.int32, device=device)
+
+        # Flat layout: [ctx_B_tokens..., gen_A_token]
+        mixed_ids = torch.cat([ids_B, gen_id_A])
+        mixed_pos = torch.cat(
+            [
+                torch.arange(seq_len, dtype=torch.int32, device=device),
+                torch.tensor([seq_len], dtype=torch.int32, device=device),
+            ]
+        ).unsqueeze(0)
+        meta_mixed = metadata_cls(
+            seq_lens=torch.tensor([seq_len, 1], dtype=torch.int),
+            num_contexts=1,  # B is context
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0, seq_len],  # B=0 cached, A=seq_len cached
+            ),
+            max_num_requests=4,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[2, 1],
+            prompt_lens=[seq_len, seq_len],
+        )
+        with torch.inference_mode():
+            meta_mixed.prepare()
+            trt_mixed = trt.forward(
+                input_ids=mixed_ids, position_ids=mixed_pos, attn_metadata=meta_mixed
+            )
+
+        # trt_mixed shape: [2, vocab] — B's context logit + A's generation logit
+        self.assertEqual(trt_mixed.shape[0], 2, f"Expected 2 logit rows, got {trt_mixed.shape}")
+
+        # HF reference: B prefill (independent)
+        hf_cache_B = DynamicCache()
+        with torch.inference_mode():
+            hf_out_B = hf(
+                input_ids=ids_B.unsqueeze(0),
+                position_ids=torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0),
+                past_key_values=hf_cache_B,
+                use_cache=True,
+            )
+            hf_logits_B = hf_out_B.logits[0, -1].float()
+
+        # HF reference: A generation (second step)
+        with torch.inference_mode():
+            hf_out_A_gen = hf(
+                input_ids=torch.tensor([[gen_token_A]], dtype=torch.int32, device=device),
+                position_ids=torch.tensor([[seq_len]], dtype=torch.int32, device=device),
+                past_key_values=hf_cache_A,
+                use_cache=True,
+            )
+            hf_logits_A_gen = hf_out_A_gen.logits[0, -1].float()
+
+        # B's context logits (mixed batch) must match HF B (independent prefill)
+        self._assert_most_elems_close(
+            trt_mixed[0:1],
+            hf_logits_B.unsqueeze(0),
+            atol=0.5,
+            rtol=0.5,
+            max_failed_frac=0.01,
+        )
+        # A's generation logits (mixed batch) must match HF A (generation step)
+        self._assert_most_elems_close(
+            trt_mixed[1:2],
+            hf_logits_A_gen.unsqueeze(0),
+            atol=0.5,
+            rtol=0.5,
+            max_failed_frac=0.01,
+        )
+
+        kv_cache_manager.shutdown()
+
     @torch.no_grad()
     def test_e4b_like_config(self):
         """E4B pattern: hybrid head_dim + NO K=V (same kv_heads all layers).
@@ -1220,6 +1433,111 @@ class TestGemma4HFComparison(unittest.TestCase):
                 self.assertTrue(layer.self_attn.is_kv_shared, f"Layer {i} attn should be KV shared")
             else:
                 self.assertFalse(layer.is_kv_shared_layer, f"Layer {i} should NOT be KV shared")
+
+    @torch.no_grad()
+    def test_rope_real_headdim_sliding(self):
+        """RoPE cos/sin must match HF for sliding layers with real head_dim=256."""
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding as HFRoPE
+
+        config = Gemma4TextConfig(
+            hidden_size=2560,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=256,
+            global_head_dim=512,
+            intermediate_size=5120,
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+                "full_attention": {
+                    "rope_theta": 1000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "rope_type": "proportional",
+                },
+            },
+            vocab_size=262144,
+            max_position_embeddings=8192,
+            rms_norm_eps=1e-6,
+            hidden_activation="gelu_pytorch_tanh",
+            sliding_window=4096,
+            torch_dtype="bfloat16",
+        )
+        mc = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        trt = Gemma4Attention(mc, layer_idx=0, is_sliding=True).to(torch.bfloat16).cuda()
+
+        hf_rope = HFRoPE(config).cuda()
+        pos = torch.arange(8, device="cuda").unsqueeze(0)
+        hf_cos, hf_sin = hf_rope(
+            torch.zeros(1, 8, 2560, device="cuda", dtype=torch.bfloat16), pos, "sliding_attention"
+        )
+
+        trt_cs = trt.rotary_emb.rotary_cos_sin[pos.view(-1)]  # [8, 2, dim//2]
+        trt_cos = trt_cs[:, 0, :].unsqueeze(0).to(torch.bfloat16)
+        trt_sin = trt_cs[:, 1, :].unsqueeze(0).to(torch.bfloat16)
+
+        self.assertTrue(
+            torch.allclose(trt_cos, hf_cos[:, :, : trt_cos.shape[-1]], atol=1e-4),
+            f"Sliding RoPE cos mismatch: max diff={(trt_cos - hf_cos[:, :, : trt_cos.shape[-1]]).abs().max()}",
+        )
+        self.assertTrue(
+            torch.allclose(trt_sin, hf_sin[:, :, : trt_sin.shape[-1]], atol=1e-4),
+            f"Sliding RoPE sin mismatch: max diff={(trt_sin - hf_sin[:, :, : trt_sin.shape[-1]]).abs().max()}",
+        )
+
+    @torch.no_grad()
+    def test_rope_real_headdim_full(self):
+        """RoPE cos/sin must match HF for full layers with real head_dim=512 (proportional RoPE)."""
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextRotaryEmbedding as HFRoPE
+
+        config = Gemma4TextConfig(
+            hidden_size=2560,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=256,
+            global_head_dim=512,
+            intermediate_size=5120,
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+                "full_attention": {
+                    "rope_theta": 1000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "rope_type": "proportional",
+                },
+            },
+            vocab_size=262144,
+            max_position_embeddings=8192,
+            rms_norm_eps=1e-6,
+            hidden_activation="gelu_pytorch_tanh",
+            sliding_window=4096,
+            torch_dtype="bfloat16",
+        )
+        mc = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        trt = Gemma4Attention(mc, layer_idx=1, is_sliding=False).to(torch.bfloat16).cuda()
+
+        hf_rope = HFRoPE(config).cuda()
+        pos = torch.arange(8, device="cuda").unsqueeze(0)
+        hf_cos, hf_sin = hf_rope(
+            torch.zeros(1, 8, 2560, device="cuda", dtype=torch.bfloat16), pos, "full_attention"
+        )
+
+        trt_cs = trt.rotary_emb.rotary_cos_sin[pos.view(-1)]
+        trt_cos = trt_cs[:, 0, :].unsqueeze(0).to(torch.bfloat16)
+        trt_sin = trt_cs[:, 1, :].unsqueeze(0).to(torch.bfloat16)
+
+        # TRT-LLM only has dim/2 = 64 cos/sin values; HF has head_dim/2 = 256 (with 192 zeros)
+        # Compare only the rotary part
+        rot_dim = trt_cos.shape[-1]
+        self.assertTrue(
+            torch.allclose(trt_cos, hf_cos[:, :, :rot_dim], atol=1e-4),
+            f"Full RoPE cos mismatch: max diff={(trt_cos - hf_cos[:, :, :rot_dim]).abs().max()}",
+        )
+        self.assertTrue(
+            torch.allclose(trt_sin, hf_sin[:, :, :rot_dim], atol=1e-4),
+            f"Full RoPE sin mismatch: max diff={(trt_sin - hf_sin[:, :, :rot_dim]).abs().max()}",
+        )
 
 
 if __name__ == "__main__":

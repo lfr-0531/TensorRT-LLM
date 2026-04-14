@@ -214,6 +214,49 @@ class Gemma4Attention(QKNormRoPEAttention):
         # Restore original config head_dim
         config.head_dim = original_head_dim
 
+        # Fix proportional RoPE for full-attention layers.
+        #
+        # HF proportional RoPE produces cos/sin of shape [seq, head_dim] (512)
+        # with only the first `rope_angles` (64) frequency pairs non-trivial;
+        # the rest are zero-frequency (cos=1, sin=0).  Crucially, HF's
+        # `rotate_half` splits at head_dim//2 = 256, pairing dim[i] with
+        # dim[i+256].
+        #
+        # TRT-LLM's default RoPE with dim=128 only rotates the first 128
+        # dimensions, pairing dim[i] with dim[i+64].  This is wrong because
+        # the pairing dimension differs from HF (i+256 vs i+64).
+        #
+        # Fix: set rope dim = head_dim (512) so that rotate_half splits at
+        # 256, matching HF. Pad inv_freq with zeros for non-rotary pairs.
+        if not is_sliding and self.rotary_emb is not None:
+            import numpy as np
+
+            theta = rope_params.theta
+            max_pos = rope_params.max_positions
+            rope_angles = int(partial_rotary_factor * layer_head_dim // 2)
+            half_dim = layer_head_dim // 2  # 256
+
+            # Build inv_freq: first rope_angles (64) have real freq, rest zeros
+            inv_freq_rotated = 1.0 / (
+                theta ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / layer_head_dim)
+            )
+            inv_freq = np.concatenate(
+                [
+                    inv_freq_rotated,
+                    np.zeros(half_dim - rope_angles, dtype=np.float32),
+                ]
+            )  # [256] — matches HF's proportional RoPE
+
+            positions = np.arange(max_pos, dtype=np.float32)
+            sinusoid = np.einsum("i,j->ij", positions, inv_freq)  # [max_pos, 256]
+            cos_sin = np.stack([np.cos(sinusoid), np.sin(sinusoid)], axis=1)
+            self.rotary_emb.rotary_cos_sin = torch.tensor(
+                cos_sin, dtype=torch.float32, device="cuda"
+            )
+            # Update head_dim so apply_rotary_pos_emb uses full head_dim for
+            # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
+            self.rotary_emb.head_dim = layer_head_dim
+
         # Gemma4 hybrid attention needs trtllm-gen FlashInfer backend for
         # head_dim > 256 (fa2 JIT kernels don't support head_dim=512).
         # Only set for THIS layer's head_dim — sliding layers (head_dim=256)
@@ -886,7 +929,11 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     ) -> torch.Tensor:
         local_attention_mask_data = None
         global_attention_mask_data = None
-        if mm_token_type_ids is not None:
+        # Only build bidirectional masks when use_bidirectional_attention is
+        # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
+        # use standard causal attention even for multimodal tokens.
+        use_bidir = getattr(self.config, "use_bidirectional_attention", None)
+        if mm_token_type_ids is not None and use_bidir == "vision":
             global_attention_mask_data = self.get_flashinfer_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
