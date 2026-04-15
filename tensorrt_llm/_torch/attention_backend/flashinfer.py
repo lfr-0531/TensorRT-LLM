@@ -711,36 +711,80 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 and metadata.flashinfer_backend != self.flashinfer_backend):
             metadata.flashinfer_backend = self.flashinfer_backend
 
-        # trtllm-gen does not support non-causal (bidirectional) attention used
-        # by multimodal models for image/audio tokens.  Fall back to causal
-        # when trtllm-gen is active and a custom mask is provided.  This is an
-        # approximation: only full attention layers (head_dim>256) are affected
-        # and only during multimodal prefill.
-        effective_mask_type = attention_mask_type
-        effective_mask_data = attention_mask_data
-        if (metadata.flashinfer_backend == "trtllm-gen"
-                and attention_mask_data is not None):
-            effective_mask_type = int(AttentionMaskType.causal)
-            effective_mask_data = None
+        # Triton prefill fallback: trtllm-gen cannot handle custom
+        # (bidirectional) attention masks for head_dim>256 layers.  Use a
+        # Triton prefill kernel for those layers during multimodal prefill,
+        # while keeping FlashInfer for decode and all other cases.
+        # KV-shared layers (k is None) keep the causal fallback below.
+        use_triton_prefill = (self.flashinfer_backend == "trtllm-gen"
+                              and attention_mask_data is not None
+                              and num_contexts > 0 and k is not None)
 
-        # this will do nothing if the last forward pass had the same parameters
-        plan_params = metadata.plan(self.num_heads,
-                                    self.num_kv_heads,
-                                    self.head_dim,
-                                    q_dtype=q.dtype,
-                                    kv_dtype=kv_cache.dtype,
-                                    q_scaling=self.q_scaling,
-                                    attention_window_size=attention_window_size,
-                                    attention_mask_type=effective_mask_type,
-                                    attention_mask_data=effective_mask_data)
+        if use_triton_prefill:
+            from .triton_prefill import triton_prefill_with_custom_mask
 
-        if num_contexts == 0:
-            decode_forward(plan_params, output)
-        elif num_generations == 0:
-            prefill_forward(plan_params, output)
+            prefix_lens = metadata.cached_token_lens[:num_contexts].clone()
+
+            triton_prefill_with_custom_mask(
+                q=q[:num_ctx_tokens],
+                k=k[:num_ctx_tokens],
+                v=v[:num_ctx_tokens],
+                output=output[:num_ctx_tokens].view(-1, self.num_heads,
+                                                    self.head_dim),
+                qo_indptr=metadata.qo_indptr[:num_contexts + 1],
+                kv_cache=kv_cache,
+                prefix_lens=prefix_lens,
+                page_table_indptr=metadata.
+                paged_kv_indptr_prefill[:num_contexts + 1],
+                page_table_indices=metadata.
+                _paged_kv_indices[:metadata.num_context_blocks],
+                page_size=metadata.page_size,
+                custom_mask=attention_mask_data,
+                sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
+            )
+
+            if num_generations > 0:
+                decode_plan_params = metadata.plan(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_dtype=q.dtype,
+                    kv_dtype=kv_cache.dtype,
+                    q_scaling=self.q_scaling,
+                    attention_window_size=None,
+                    attention_mask_type=int(AttentionMaskType.causal),
+                    attention_mask_data=None)
+                decode_forward(decode_plan_params, output[num_ctx_tokens:, :])
+
         else:
-            prefill_forward(plan_params, output[:num_ctx_tokens, :])
-            decode_forward(plan_params, output[num_ctx_tokens:, :])
+            # Existing FlashInfer path.  For KV-shared layers with trtllm-gen
+            # + custom mask: fall back to causal (trtllm-gen has no Custom
+            # cubin for head_dim>256).
+            effective_mask_type = attention_mask_type
+            effective_mask_data = attention_mask_data
+            if (metadata.flashinfer_backend == "trtllm-gen"
+                    and attention_mask_data is not None):
+                effective_mask_type = int(AttentionMaskType.causal)
+                effective_mask_data = None
+
+            plan_params = metadata.plan(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                q_scaling=self.q_scaling,
+                attention_window_size=attention_window_size,
+                attention_mask_type=effective_mask_type,
+                attention_mask_data=effective_mask_data)
+
+            if num_contexts == 0:
+                decode_forward(plan_params, output)
+            elif num_generations == 0:
+                prefill_forward(plan_params, output)
+            else:
+                prefill_forward(plan_params, output[:num_ctx_tokens, :])
+                decode_forward(plan_params, output[num_ctx_tokens:, :])
 
     def forward(self,
                 q: torch.Tensor,
