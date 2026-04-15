@@ -258,9 +258,8 @@ class Gemma4Attention(QKNormRoPEAttention):
             self.rotary_emb.head_dim = layer_head_dim
 
         # Gemma4 hybrid attention needs trtllm-gen FlashInfer backend for
-        # head_dim > 256 (fa2 JIT kernels don't support head_dim=512).
-        # Only set for THIS layer's head_dim — sliding layers (head_dim=256)
-        # should keep using the default fa2 backend.
+        # head_dim > 256 prefill (fa2 JIT kernels don't support head_dim=512
+        # prefill).  For decode, fa2 supports head_dim=512.
         if layer_head_dim > 256:
             self.attn.flashinfer_backend = "trtllm-gen"
 
@@ -842,9 +841,14 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
-        CUDA graphs are disabled because the VSWA (variable sliding window
-        attention) per-pool page index swapping in ``forward_impl`` is not
-        compatible with CUDA graph capture/replay.
+        CUDA graphs are disabled because:
+        1. The trtllm-gen decode backend (needed for head_dim=512) caches
+           page indices in an internal ``_block_tables`` tensor during
+           ``plan()``, which becomes stale after VSWA pool index swaps.
+        2. The fa2/fa3 decode backend doesn't support head_dim=512 prefill
+           modules that are used internally by the FlashInfer decode wrapper.
+        Until FlashInfer adds CUDA-graph-compatible VSWA support for
+        head_dim=512, CUDA graphs must be disabled for Gemma4.
         """
         return {"cuda_graph_config": None}
 

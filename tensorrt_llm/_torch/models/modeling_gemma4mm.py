@@ -278,12 +278,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        """Gemma4-specific defaults.
-
-        CUDA graphs are disabled because the VSWA (variable sliding window
-        attention) per-pool page index swapping in ``forward_impl`` is not
-        compatible with CUDA graph capture/replay.
-        """
+        """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {"cuda_graph_config": None}
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):

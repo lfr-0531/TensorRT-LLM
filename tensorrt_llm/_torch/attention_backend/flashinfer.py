@@ -155,6 +155,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         so we overwrite its contents with the correct pool's data before
         each layer's plan/run cycle.  We track the currently active pool
         so we only copy when the pool actually changes.
+
         """
         if self._vswa_layer_to_pool is None:
             return
@@ -281,6 +282,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                             mgr.layer_offsets[layer_idx]]
                         if hd not in self._vswa_head_dim_to_pool:
                             self._vswa_head_dim_to_pool[hd] = pool_id
+
+                # Pre-allocate VSWA pool cache buffers.  These must be
+                # stable (never reallocated) so that CUDA-graph-recorded
+                # copies reference valid addresses across replays.
+                for pool_id in set(self._vswa_layer_to_pool.values()):
+                    buf_key = f'_vswa_pool_buf_{pool_id}'
+                    if getattr(self, buf_key, None) is None:
+                        setattr(
+                            self, buf_key,
+                            torch.empty(max_num_pages,
+                                        dtype=torch.int,
+                                        device='cuda'))
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -458,18 +471,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self._vswa_layer_to_pool is not None:
             unique_pools = set(self._vswa_layer_to_pool.values())
             primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            # Allocate a dedicated buffer for the primary pool's indices.
-            # Using _paged_kv_indices directly would be an alias: when a
-            # secondary pool swap overwrites _paged_kv_indices the primary
-            # pool's cached entry would also be corrupted.
+            # Use dedicated pre-allocated buffers for each pool's indices.
+            # These buffers are created in __post_init__ so their addresses
+            # stay stable across CUDA-graph replays.
             total_idx = paged_kv_indices.size(0)
-            buf_key_primary = f'_vswa_pool_buf_{primary_pool_id}'
-            primary_buf = getattr(self, buf_key_primary, None)
-            if primary_buf is None or primary_buf.size(0) < total_idx:
-                primary_buf = torch.empty(max(total_idx, 1),
-                                          dtype=torch.int,
-                                          device='cuda')
-                setattr(self, buf_key_primary, primary_buf)
+            primary_buf = getattr(self, f'_vswa_pool_buf_{primary_pool_id}')
             primary_buf[:total_idx].copy_(self._paged_kv_indices[:total_idx],
                                           non_blocking=True)
             self._vswa_pool_indices_cache = {
@@ -485,14 +491,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 for i, blk_ids in enumerate(pool_block_ids):
                     pool_idx_list.extend(blk_ids[:self.num_blocks[i]])
                 pool_indices = torch.tensor(pool_idx_list, dtype=torch.int32)
-                # Allocate or reuse a CUDA buffer for this pool.
-                buf_key = f'_vswa_pool_buf_{pool_id}'
-                buf = getattr(self, buf_key, None)
-                if buf is None or buf.size(0) < pool_indices.size(0):
-                    buf = torch.empty(max(pool_indices.size(0), total_idx),
-                                      dtype=torch.int,
-                                      device='cuda')
-                    setattr(self, buf_key, buf)
+                buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
                 buf[:pool_indices.size(0)].copy_(pool_indices,
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = buf
