@@ -947,12 +947,24 @@ def _create_kv_cache_manager(
 
         # Set per-layer max_attention_window so V2 creates separate pool
         # groups for sliding vs full attention layers (different page sizes).
+        # Use max_seq_len - 1 for sliding layers instead of the model's
+        # sliding_window.  V2 uses sliding_window_size to evict old blocks,
+        # but FlashInfer's prepare() computes positions and last_page_len
+        # from full kv_lens — which assumes ALL tokens are in the cache.
+        # With V2 eviction the sliding pool stores fewer tokens than
+        # kv_lens, causing position overflow → page index OOB.  Using
+        # max_seq_len - 1 disables eviction (all blocks kept) while
+        # remaining distinct from full layers' max_seq_len (V2 converts
+        # max_seq_len → None), keeping is_vswa=True.  The sliding window
+        # is enforced via window_left at the attention kernel level.
+        # TODO: properly support V2 eviction by computing per-pool
+        # effective kv_lens (windowed) for positions and last_page_len.
         if (kv_cache_config.max_attention_window is None
                 and sliding_window is not None):
             kv_cache_config = copy.copy(kv_cache_config)
             kv_cache_config.max_attention_window = [
-                int(sliding_window)
-                if lt == "sliding_attention" else int(max_seq_len)
+                int(max_seq_len) -
+                1 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]
 

@@ -279,7 +279,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {"cuda_graph_config": None}
+        return {
+            "attn_backend": "FLASHINFER",
+            "cuda_graph_config": None,
+        }
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_disagg():

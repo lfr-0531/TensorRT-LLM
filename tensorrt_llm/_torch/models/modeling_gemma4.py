@@ -841,6 +841,14 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
+        FlashInfer backend is required because:
+        1. Hybrid attention (per-layer head_dim 256/512) needs FlashInfer's
+           VSWA (Variable Sliding Window Attention) per-pool page management.
+        2. Full attention layers (head_dim=512) use trtllm-gen cubin kernels
+           via FlashInfer's backend dispatch.
+        3. Bidirectional attention masks for multimodal tokens use
+           FlashInfer's custom mask support.
+
         CUDA graphs are disabled because:
         1. The trtllm-gen decode backend (needed for head_dim=512) caches
            page indices in an internal ``_block_tables`` tensor during
@@ -850,7 +858,10 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         Until FlashInfer adds CUDA-graph-compatible VSWA support for
         head_dim=512, CUDA graphs must be disabled for Gemma4.
         """
-        return {"cuda_graph_config": None}
+        return {
+            "attn_backend": "FLASHINFER",
+            "cuda_graph_config": None,
+        }
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.

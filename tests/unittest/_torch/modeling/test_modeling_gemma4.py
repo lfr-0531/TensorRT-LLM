@@ -570,8 +570,11 @@ class TestGemma4HFComparison(unittest.TestCase):
         if isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1:
             needs_vswa = True
         if needs_vswa and sliding_window:
+            # Use max_seq_len - 1 for sliding layers (same as _util.py fix)
+            # to prevent V2 block eviction that would cause FlashInfer
+            # page index OOB when kv_lens > sliding_window.
             max_attn_window = [
-                sliding_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
+                max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
             ]
 
         kv_cache_config = KvCacheConfigV2(
@@ -1625,6 +1628,91 @@ class TestGemma4HFComparison(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_vswa_no_eviction_with_long_sequence(self):
+        """VSWA: sliding pool must not evict blocks when max_attention_window
+        uses max_seq_len - 1 (the fix for page index OOB).
+
+        Root cause: when _util.py used the model's sliding_window (e.g. 512)
+        as max_attention_window for sliding layers, V2 would evict old blocks
+        when kv_lens exceeded the window.  But FlashInfer's prepare() computes
+        num_blocks from the FULL kv_lens, so the page indices for evicted
+        blocks become stale → illegal memory access.
+
+        The fix uses max_seq_len - 1 instead of sliding_window, preventing
+        eviction while keeping is_vswa=True.  This test verifies that with
+        the fix, a sequence longer than sliding_window still has all its
+        blocks allocated (no eviction) and page indices are within bounds.
+        """
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        # Use a small sliding_window to easily exceed it
+        config_dict["sliding_window"] = 64
+        config = Gemma4TextConfig(**config_dict)
+
+        # num_blocks=4 → max_seq_len = 4*128 = 512, much larger than
+        # sliding_window=64.  With the fix, max_attention_window for sliding
+        # layers = 511 (max_seq_len - 1), so V2 won't evict.
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=4)
+
+        # Allocate a request with tokens > sliding_window
+        request_ids = [1]
+        token_nums = [128]  # 128 tokens >> sliding_window (64)
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        metadata = metadata_cls(
+            seq_lens=torch.tensor([128], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=[128],
+        )
+
+        with torch.inference_mode():
+            metadata.prepare()
+
+        # num_blocks should be based on full kv_lens (128 tokens),
+        # not clamped to sliding_window (64 tokens).
+        expected_blocks = (
+            128 + kv_cache_manager.tokens_per_block - 1
+        ) // kv_cache_manager.tokens_per_block
+        self.assertEqual(
+            metadata.num_blocks[0],
+            expected_blocks,
+            f"num_blocks should be {expected_blocks} (from full kv_lens=128), "
+            f"not clamped to sliding_window={config_dict['sliding_window']}",
+        )
+
+        # Page indices must be within bounds for EVERY layer
+        for layer_idx in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
+            if buf is None:
+                continue
+            max_pages = buf.shape[0]
+            indices = metadata.get_paged_kv_indices_for_layer(layer_idx)
+            if indices.numel() == 0:
+                continue
+            max_idx = indices.max().item()
+            self.assertLess(
+                max_idx,
+                max_pages,
+                f"Layer {layer_idx}: page index {max_idx} >= pool pages {max_pages}",
+            )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
     def test_mixed_batch_kv_cache_isolation(self):
         """Mixed batch: B's prefill must not corrupt A's KV cache.
 
@@ -1813,6 +1901,70 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertTrue(mask_26b[4, 2].item(), "Image token 4 should attend to 2")
         # But causal for text tokens
         self.assertFalse(mask_26b[0, 1].item(), "Text token 0 should NOT attend to 1")
+
+
+class TestGemma4ModelDefaults(unittest.TestCase):
+    """Tests for Gemma4 model defaults (get_model_defaults)."""
+
+    def test_causal_lm_requires_flashinfer_backend(self):
+        """Gemma4ForCausalLM must default to FLASHINFER attention backend.
+
+        The TRTLLM backend does not support:
+        - FlashInfer VSWA per-pool page management for hybrid head_dim
+        - trtllm-gen cubin dispatch for head_dim=512 layers
+        - Custom attention masks for bidirectional multimodal tokens
+        Without this default, models crash with:
+            'TrtllmAttentionMetadata' object has no attribute 'kv_layout'
+        """
+        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        self.assertIn("attn_backend", defaults, "get_model_defaults must set attn_backend")
+        self.assertEqual(
+            defaults["attn_backend"], "FLASHINFER", "Gemma4 requires FLASHINFER (exact uppercase)"
+        )
+
+    def test_causal_lm_disables_cuda_graphs(self):
+        """Gemma4ForCausalLM must disable CUDA graphs.
+
+        CUDA graphs are incompatible with VSWA page index swapping.
+        """
+        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        self.assertIn("cuda_graph_config", defaults)
+        self.assertIsNone(defaults["cuda_graph_config"])
+
+    def test_conditional_gen_requires_flashinfer_backend(self):
+        """Gemma4ForConditionalGeneration must also default to FLASHINFER."""
+        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        self.assertIn("attn_backend", defaults)
+        self.assertEqual(defaults["attn_backend"], "FLASHINFER")
+
+    def test_conditional_gen_disables_cuda_graphs(self):
+        """Gemma4ForConditionalGeneration must also disable CUDA graphs."""
+        from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        self.assertIn("cuda_graph_config", defaults)
+        self.assertIsNone(defaults["cuda_graph_config"])
+
+    def test_attn_backend_dispatches_to_flashinfer(self):
+        """Verify the exact string 'FLASHINFER' dispatches correctly.
+
+        get_attention_backend uses exact case-sensitive match. 'FlashInfer'
+        or 'flashinfer' would silently fall back to TrtllmAttention, which
+        causes 'TrtllmAttentionMetadata has no attribute kv_layout' crashes.
+        """
+        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+
+        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        backend_cls = get_attention_backend(defaults["attn_backend"])
+
+        # Must be FlashInferAttention, not TrtllmAttention
+        self.assertEqual(
+            backend_cls.__name__,
+            "FlashInferAttention",
+            "FLASHINFER must dispatch to FlashInferAttention",
+        )
 
 
 if __name__ == "__main__":
