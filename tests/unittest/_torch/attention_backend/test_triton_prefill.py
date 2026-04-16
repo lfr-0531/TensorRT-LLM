@@ -240,6 +240,36 @@ class TestTritonPrefillNoPrefix:
 
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
+    def test_causal_no_custom_mask(self, device):
+        """Causal attention with custom_mask=None (NVFP4 fallback path).
+
+        When trtllm-gen context cubins don't support mixed Q/KV dtypes
+        (BF16 Q + FP8 KV for NVFP4 models), the Triton prefill kernel is
+        called with custom_mask=None and must generate a causal mask
+        internally. Result must match explicit causal mask.
+        """
+        torch.manual_seed(42)
+        seq_len, num_heads, num_kv_heads, head_dim = 64, 8, 4, 512
+        sm_scale = 1.0
+
+        q = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+        k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+        v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+
+        # Run with None mask (auto-causal)
+        out_none = self._run_no_prefix(q, k, v, None, sm_scale, device)
+
+        # Run with explicit causal mask
+        mask = _make_causal_mask(seq_len).to(device)
+        out_explicit = self._run_no_prefix(q, k, v, mask.flatten().contiguous(), sm_scale, device)
+
+        # Both should match
+        torch.testing.assert_close(out_none, out_explicit, atol=1e-5, rtol=1e-5)
+
+        # Also match SDPA reference
+        ref = _sdpa_reference(q, k, v, mask=[mask], sm_scale=sm_scale)
+        torch.testing.assert_close(out_none, ref, atol=1e-2, rtol=1e-2)
+
     def test_gqa_num_heads_8_kv_4(self, device):
         """GQA with num_heads=8, num_kv_heads=4 (Gemma4 config)."""
         torch.manual_seed(42)

@@ -2031,6 +2031,27 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             "FLASHINFER must dispatch to FlashInferAttention",
         )
 
+    def test_all_layers_use_trtllm_gen(self):
+        """All Gemma4 layers use trtllm-gen backend uniformly.
+
+        trtllm-gen has pre-compiled cubins for H256+H512, both BF16 and
+        FP8 dtypes.  For FP8 KV cache (NVFP4), the FlashInfer backend
+        casts Q to FP8 to match KV, enabling QkvE4m3OBfloat16 context
+        cubins.  Uniform backend is required for CUDA graph workspace
+        sharing safety.
+        """
+        config_dict = deepcopy(GEMMA4_SMALL_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config)
+
+        for i in range(config.num_hidden_layers):
+            attn = Gemma4Attention(model_config, i)
+            self.assertEqual(
+                attn.attn.flashinfer_backend,
+                "trtllm-gen",
+                f"Layer {i} should use trtllm-gen",
+            )
+
 
 class TestGemma4CUDAGraph(unittest.TestCase):
     """Tests for Gemma4 attention with CUDA graph capture/replay."""

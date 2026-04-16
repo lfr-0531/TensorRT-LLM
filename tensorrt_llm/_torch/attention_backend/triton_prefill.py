@@ -480,13 +480,15 @@ def triton_prefill_with_custom_mask(
     page_table_indices: torch.Tensor,
     page_size: int,
     # Attention config
-    custom_mask: torch.Tensor,
+    custom_mask: Optional[torch.Tensor],
     sm_scale: float,
 ) -> None:
-    """Triton prefill attention with custom mask and paged KV cache support.
+    """Triton prefill attention with optional custom mask and paged KV cache.
 
-    Replaces FlashInfer prefill for layers where trtllm-gen cannot handle custom
-    masks (e.g. head_dim=512 + bidirectional attention for multimodal).
+    Replaces FlashInfer prefill for layers where trtllm-gen cannot handle:
+    - Custom (bidirectional) masks for head_dim>256 multimodal layers.
+    - Mixed Q/KV dtypes during prefill (FP8 KV cache with NVFP4 models).
+    When custom_mask is None, uses causal attention (lower-triangular mask).
 
     Two-stage attention:
       Stage 1: Attend to prefix KV in paged cache (skipped when prefix_lens=0)
@@ -505,15 +507,32 @@ def triton_prefill_with_custom_mask(
         page_table_indices: [total_pages] physical page IDs
         page_size: Tokens per cache page
         custom_mask: Flattened bool mask, concatenated per sequence.
-                     Per-seq shape: [extend_len, prefix_len + extend_len]
+                     Per-seq shape: [extend_len, prefix_len + extend_len].
+                     None for causal attention.
         sm_scale: Softmax scale factor
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
     extend_lens = qo_indptr[1:] - qo_indptr[:-1]
 
-    # Compute mask_indptr: each seq's mask is [extend_len, prefix_len + extend_len]
+    # Build causal mask when custom_mask is not provided
     total_kv_lens = prefix_lens + extend_lens
+    if custom_mask is None:
+        # Generate causal mask: each query at position i attends to
+        # positions [0..prefix_len+i] (all prefix + causal extend)
+        mask_parts = []
+        for seq_idx in range(num_contexts):
+            ext = int(extend_lens[seq_idx].item())
+            pre = int(prefix_lens[seq_idx].item())
+            total = pre + ext
+            # Row i of extend can see columns [0..pre+i]
+            rows = torch.arange(ext, device=device).unsqueeze(1)
+            cols = torch.arange(total, device=device).unsqueeze(0)
+            seq_mask = cols <= (rows + pre)
+            mask_parts.append(seq_mask.reshape(-1))
+        custom_mask = torch.cat(mask_parts)
+
+    # Compute mask_indptr: each seq's mask is [extend_len, prefix_len + extend_len]
     mask_sizes = extend_lens * total_kv_lens
     mask_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
     mask_indptr[1:] = torch.cumsum(mask_sizes, dim=0)
@@ -522,10 +541,19 @@ def triton_prefill_with_custom_mask(
     prefix_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
     prefix_indptr[1:] = torch.cumsum(prefix_lens, dim=0)
 
-    # Extract K/V views from paged cache (no copy)
+    # Extract K/V views from paged cache.  When the KV cache uses a
+    # narrower dtype (e.g. FP8 with NVFP4 quantization), cast to the
+    # compute dtype (Q's dtype, typically BF16) so the Triton kernel
+    # can run tl.dot in BF16.  Only the accessed pages are copied.
+    compute_dtype = q.dtype
     if kv_cache is not None:
         k_buffer = kv_cache.select(1, 0)  # [num_pages, num_kv_heads, page_size, head_dim]
         v_buffer = kv_cache.select(1, 1)
+        if k_buffer.dtype != compute_dtype:
+            num_prefix_pages = int(page_table_indptr[-1].item())
+            if num_prefix_pages > 0:
+                k_buffer = k_buffer.to(compute_dtype)
+                v_buffer = v_buffer.to(compute_dtype)
     else:
         # Dummy 4D buffers — not accessed when all prefix_lens are 0,
         # but must have 4 dims so stride(0..3) works in the kernel launcher.

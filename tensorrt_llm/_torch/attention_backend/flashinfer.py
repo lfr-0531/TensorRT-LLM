@@ -698,6 +698,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
+        # When Q is cast to FP8 (for NVFP4 models), output must remain
+        # BF16 — pass o_data_type explicitly so the plan selects
+        # QkvE4m3OBfloat16 cubins instead of QkvE4m3OE4m3.
+        o_dtype = (torch.bfloat16 if plan_params.q_dtype
+                   in (torch.float8_e4m3fn, torch.float8_e5m2) else None)
+
         def prefill_plan():
             # Setting `window_left` to -1 for custom attention mask is important.
             # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
@@ -719,6 +725,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 window_left=window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                o_data_type=o_dtype,
                 custom_mask=plan_params.attention_mask_data,
             )
 
@@ -762,6 +769,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 window_left=plan_params.window_left,
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
+                o_data_type=o_dtype,
             )
 
         # Must sync after append_paged_kv_cache and before plan.
@@ -887,6 +895,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 kv_indptr=metadata.paged_kv_indptr,
                 kv_last_page_len=metadata.paged_kv_last_page_len,
                 kv_layout=metadata.kv_layout)
+
+        # For trtllm-gen + FP8 KV cache: cast Q to FP8 so context cubins
+        # (QkvE4m3OBfloat16) can be used.  trtllm-gen context cubins
+        # require same Q/KV dtype; only decode cubins support mixed dtypes.
+        # Guard on flashinfer_backend to avoid affecting fa2/fa3 paths.
+        if (self.flashinfer_backend == "trtllm-gen" and self.has_fp8_kv_cache
+                and q.dtype != kv_cache.dtype):
+            q = q.to(kv_cache.dtype)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
