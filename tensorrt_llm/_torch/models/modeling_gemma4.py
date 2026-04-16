@@ -257,11 +257,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Gemma4 hybrid attention needs trtllm-gen FlashInfer backend for
-        # head_dim > 256 prefill (fa2 JIT kernels don't support head_dim=512
-        # prefill).  For decode, fa2 supports head_dim=512.
-        if layer_head_dim > 256:
-            self.attn.flashinfer_backend = "trtllm-gen"
+        # Use trtllm-gen for ALL layers.  This avoids the flashinfer_backend
+        # leak issue where context-phase overrides (trtllm-gen for full layers)
+        # leak into CUDA graph metadata and corrupt sliding-layer wrappers.
+        # trtllm-gen has pre-compiled cubins for both H256+SWA and H512.
+        self.attn.flashinfer_backend = "trtllm-gen"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -841,26 +841,12 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required because:
-        1. Hybrid attention (per-layer head_dim 256/512) needs FlashInfer's
-           VSWA (Variable Sliding Window Attention) per-pool page management.
-        2. Full attention layers (head_dim=512) use trtllm-gen cubin kernels
-           via FlashInfer's backend dispatch.
-        3. Bidirectional attention masks for multimodal tokens use
-           FlashInfer's custom mask support.
-
-        CUDA graphs are disabled because:
-        1. The trtllm-gen decode backend (needed for head_dim=512) caches
-           page indices in an internal ``_block_tables`` tensor during
-           ``plan()``, which becomes stale after VSWA pool index swaps.
-        2. The fa2/fa3 decode backend doesn't support head_dim=512 prefill
-           modules that are used internally by the FlashInfer decode wrapper.
-        Until FlashInfer adds CUDA-graph-compatible VSWA support for
-        head_dim=512, CUDA graphs must be disabled for Gemma4.
+        FlashInfer backend is required for hybrid attention (per-layer
+        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
+        bidirectional attention masks for multimodal tokens.
         """
         return {
             "attn_backend": "FLASHINFER",
-            "cuda_graph_config": None,
         }
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):

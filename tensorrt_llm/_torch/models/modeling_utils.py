@@ -514,6 +514,11 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+                        # Reset _weights_created so create_weights() in
+                        # __post_init__ will re-create this module's weights
+                        # with the updated (non-quantized) config.
+                        if hasattr(module, '_weights_created'):
+                            module._weights_created = False
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()

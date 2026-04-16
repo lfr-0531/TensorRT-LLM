@@ -281,7 +281,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {
             "attn_backend": "FLASHINFER",
-            "cuda_graph_config": None,
         }
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
@@ -313,6 +312,20 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.model_config = model_config_cp
 
         # --- Language model ---
+        # Remap quantization exclude_modules patterns from HF naming to
+        # TRT-LLM naming so that excluded layers (e.g., attention for
+        # NVFP4) are correctly identified by apply_quant_config_exclude_modules
+        # inside the LLM sub-model.
+        # HF: "model.language_model.layers.X.self_attn*"
+        # TRT-LLM CausalLM sub-model: "model.layers.X.self_attn*"
+        qc = getattr(model_config_cp, "quant_config", None)
+        if qc and getattr(qc, "exclude_modules", None):
+            remapped = []
+            for pat in qc.exclude_modules:
+                remapped.append(pat)
+                if pat.startswith("model.language_model."):
+                    remapped.append(pat.replace("model.language_model.", "model."))
+            qc.exclude_modules = remapped
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
 

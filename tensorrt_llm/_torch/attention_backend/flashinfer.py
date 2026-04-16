@@ -67,10 +67,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
 
-    # FlashInfer kernel backend: "fa2" (default), "fa3", "trtllm-gen", or "auto".
-    # "trtllm-gen" uses pre-compiled FMHA kernels and supports head_dim=512.
-    flashinfer_backend: str = "fa2"
-
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
@@ -133,21 +129,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
 
-    def _swap_indices_for_head_dim(self, head_dim: int) -> None:
-        """Swap _paged_kv_indices to the pool matching the given head_dim.
-
-        Used by prepare() to re-plan each cached wrapper with correct indices.
-        """
-        head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
-        if head_dim_to_pool is None or self._vswa_pool_indices_cache is None:
-            return
-        pool_id = head_dim_to_pool.get(head_dim)
-        if pool_id is None:
-            return
-        rep_layer = self._vswa_pool_to_rep_layer.get(pool_id)
-        if rep_layer is not None:
-            self.swap_paged_kv_indices_for_layer(rep_layer)
-
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
 
@@ -163,11 +144,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if pool_id is None:
             return  # Layer not in VSWA mapping
         active = getattr(self, '_vswa_active_pool_id', None)
-        if pool_id == active:
+        if pool_id == active and not self.is_cuda_graph:
             return  # Buffer already has the right data
-        total_blocks = self.num_generation_blocks + self.num_context_blocks
-        src = self._vswa_pool_indices_cache[pool_id][:total_blocks]
-        self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
+        n = self._paged_kv_indices.numel() if self.is_cuda_graph else (
+            self.num_generation_blocks + self.num_context_blocks)
+        src = self._vswa_pool_indices_cache[pool_id][:n]
+        self._paged_kv_indices[:n].copy_(src, non_blocking=True)
         self._vswa_active_pool_id = pool_id
 
     @property
@@ -286,12 +268,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # Pre-allocate VSWA pool cache buffers.  These must be
                 # stable (never reallocated) so that CUDA-graph-recorded
                 # copies reference valid addresses across replays.
+                # Use the maximum page count across ALL pools (not just the
+                # primary) so that secondary pool buffers are large enough.
+                all_pool_pages = max_num_pages
+                if hasattr(self.kv_cache_manager, 'layer_offsets'):
+                    for lid in self.kv_cache_manager.layer_offsets:
+                        lbuf = self.kv_cache_manager.get_buffers(lid)
+                        if lbuf is not None:
+                            all_pool_pages = max(all_pool_pages, lbuf.shape[0])
                 for pool_id in set(self._vswa_layer_to_pool.values()):
                     buf_key = f'_vswa_pool_buf_{pool_id}'
                     if getattr(self, buf_key, None) is None:
                         setattr(
                             self, buf_key,
-                            torch.empty(max_num_pages,
+                            torch.empty(all_pool_pages,
                                         dtype=torch.int,
                                         device='cuda'))
 
@@ -577,6 +567,45 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
             self._vswa_active_pool_id = primary_pool_id
 
+        # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
+        # so the trtllm-gen decode kernel uses current page indices.
+        if (self.is_cuda_graph and self._vswa_layer_to_pool is not None
+                and self._vswa_pool_indices_cache is not None
+                and self.num_generations > 0):
+            decode_blocks = self.num_blocks[self.num_contexts:]
+            head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
+            for plan_params, wrappers in self._plan_params_to_wrappers.items():
+                if plan_params.attention_mask_data is not None:
+                    continue
+                dw = wrappers.decode_wrapper
+                bt = getattr(dw, '_block_tables', None)
+                if bt is None:
+                    continue
+                pool_id = (head_dim_to_pool.get(plan_params.head_dim)
+                           if head_dim_to_pool else None)
+                if pool_id is None:
+                    continue
+                pool_buf = self._vswa_pool_indices_cache[pool_id]
+                bs, max_blk = bt.shape
+                new_bt = torch.zeros_like(bt)
+                offset = self.num_context_blocks
+                flat_offset = 0
+                for i in range(min(bs, self.num_generations)):
+                    n = decode_blocks[i]
+                    ncopy = min(n, max_blk)
+                    new_bt[i, :ncopy] = pool_buf[offset + flat_offset:offset +
+                                                 flat_offset + ncopy]
+                    flat_offset += n
+                bt.copy_(new_bt)
+                kv_lens_buf = getattr(dw, '_kv_lens_buffer', None)
+                if kv_lens_buf is not None:
+                    decode_kv_lens = kv_lens[self.num_contexts:]
+                    kv_lens_buf[:self.num_generations].copy_(
+                        decode_kv_lens[:self.num_generations],
+                        non_blocking=True)
+                    if self.num_generations < bs:
+                        kv_lens_buf[self.num_generations:bs].zero_()
+
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
 
@@ -589,7 +618,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              attention_mask_type: int,
              q_scaling: Optional[float] = None,
              attention_window_size: Optional[int] = None,
-             attention_mask_data: Optional[torch.Tensor] = None) -> PlanParams:
+             attention_mask_data: Optional[torch.Tensor] = None,
+             flashinfer_backend: str = "fa2") -> PlanParams:
 
         sm_scale = None
         if q_scaling is not None:
@@ -606,14 +636,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data)
-        return self._plan_with_params(plan_params)
+        return self._plan_with_params(plan_params, flashinfer_backend)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
         return plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
 
-    def _plan_with_params(self, plan_params: PlanParams) -> PlanParams:
+    def _plan_with_params(self,
+                          plan_params: PlanParams,
+                          flashinfer_backend: str = "fa2") -> PlanParams:
         if not self.needs_plan(plan_params):
             return plan_params
 
@@ -657,7 +689,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 self.kv_layout,
-                backend=self.flashinfer_backend,
+                backend=flashinfer_backend,
                 qo_indptr_buf=self.qo_indptr,
                 paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
                 paged_kv_indices_buf=self._paged_kv_indices,
@@ -704,9 +736,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 paged_kv_indices_buffer=self._paged_kv_indices,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
                 use_tensor_cores=use_tensor_cores
-                or self.flashinfer_backend == "trtllm-gen",
-                backend=self.flashinfer_backend if self.flashinfer_backend
-                != "fa2" else ("fa2" if torch.cuda.get_device_capability(0) == (
+                or flashinfer_backend == "trtllm-gen",
+                backend=flashinfer_backend if flashinfer_backend != "fa2" else
+                ("fa2" if torch.cuda.get_device_capability(0) == (
                     9, 0) else "auto"),
             )
 
@@ -765,7 +797,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
-        self.flashinfer_backend = kwargs.pop('flashinfer_backend', None)
+        self.flashinfer_backend = kwargs.pop('flashinfer_backend', "fa2")
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         if not skip_create_weights_in_init:
@@ -872,12 +904,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
-        # Override FlashInfer kernel backend if the attention layer requests it
-        # (e.g., Gemma4 uses trtllm-gen for head_dim=512 support).
-        if (self.flashinfer_backend is not None
-                and metadata.flashinfer_backend != self.flashinfer_backend):
-            metadata.flashinfer_backend = self.flashinfer_backend
-
         # Triton prefill fallback: trtllm-gen cannot handle custom
         # (bidirectional) attention masks for head_dim>256 layers.  Use a
         # Triton prefill kernel for those layers during multimodal prefill,
@@ -920,7 +946,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     q_scaling=self.q_scaling,
                     attention_window_size=None,
                     attention_mask_type=int(AttentionMaskType.causal),
-                    attention_mask_data=None)
+                    attention_mask_data=None,
+                    flashinfer_backend=self.flashinfer_backend)
                 decode_forward(decode_plan_params, output[num_ctx_tokens:, :])
 
         else:
@@ -929,7 +956,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             # cubin for head_dim>256).
             effective_mask_type = attention_mask_type
             effective_mask_data = attention_mask_data
-            if (metadata.flashinfer_backend == "trtllm-gen"
+            if (self.flashinfer_backend == "trtllm-gen"
                     and attention_mask_data is not None):
                 effective_mask_type = int(AttentionMaskType.causal)
                 effective_mask_data = None
@@ -943,7 +970,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 q_scaling=self.q_scaling,
                 attention_window_size=attention_window_size,
                 attention_mask_type=effective_mask_type,
-                attention_mask_data=effective_mask_data)
+                attention_mask_data=effective_mask_data,
+                flashinfer_backend=self.flashinfer_backend)
 
             if num_contexts == 0:
                 decode_forward(plan_params, output)

@@ -512,11 +512,81 @@ GEMMA4_E4B_LIKE_CONFIG = {
     "num_global_key_value_heads": None,  # inherit num_key_value_heads
 }
 
+# E2B-like: hybrid_hd + num_kv_heads=1 → GQA=4 → tensor-core decode for
+# ALL layers.  This is critical for CUDA graph testing because both sliding
+# and full wrappers use tensor-core plan(), which writes to workspace.
+# Without per-PlanParams workspace, the second plan overwrites the first's
+# workspace data → wrong attention during graph replay.
+GEMMA4_E2B_LIKE_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "num_key_value_heads": 1,
+    "attention_k_eq_v": False,
+    "num_global_key_value_heads": None,
+}
+
+# E2B-real-dims: same GQA=8 but with real head_dim (256/512).  This
+# exercises the trtllm-gen backend for full layers and non-TC decode
+# for sliding layers at production-scale head dimensions.
+GEMMA4_E2B_REAL_DIMS_CONFIG = {
+    "model_type": "gemma4_text",
+    "vocab_size": 1024,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "num_hidden_layers": 6,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 1,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "num_global_key_value_heads": None,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 1024,
+    "rms_norm_eps": 1e-6,
+    "sliding_window": 128,
+    "attention_k_eq_v": False,
+    "enable_moe_block": False,
+    "num_kv_shared_layers": 0,
+    "hidden_size_per_layer_input": 0,
+    "use_double_wide_mlp": False,
+    "final_logit_softcapping": None,
+    "use_bidirectional_attention": None,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {
+            "rope_type": "proportional",
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1000000.0,
+        },
+    },
+    "torch_dtype": "bfloat16",
+    "tie_word_embeddings": True,
+}
+
+# 31B-real-dims: GQA=2 sliding (32/16), GQA=8 full K=V (32/4), hd=256/512.
+# Exercises mixed GQA ratios with K=V full-attention layers.
+GEMMA4_31B_REAL_DIMS_CONFIG = {
+    **GEMMA4_E2B_REAL_DIMS_CONFIG,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 16,
+    "num_global_key_value_heads": 4,
+    "attention_k_eq_v": True,
+}
+
+# 26B-real-dims: GQA=2 sliding (16/8), GQA=2 full K=V (16/8), hd=256/512.
+GEMMA4_26B_REAL_DIMS_CONFIG = {
+    **GEMMA4_E2B_REAL_DIMS_CONFIG,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 8,
+    "attention_k_eq_v": True,
+}
+
 
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
 
-    def _get_kv_cache_manager(self, config, num_blocks=1, tokens_per_block=128, batch_size=1):
+    def _get_kv_cache_manager(self, config, num_blocks=4, tokens_per_block=32, batch_size=1):
         """Create KVCacheManagerV2 supporting per-layer head_dim."""
         import tensorrt_llm
         from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
@@ -1922,14 +1992,10 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             defaults["attn_backend"], "FLASHINFER", "Gemma4 requires FLASHINFER (exact uppercase)"
         )
 
-    def test_causal_lm_disables_cuda_graphs(self):
-        """Gemma4ForCausalLM must disable CUDA graphs.
-
-        CUDA graphs are incompatible with VSWA page index swapping.
-        """
+    def test_causal_lm_does_not_disable_cuda_graphs(self):
+        """Gemma4ForCausalLM must not disable CUDA graphs."""
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
-        self.assertIn("cuda_graph_config", defaults)
-        self.assertIsNone(defaults["cuda_graph_config"])
+        self.assertNotIn("cuda_graph_config", defaults)
 
     def test_conditional_gen_requires_flashinfer_backend(self):
         """Gemma4ForConditionalGeneration must also default to FLASHINFER."""
@@ -1939,13 +2005,12 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         self.assertIn("attn_backend", defaults)
         self.assertEqual(defaults["attn_backend"], "FLASHINFER")
 
-    def test_conditional_gen_disables_cuda_graphs(self):
-        """Gemma4ForConditionalGeneration must also disable CUDA graphs."""
+    def test_conditional_gen_does_not_disable_cuda_graphs(self):
+        """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
         defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
-        self.assertIn("cuda_graph_config", defaults)
-        self.assertIsNone(defaults["cuda_graph_config"])
+        self.assertNotIn("cuda_graph_config", defaults)
 
     def test_attn_backend_dispatches_to_flashinfer(self):
         """Verify the exact string 'FLASHINFER' dispatches correctly.
@@ -1965,6 +2030,916 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             "FlashInferAttention",
             "FLASHINFER must dispatch to FlashInferAttention",
         )
+
+
+class TestGemma4CUDAGraph(unittest.TestCase):
+    """Tests for Gemma4 attention with CUDA graph capture/replay."""
+
+    def _get_kv_cache_manager(self, config, num_blocks=2, tokens_per_block=32, batch_size=4):
+        """Create KVCacheManagerV2 with per-layer head_dim (VSWA)."""
+        import tensorrt_llm
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
+
+        dtype = config.torch_dtype
+        if dtype == torch.half:
+            kv_dtype = tensorrt_llm.bindings.DataType.HALF
+        else:
+            kv_dtype = tensorrt_llm.bindings.DataType.BF16
+
+        layer_types = config.layer_types
+        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
+        head_dim_per_layer = []
+        num_kv_heads_per_layer = []
+        for lt in layer_types:
+            is_sliding = lt == "sliding_attention"
+            use_k_eq_v = attention_k_eq_v and not is_sliding
+            if is_sliding:
+                head_dim_per_layer.append(config.head_dim)
+                num_kv_heads_per_layer.append(config.num_key_value_heads)
+            else:
+                head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
+                if use_k_eq_v:
+                    num_kv_heads_per_layer.append(
+                        getattr(config, "num_global_key_value_heads", None)
+                        or config.num_key_value_heads
+                    )
+                else:
+                    num_kv_heads_per_layer.append(config.num_key_value_heads)
+
+        unique_hd = set(head_dim_per_layer)
+        head_dim = head_dim_per_layer if len(unique_hd) > 1 else head_dim_per_layer[0]
+        unique_kv = set(num_kv_heads_per_layer)
+        num_kv_heads = num_kv_heads_per_layer if len(unique_kv) > 1 else num_kv_heads_per_layer[0]
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        max_seq_len = num_blocks * tokens_per_block
+        sliding_window = getattr(config, "sliding_window", None)
+        max_attn_window = None
+        needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
+        if not needs_vswa:
+            needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
+        if needs_vswa and sliding_window:
+            max_attn_window = [
+                max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
+            ]
+
+        kv_cache_config = KvCacheConfigV2(
+            max_tokens=num_blocks * tokens_per_block,
+            enable_block_reuse=False,
+            max_attention_window=max_attn_window,
+        )
+        return KVCacheManagerV2(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_dtype,
+        )
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_hybrid_headdim(self):
+        """CUDA graph decode with hybrid head_dim (VSWA).
+
+        Tests that CUDA graph capture + replay produces the same decode
+        output as eager execution for Gemma4's hybrid attention layout
+        (sliding head_dim=64, full head_dim=128).
+
+        This is the key test for CUDA graph support: Gemma4's VSWA creates
+        separate V2 pools for different head_dims.  The FlashInfer wrappers
+        must correctly handle page index swaps and workspace sharing under
+        CUDA graph capture/replay.
+        """
+        import random
+
+        from tensorrt_llm._torch.attention_backend import (
+            FlashInferAttention,
+            FlashInferAttentionMetadata,
+        )
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        batch_size = 4
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=2, batch_size=batch_size)
+
+        # Verify VSWA setup
+        self.assertTrue(kv_cache_manager.is_vswa, "Expected VSWA manager")
+
+        request_ids = list(range(batch_size))
+        past_seen_tokens = [random.randint(1, 100) for _ in range(batch_size)]
+        token_nums = [t + 1 for t in past_seen_tokens]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        # Fill KV cache with random data
+        for i in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(i)
+            if buf is not None:
+                torch.nn.init.normal_(buf)
+
+        # Build per-layer info
+        layer_types = config.layer_types
+        num_layers = config.num_hidden_layers
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+
+        layers_info = []
+        for layer_idx in range(num_layers):
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            hd = (
+                config.head_dim
+                if is_sliding
+                else getattr(config, "global_head_dim", config.head_dim)
+            )
+            layers_info.append(
+                {
+                    "layer_idx": layer_idx,
+                    "head_dim": hd,
+                    "num_kv_heads": config.num_key_value_heads,
+                    "num_heads": config.num_attention_heads,
+                }
+            )
+
+        # Create attention layers
+        layers = []
+        for info in layers_info:
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=info["layer_idx"],
+                    num_heads=info["num_heads"],
+                    head_dim=info["head_dim"],
+                    num_kv_heads=info["num_kv_heads"],
+                )
+            )
+
+        # Generate decode Q/K/V per layer (one token per request)
+        gen_qs, gen_ks, gen_vs = [], [], []
+        for info in layers_info:
+            gen_qs.append(
+                [
+                    torch.randn(1, info["num_heads"] * info["head_dim"], dtype=dtype, device=device)
+                    for _ in range(batch_size)
+                ]
+            )
+            gen_ks.append(
+                [
+                    torch.randn(
+                        1, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                    )
+                    for _ in range(batch_size)
+                ]
+            )
+            gen_vs.append(
+                [
+                    torch.randn(
+                        1, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                    )
+                    for _ in range(batch_size)
+                ]
+            )
+
+        seq_lens = torch.ones(batch_size, dtype=torch.int)
+
+        # --- Reference run (eager, no CUDA graph) ---
+        ref_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens
+            ),
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        ref_metadata.prepare()
+
+        ref_results = []
+        for i in range(num_layers):
+            q = torch.cat(gen_qs[i])
+            k = torch.cat(gen_ks[i])
+            v = torch.cat(gen_vs[i])
+            ref_results.append(layers[i].forward(q, k, v, ref_metadata))
+
+        # --- CUDA graph run ---
+        workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        cg_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens
+            ),
+            workspace_buffer=workspace,
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        cg_metadata.prepare()
+
+        # Warmup runs (required before CUDA graph capture)
+        for _ in range(2):
+            for i in range(num_layers):
+                q = torch.cat(gen_qs[i])
+                k = torch.cat(gen_ks[i])
+                v = torch.cat(gen_vs[i])
+                layers[i].forward(q, k, v, cg_metadata)
+
+        # Capture
+        cg_results = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(num_layers):
+                q = torch.cat(gen_qs[i])
+                k = torch.cat(gen_ks[i])
+                v = torch.cat(gen_vs[i])
+                cg_results.append(layers[i].forward(q, k, v, cg_metadata))
+
+        # Replay
+        graph.replay()
+
+        # Compare each layer's output
+        for i in range(num_layers):
+            torch.testing.assert_close(
+                cg_results[i],
+                ref_results[i],
+                atol=1e-2,
+                rtol=0,
+                msg=(
+                    f"Layer {i} ({layer_types[i]}, "
+                    f"hd={layers_info[i]['head_dim']}): "
+                    f"CUDA graph output doesn't match reference"
+                ),
+            )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_multi_step_decode(self):
+        """CUDA graph multi-step decode with hybrid head_dim.
+
+        Simulates the actual model_engine flow: prepare() + graph.replay()
+        for MULTIPLE sequential decode steps.  Each step increments
+        num_cached_tokens.  This catches issues that only appear after
+        several decode iterations (e.g., stale plan data, growing kv_lens,
+        VSWA swap with changing page counts).
+        """
+        from tensorrt_llm._torch.attention_backend import (
+            FlashInferAttention,
+            FlashInferAttentionMetadata,
+        )
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        batch_size = 2
+        num_decode_steps = 10
+        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=4, batch_size=batch_size)
+
+        request_ids = list(range(batch_size))
+        initial_cached = [30, 45]
+        token_nums = [t + 1 for t in initial_cached]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        # Fill KV cache
+        for i in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(i)
+            if buf is not None:
+                torch.nn.init.normal_(buf)
+
+        layer_types = config.layer_types
+        num_layers = config.num_hidden_layers
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+
+        layers_info = []
+        for layer_idx in range(num_layers):
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            hd = (
+                config.head_dim
+                if is_sliding
+                else getattr(config, "global_head_dim", config.head_dim)
+            )
+            layers_info.append(
+                {
+                    "layer_idx": layer_idx,
+                    "head_dim": hd,
+                    "num_kv_heads": config.num_key_value_heads,
+                    "num_heads": config.num_attention_heads,
+                }
+            )
+
+        layers = []
+        for info in layers_info:
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=info["layer_idx"],
+                    num_heads=info["num_heads"],
+                    head_dim=info["head_dim"],
+                    num_kv_heads=info["num_kv_heads"],
+                )
+            )
+
+        seq_lens = torch.ones(batch_size, dtype=torch.int)
+
+        # --- CUDA graph setup ---
+        workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        cg_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
+            workspace_buffer=workspace,
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        cg_metadata.prepare()
+
+        # Generate per-layer Q/K/V (reused across steps, like real static buffers)
+        gen_qs, gen_ks, gen_vs = [], [], []
+        for info in layers_info:
+            gen_qs.append(
+                torch.randn(
+                    batch_size, info["num_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_ks.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_vs.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+
+        # Warmup
+        for _ in range(2):
+            for i in range(num_layers):
+                layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata)
+
+        # Capture
+        cg_outputs = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(num_layers):
+                cg_outputs.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
+
+        # --- Multi-step decode: prepare() + replay() ---
+        for step in range(num_decode_steps):
+            # Simulate growing cached tokens (like real generation)
+            cached = [c + step for c in initial_cached]
+            cg_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=cached
+            )
+            cg_metadata.seq_lens = seq_lens
+            cg_metadata.num_contexts = 0
+            cg_metadata.request_ids = request_ids
+            cg_metadata.prepare()
+
+            graph.replay()
+            torch.cuda.synchronize()
+
+            # Verify outputs are not NaN/Inf
+            for i in range(num_layers):
+                out = cg_outputs[i]
+                self.assertFalse(
+                    torch.isnan(out).any(), f"Step {step}, Layer {i}: NaN in CUDA graph output"
+                )
+                self.assertFalse(
+                    torch.isinf(out).any(), f"Step {step}, Layer {i}: Inf in CUDA graph output"
+                )
+
+            # --- Reference (eager) for comparison ---
+            ref_metadata = FlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+            ref_metadata.prepare()
+
+            for i in range(num_layers):
+                ref_out = layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata)
+                torch.testing.assert_close(
+                    cg_outputs[i],
+                    ref_out,
+                    atol=1e-2,
+                    rtol=0,
+                    msg=(
+                        f"Step {step}, Layer {i} "
+                        f"({layer_types[i]}, "
+                        f"hd={layers_info[i]['head_dim']}): "
+                        f"CUDA graph diverges from eager"
+                    ),
+                )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_high_gqa(self):
+        """CUDA graph decode with GQA=8 and real head_dim (E2B-like).
+
+        Uses E2B real-dims config (hd=256/512, GQA=8) with multi-step
+        decode to verify _block_tables update works for high-GQA models.
+        """
+        from tensorrt_llm._torch.attention_backend import (
+            FlashInferAttention,
+            FlashInferAttentionMetadata,
+        )
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        batch_size = 2
+        num_decode_steps = 5
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=16, tokens_per_block=32, batch_size=batch_size
+        )
+
+        self.assertTrue(kv_cache_manager.is_vswa, "Expected VSWA manager")
+
+        request_ids = list(range(batch_size))
+        initial_cached = [30, 45]
+        token_nums = [t + 1 for t in initial_cached]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        for i in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(i)
+            if buf is not None:
+                torch.nn.init.normal_(buf)
+
+        layer_types = config.layer_types
+        num_layers = config.num_hidden_layers
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+
+        layers_info = []
+        for layer_idx in range(num_layers):
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            hd = (
+                config.head_dim
+                if is_sliding
+                else getattr(config, "global_head_dim", config.head_dim)
+            )
+            layers_info.append(
+                {
+                    "layer_idx": layer_idx,
+                    "head_dim": hd,
+                    "num_kv_heads": config.num_key_value_heads,
+                    "num_heads": config.num_attention_heads,
+                }
+            )
+
+        layers = []
+        for info in layers_info:
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=info["layer_idx"],
+                    num_heads=info["num_heads"],
+                    head_dim=info["head_dim"],
+                    num_kv_heads=info["num_kv_heads"],
+                    flashinfer_backend="trtllm-gen",
+                )
+            )
+
+        seq_lens = torch.ones(batch_size, dtype=torch.int)
+        gen_qs, gen_ks, gen_vs = [], [], []
+        for info in layers_info:
+            gen_qs.append(
+                torch.randn(
+                    batch_size, info["num_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_ks.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_vs.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+
+        # --- CUDA graph setup ---
+        workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        cg_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
+            workspace_buffer=workspace,
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        cg_metadata.prepare()
+
+        # Warmup
+        for _ in range(2):
+            for i in range(num_layers):
+                layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata)
+
+        # Capture
+        cg_outputs = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(num_layers):
+                cg_outputs.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
+
+        # Multi-step decode: prepare() + replay()
+        for step in range(num_decode_steps):
+            cached = [c + step for c in initial_cached]
+            cg_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=cached
+            )
+            cg_metadata.seq_lens = seq_lens
+            cg_metadata.num_contexts = 0
+            cg_metadata.request_ids = request_ids
+            cg_metadata.prepare()
+
+            graph.replay()
+            torch.cuda.synchronize()
+
+            # Verify no NaN/Inf
+            for i in range(num_layers):
+                out = cg_outputs[i]
+                self.assertFalse(torch.isnan(out).any(), f"Step {step}, Layer {i}: NaN in output")
+                self.assertFalse(torch.isinf(out).any(), f"Step {step}, Layer {i}: Inf in output")
+
+            # Compare with eager reference
+            ref_metadata = FlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+            ref_metadata.prepare()
+
+            for i in range(num_layers):
+                ref_out = layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata)
+                torch.testing.assert_close(
+                    cg_outputs[i],
+                    ref_out,
+                    atol=1e-2,
+                    rtol=0,
+                    msg=(
+                        f"Step {step}, Layer {i} "
+                        f"({layer_types[i]}, "
+                        f"hd={layers_info[i]['head_dim']}): "
+                        f"CUDA graph diverges from eager (GQA>=4)"
+                    ),
+                )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def _run_cuda_graph_real_headdim(self, config_dict, label=""):
+        """Helper: CUDA graph decode test with real head_dim configs."""
+        from tensorrt_llm._torch.attention_backend import (
+            FlashInferAttention,
+            FlashInferAttentionMetadata,
+        )
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config = Gemma4TextConfig(**config_dict)
+        batch_size = 2
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=16, tokens_per_block=32, batch_size=batch_size
+        )
+
+        self.assertTrue(kv_cache_manager.is_vswa, f"{label}: Expected VSWA manager")
+
+        request_ids = list(range(batch_size))
+        initial_cached = [30, 45]
+        token_nums = [t + 1 for t in initial_cached]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        for i in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(i)
+            if buf is not None:
+                torch.nn.init.normal_(buf)
+
+        layer_types = config.layer_types
+        num_layers = config.num_hidden_layers
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
+
+        layers_info = []
+        for layer_idx in range(num_layers):
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            hd = (
+                config.head_dim
+                if is_sliding
+                else getattr(config, "global_head_dim", config.head_dim)
+            )
+            # Match Gemma4Attention K=V logic for kv_heads
+            use_k_eq_v = attention_k_eq_v and not is_sliding
+            if is_sliding:
+                kv_h = config.num_key_value_heads
+            elif use_k_eq_v:
+                kv_h = (
+                    getattr(config, "num_global_key_value_heads", None)
+                    or config.num_key_value_heads
+                )
+            else:
+                kv_h = config.num_key_value_heads
+            layers_info.append(
+                {
+                    "layer_idx": layer_idx,
+                    "head_dim": hd,
+                    "num_kv_heads": kv_h,
+                    "num_heads": config.num_attention_heads,
+                }
+            )
+
+        layers = []
+        for info in layers_info:
+            kwargs = {}
+            # head_dim>256 needs trtllm-gen (fa2 JIT doesn't support it)
+            if info["head_dim"] > 256:
+                kwargs["flashinfer_backend"] = "trtllm-gen"
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=info["layer_idx"],
+                    num_heads=info["num_heads"],
+                    head_dim=info["head_dim"],
+                    num_kv_heads=info["num_kv_heads"],
+                    **kwargs,
+                )
+            )
+
+        seq_lens = torch.ones(batch_size, dtype=torch.int)
+        gen_qs, gen_ks, gen_vs = [], [], []
+        for info in layers_info:
+            gen_qs.append(
+                torch.randn(
+                    batch_size, info["num_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_ks.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+            gen_vs.append(
+                torch.randn(
+                    batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+                )
+            )
+
+        # --- Reference (eager) ---
+        ref_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        ref_metadata.prepare()
+        ref_results = []
+        for i in range(num_layers):
+            ref_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata))
+
+        # --- CUDA graph ---
+        workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        cg_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
+            workspace_buffer=workspace,
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        cg_metadata.prepare()
+
+        for _ in range(2):
+            for i in range(num_layers):
+                layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata)
+
+        cg_results = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(num_layers):
+                cg_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
+        graph.replay()
+
+        for i in range(num_layers):
+            torch.testing.assert_close(
+                cg_results[i],
+                ref_results[i],
+                atol=1e-2,
+                rtol=0,
+                msg=(
+                    f"{label} Layer {i} ({layer_types[i]}, "
+                    f"hd={layers_info[i]['head_dim']}, "
+                    f"kv={layers_info[i]['num_kv_heads']}): "
+                    f"CUDA graph diverges from eager"
+                ),
+            )
+
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_real_headdim(self):
+        """E2B-like: GQA=8, hd=256/512, non-K=V."""
+        self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG), "E2B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_31b_like(self):
+        """31B-like: mixed GQA (2 sliding, 8 full K=V), hd=256/512."""
+        self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG), "31B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_26b_like(self):
+        """26B-like: GQA=2, K=V, hd=256/512."""
+        self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_multi_step_trtllm_gen(self):
+        """Multi-step CG decode with trtllm-gen (hd=256/512).
+
+        Verifies _block_tables update in prepare() works correctly
+        across multiple graph replays with changing kv_lens.  Uses
+        31B-like config with trtllm-gen for all layers.
+        """
+        from tensorrt_llm._torch.attention_backend import (
+            FlashInferAttention,
+            FlashInferAttentionMetadata,
+        )
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        batch_size = 2
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=16, tokens_per_block=32, batch_size=batch_size
+        )
+
+        request_ids = list(range(batch_size))
+        initial_cached = [30, 45]
+        token_nums = [t + 1 for t in initial_cached]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        for i in range(config.num_hidden_layers):
+            buf = kv_cache_manager.get_buffers(i)
+            if buf is not None:
+                torch.nn.init.normal_(buf)
+
+        layer_types = config.layer_types
+        num_layers = config.num_hidden_layers
+        dtype = config.torch_dtype
+        device = torch.device("cuda")
+        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
+
+        layers_info = []
+        for layer_idx in range(num_layers):
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            hd = (
+                config.head_dim
+                if is_sliding
+                else getattr(config, "global_head_dim", config.head_dim)
+            )
+            use_k_eq_v = attention_k_eq_v and not is_sliding
+            if is_sliding:
+                kv_h = config.num_key_value_heads
+            elif use_k_eq_v:
+                kv_h = (
+                    getattr(config, "num_global_key_value_heads", None)
+                    or config.num_key_value_heads
+                )
+            else:
+                kv_h = config.num_key_value_heads
+            layers_info.append(
+                {
+                    "layer_idx": layer_idx,
+                    "head_dim": hd,
+                    "num_kv_heads": kv_h,
+                    "num_heads": config.num_attention_heads,
+                }
+            )
+
+        layers = []
+        for info in layers_info:
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=info["layer_idx"],
+                    num_heads=info["num_heads"],
+                    head_dim=info["head_dim"],
+                    num_kv_heads=info["num_kv_heads"],
+                    flashinfer_backend="trtllm-gen",
+                )
+            )
+
+        seq_lens = torch.ones(batch_size, dtype=torch.int)
+        gen_qs = [
+            torch.randn(
+                batch_size, info["num_heads"] * info["head_dim"], dtype=dtype, device=device
+            )
+            for info in layers_info
+        ]
+        gen_ks = [
+            torch.randn(
+                batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+            )
+            for info in layers_info
+        ]
+        gen_vs = [
+            torch.randn(
+                batch_size, info["num_kv_heads"] * info["head_dim"], dtype=dtype, device=device
+            )
+            for info in layers_info
+        ]
+
+        workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        cg_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
+            workspace_buffer=workspace,
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        cg_metadata.prepare()
+
+        for _ in range(2):
+            for i in range(num_layers):
+                layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata)
+
+        cg_outputs = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(num_layers):
+                cg_outputs.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
+
+        # Multi-step replay with fixed kv_lens
+        for step in range(5):
+            cg_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=initial_cached
+            )
+            cg_metadata.seq_lens = seq_lens
+            cg_metadata.num_contexts = 0
+            cg_metadata.request_ids = request_ids
+            cg_metadata.prepare()
+            graph.replay()
+            torch.cuda.synchronize()
+
+            for i in range(num_layers):
+                self.assertFalse(
+                    torch.isnan(cg_outputs[i]).any(), f"Step {step}, Layer {i}: NaN in output"
+                )
+
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":
