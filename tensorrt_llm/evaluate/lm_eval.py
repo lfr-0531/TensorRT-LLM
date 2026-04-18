@@ -60,13 +60,19 @@ class LmEvalWrapper(TemplateLM):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 sampling_override: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
+        # When True, CLI-provided sampling params (temperature/top_k/top_p/seed)
+        # take precedence over task yaml gen_kwargs.  Needed to match the
+        # sampling recipe published by a model card (e.g., Gemma4 26B:
+        # temperature=1.0, top_p=0.95, top_k=64).
+        self.sampling_override = sampling_override
 
     @property
     def eot_token_id(self) -> int:
@@ -128,9 +134,14 @@ class LmEvalWrapper(TemplateLM):
         else:
             sampling_params = copy.deepcopy(self.sampling_params)
 
+        # If sampling_override is set, CLI-provided temperature / top_k / top_p
+        # win over gen_kwargs.  We still respect gen_kwargs' ``until`` stop
+        # tokens and ``max_gen_toks`` (harness computes them from task config).
+        override_keys = {"temperature", "top_p"
+                         } if self.sampling_override else set()
         for lm_eval_key, trtllm_key in params_mapping.items():
             value = gen_kwargs.pop(lm_eval_key, None)
-            if value is not None:
+            if value is not None and lm_eval_key not in override_keys:
                 setattr(sampling_params, trtllm_key, value)
         return sampling_params
 
@@ -181,7 +192,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 sampling_override: bool = False):
         """
         Initialize the multimodal wrapper.
 
@@ -192,8 +204,13 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             max_images: Maximum number of images per prompt (currently unlimited in TRT-LLM), set to 999 from lm_eval's default value.
             chat_template_kwargs: Chat template kwargs as JSON string
             output_dir: Directory to save the task infos.
+            sampling_override: If True, sampling_params override task gen_kwargs.
         """
-        super().__init__(llm, sampling_params, streaming, output_dir=output_dir)
+        super().__init__(llm,
+                         sampling_params,
+                         streaming,
+                         output_dir=output_dir,
+                         sampling_override=sampling_override)
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
@@ -478,8 +495,12 @@ class LmEvalEvaluator(Evaluator):
         path = Path(self.output_path)
         path.mkdir(parents=True, exist_ok=True)
         result_path = (path / f"samples_{self.task_name}.json")
+        # lm-eval's filter_list embeds live function objects in the config
+        # payload, so a vanilla json.dump raises TypeError.  Fall back to
+        # repr() for anything that isn't directly serializable instead of
+        # losing the per-sample outputs users want to inspect.
         with open(result_path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, default=repr)
         logger.info(f"Results saved to {result_path}")
 
     def evaluate(self,
@@ -488,7 +509,8 @@ class LmEvalEvaluator(Evaluator):
                  streaming: bool = False,
                  scores_filter: str = None,
                  model_type: str = None,
-                 is_force_single_image: bool = False) -> float:
+                 is_force_single_image: bool = False,
+                 sampling_override: bool = False) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
 
@@ -499,7 +521,8 @@ class LmEvalEvaluator(Evaluator):
                       chat_template_kwargs=self.chat_template_kwargs,
                       model_type=model_type,
                       is_force_single_image=is_force_single_image,
-                      output_dir=self.output_dir),
+                      output_dir=self.output_dir,
+                      sampling_override=sampling_override),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -550,11 +573,33 @@ class LmEvalEvaluator(Evaluator):
                         log_samples=kwargs.pop("log_samples", False),
                         output_path=kwargs.pop("output_path", None),
                         output_dir=kwargs.pop("output_dir", None))
+        # Optional sampling overrides (default: greedy, as before).
+        # When any of temperature / top_p / top_k / seed is set, the wrapper
+        # uses CLI values in preference to the task yaml's gen_kwargs so
+        # model-card sampling recipes can be faithfully reproduced.
+        temperature = kwargs.pop("temperature", None)
+        top_p = kwargs.pop("top_p", None)
+        top_k = kwargs.pop("top_k", None)
+        seed = kwargs.pop("sampling_seed", None)
+        sampling_override = any(x is not None
+                                for x in (temperature, top_p, top_k, seed))
+        sp_kwargs = {}
+        if temperature is not None:
+            sp_kwargs["temperature"] = float(temperature)
+        if top_p is not None:
+            sp_kwargs["top_p"] = float(top_p)
+        if top_k is not None:
+            sp_kwargs["top_k"] = int(top_k)
+        if seed is not None:
+            sp_kwargs["seed"] = int(seed)
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"),
-            stop=kwargs.pop("stop", None))
-        evaluator.evaluate(llm, sampling_params)
+            stop=kwargs.pop("stop", None),
+            **sp_kwargs)
+        evaluator.evaluate(llm,
+                           sampling_params,
+                           sampling_override=sampling_override)
         llm.shutdown()
 
 
@@ -606,6 +651,23 @@ class GSM8K(LmEvalEvaluator):
                   type=int,
                   default=256,
                   help="Maximum generation length.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling.")
     @click.option("--log_samples",
                   is_flag=True,
                   default=False,
@@ -684,6 +746,24 @@ class GPQADiamond(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling "
+                  "(per-request; does not affect dataset order).")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
