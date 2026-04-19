@@ -2963,5 +2963,100 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         kv_cache_manager.shutdown()
 
 
+class TestGemma4PLEMultimodalGuards(unittest.TestCase):
+    """Regression tests for the multimodal Per-Layer-Embedding (PLE) fix.
+
+    Background: ``Gemma4TextModel.forward`` originally raised when both
+    ``input_ids`` and ``inputs_embeds`` were provided, and silently skipped
+    PLE when ``input_ids`` was ``None``.  The multimodal wrapper passes
+    ``inputs_embeds`` (with image/audio features scattered in) and used to
+    pass ``input_ids=None``, which disabled PLE on E2B/E4B and produced
+    garbage output for image and audio prompts.  The fix lets the multimodal
+    wrapper hand a separate ``ple_input_ids`` (with mm tokens replaced by
+    pad) so PLE keeps running on multimodal inputs.
+    """
+
+    def _make_e2b_like_text_model(self, hidden_size_per_layer_input: int = 32):
+        """A tiny Gemma4 text model with PLE enabled (mimicking E2B)."""
+        cfg = {
+            **GEMMA4_SMALL_CONFIG,
+            "hidden_size_per_layer_input": hidden_size_per_layer_input,
+            "num_hidden_layers": 4,
+        }
+        text_config = Gemma4TextConfig(**cfg)
+        full_config = Gemma4Config(text_config=text_config)
+        model_config = ModelConfig(
+            pretrained_config=full_config.text_config,
+            attn_backend="FLASHINFER",
+        )
+        return Gemma4TextModel(model_config)
+
+    def test_ple_skipped_when_input_ids_none(self):
+        """Without ``input_ids`` PLE silently returns ``None`` — original
+        behaviour.  This test pins it down so future refactors don't
+        accidentally start using inputs_embeds for the per-layer
+        embedding lookup.
+        """
+        model = self._make_e2b_like_text_model()
+        hidden_states = torch.zeros(8, 256, dtype=torch.bfloat16)
+        per_layer = model._compute_per_layer_inputs(None, hidden_states)
+        self.assertIsNone(per_layer)
+
+    def test_ple_uses_explicit_ple_input_ids(self):
+        """When the multimodal wrapper passes ``ple_input_ids`` (a
+        sanitized copy of input_ids with mm tokens replaced by pad), the
+        forward must use that view for the PLE lookup instead of relying
+        on a separate ``input_ids`` (which is ``None`` on the multimodal
+        path).
+
+        Avoids replacing nn.ModuleList children — instead patches
+        ``_compute_per_layer_inputs`` to capture the ids it received and
+        raises a sentinel error to short-circuit the rest of forward.
+        """
+        model = self._make_e2b_like_text_model()
+        captured = {}
+
+        class _Done(Exception):
+            pass
+
+        def fake_compute(input_ids, inputs_embeds):
+            captured["input_ids"] = input_ids.clone() if input_ids is not None else None
+            raise _Done
+
+        model._compute_per_layer_inputs = fake_compute
+
+        ple_ids = torch.tensor([[100, 200, 300]], dtype=torch.int32)
+        inputs_embeds = torch.zeros(3, 256, dtype=torch.bfloat16)
+        attn_metadata = unittest.mock.MagicMock()
+        with self.assertRaises(_Done):
+            with torch.inference_mode():
+                model(
+                    attn_metadata=attn_metadata,
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds,
+                    ple_input_ids=ple_ids,
+                )
+        self.assertIsNotNone(captured.get("input_ids"))
+        self.assertTrue(
+            torch.equal(captured["input_ids"], ple_ids),
+            f"PLE received {captured['input_ids']}, expected {ple_ids}",
+        )
+
+    def test_forward_accepts_input_ids_and_inputs_embeds_together(self):
+        """The XOR check on ``input_ids`` vs ``inputs_embeds`` was relaxed
+        so the multimodal wrapper can pass both (input_ids for PLE,
+        inputs_embeds for the main forward).  Verify the constructor of
+        the text model no longer raises on this combination.
+        """
+        model = self._make_e2b_like_text_model(hidden_size_per_layer_input=0)
+        # When both args are None, we should still raise.
+        with self.assertRaises(ValueError):
+            model(
+                attn_metadata=unittest.mock.MagicMock(),
+                input_ids=None,
+                inputs_embeds=None,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

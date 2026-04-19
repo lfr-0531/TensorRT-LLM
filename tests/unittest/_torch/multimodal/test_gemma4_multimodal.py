@@ -403,6 +403,76 @@ class TestGemma4InputProcessor(unittest.TestCase):
         with self.assertRaises(KeyError):
             proc(inputs, sp)
 
+    def test_video_processing_returns_pixel_values(self):
+        """Video input bypasses HF Gemma4Processor and yields per-frame
+        pixel_values + expanded video soft tokens in input_ids.
+
+        Regression for the ``merged_typed_dict.__init__() got an unexpected
+        keyword argument 'video_sizes'`` failure where calling
+        ``Gemma4Processor`` with ``videos=`` triggers strict-typed-dict
+        validation in transformers 5.5.x.  Our input processor sidesteps
+        this by calling the underlying ``video_processor`` directly and
+        expanding the placeholder manually.
+        """
+        import numpy as np
+        from PIL import Image
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        if not hasattr(proc._processor, "video_processor"):
+            self.skipTest("Processor has no video_processor")
+
+        # 32 dummy 224x224 frames (matches Gemma4VideoProcessor.num_frames).
+        frames = [
+            Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+            for _ in range(32)
+        ]
+        # Dataclass-like wrapper to exercise the ``getattr(v, 'frames', ...)``
+        # path used by the TRT-LLM video loader.
+        VideoData = type("VideoData", (), {})
+        vd = VideoData()
+        vd.frames = frames
+
+        prompt = proc._processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video"},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"video": [vd]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsNotNone(mm_data)
+        self.assertIn("video", mm_data["multimodal_data"])
+        video_data = mm_data["multimodal_data"]["video"]
+        self.assertIn("pixel_values", video_data)
+        # Per-frame pixel_values: (num_frames, num_patches, channels)
+        self.assertEqual(video_data["pixel_values"].dim(), 3)
+        self.assertEqual(video_data["pixel_values"].shape[0], 32)
+
+        # The video_token id should appear in the expanded input_ids.
+        video_token_id = self._video_token_id()
+        if video_token_id is not None:
+            self.assertGreater(
+                sum(1 for t in input_ids if t == video_token_id),
+                0,
+                "Expected video soft tokens in expanded input_ids",
+            )
+
+    def _video_token_id(self):
+        return getattr(self.config, "video_token_id", None)
+
 
 class TestGemma4MultimodalEmbedder(unittest.TestCase):
     """Test the multimodal embedder projection layer."""

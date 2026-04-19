@@ -788,21 +788,27 @@ class Gemma4TextModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         local_attention_mask_data: Optional[torch.Tensor] = None,
         global_attention_mask_data: Optional[torch.Tensor] = None,
+        ple_input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the "
-                "same time, and must specify either one"
-            )
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds.to(self.dtype)
 
-        # Compute PLE inputs
-        per_layer_inputs = self._compute_per_layer_inputs(input_ids, hidden_states)
+        # Compute PLE inputs.  When both input_ids and inputs_embeds are
+        # provided (multimodal path, where inputs_embeds has audio/image
+        # features scattered in), use a PLE-safe ``ple_input_ids`` with the
+        # multimodal token IDs replaced by pad_token_id so the per-layer
+        # embedding table is not consulted at multimodal positions.  This
+        # matches the HF Gemma4Model behaviour and is required for E2B/E4B
+        # (which rely on PLE) to produce coherent output for multimodal
+        # requests.
+        ple_ids = ple_input_ids if ple_input_ids is not None else input_ids
+        per_layer_inputs = self._compute_per_layer_inputs(ple_ids, hidden_states)
 
         for i, decoder_layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
@@ -966,6 +972,7 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
+            ple_input_ids=kwargs.pop("ple_input_ids", None),
             **kwargs,
         )
 
