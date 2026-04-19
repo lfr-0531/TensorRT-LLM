@@ -287,6 +287,122 @@ class TestGemma4InputProcessor(unittest.TestCase):
         self.assertEqual(proc.model_path, MODEL_26B_PATH)
         self.assertIsNotNone(proc.processor)
 
+    def test_audio_processing(self):
+        """Audio input returns input_ids + audio_features in multimodal data."""
+        import numpy as np
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        # Synthetic 1-second mono audio at 16 kHz.
+        audio = np.random.randn(16000).astype(np.float32)
+
+        prompt = proc._processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio"},
+                        {"type": "text", "text": "Transcribe the audio."},
+                    ],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"audio": [audio]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, mm_data = proc(inputs, sp)
+
+        self.assertIsInstance(input_ids, list)
+        self.assertIsNotNone(mm_data)
+        self.assertIn("multimodal_data", mm_data)
+        self.assertIn("audio", mm_data["multimodal_data"])
+        audio_data = mm_data["multimodal_data"]["audio"]
+        self.assertIn("audio_features", audio_data)
+        # (batch, frames, mel_bins)
+        self.assertEqual(audio_data["audio_features"].dim(), 3)
+
+    def test_audio_token_expansion(self):
+        """Audio placeholder expands to audio soft-token positions."""
+        import numpy as np
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        audio_token_id = getattr(self.config, "audio_token_id", None)
+        if audio_token_id is None:
+            self.skipTest("Model config has no audio_token_id")
+
+        proc = self._make_processor()
+        audio = np.random.randn(16000).astype(np.float32)
+
+        prompt = proc._processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio"},
+                        {"type": "text", "text": "Transcribe the audio."},
+                    ],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"audio": [audio]},
+        }
+        sp = SamplingParams(max_tokens=10)
+        input_ids, _ = proc(inputs, sp)
+
+        audio_count = sum(1 for t in input_ids if t == audio_token_id)
+        self.assertGreater(audio_count, 0, "Expected audio soft tokens in expanded input_ids")
+
+    def test_audio_input_normalization(self):
+        """_normalize_audio_inputs downmixes stereo and resamples."""
+        import numpy as np
+
+        from tensorrt_llm._torch.models.modeling_gemma4mm import _normalize_audio_inputs
+
+        # Stereo input at 48 kHz -> mono at 16 kHz.
+        sr_src = 48000
+        dur_sec = 0.5
+        stereo = np.random.randn(int(sr_src * dur_sec), 2).astype(np.float32)
+        normalized = _normalize_audio_inputs([(stereo, sr_src)], target_sr=16000)
+        self.assertEqual(len(normalized), 1)
+        arr = normalized[0]
+        self.assertEqual(arr.ndim, 1)
+        self.assertEqual(arr.dtype, np.float32)
+        # 0.5 sec @ 16 kHz ≈ 8000 samples (resample_poly may differ by 1).
+        self.assertAlmostEqual(arr.size, 8000, delta=4)
+
+    def test_audio_input_torch_tensor(self):
+        """_normalize_audio_inputs accepts torch tensors."""
+        import numpy as np
+
+        from tensorrt_llm._torch.models.modeling_gemma4mm import _normalize_audio_inputs
+
+        tensor = torch.randn(8000)
+        normalized = _normalize_audio_inputs([tensor], target_sr=16000)
+        self.assertEqual(normalized[0].dtype, np.float32)
+        self.assertEqual(normalized[0].ndim, 1)
+        self.assertEqual(normalized[0].size, 8000)
+
+    def test_unknown_mm_modality_rejected(self):
+        """Passing an unknown modality key raises KeyError."""
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        inputs = {
+            "prompt": "<|placeholder|>",
+            "multi_modal_data": {"point_cloud": object()},
+        }
+        sp = SamplingParams(max_tokens=10)
+        with self.assertRaises(KeyError):
+            proc(inputs, sp)
+
 
 class TestGemma4MultimodalEmbedder(unittest.TestCase):
     """Test the multimodal embedder projection layer."""

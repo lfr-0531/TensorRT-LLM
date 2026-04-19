@@ -894,6 +894,150 @@ class GPQAExtended(LmEvalEvaluator):
         GPQAExtended.command_harness(ctx, **kwargs)
 
 
+class MMMUPro(LmEvalEvaluator):
+    """MMMU Pro benchmark — 10-option multimodal multiple-choice QA.
+
+    MMMU Pro (https://huggingface.co/datasets/MMMU/MMMU_Pro) is a harder
+    sibling of MMMU with an expanded option set and a broader mix of
+    subjects.  Gemma4's HF blog reports MMMU Pro numbers, so we expose it
+    here as a first-class trtllm-eval task backed by a custom lm-eval
+    task yaml under ``tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro``.
+    """
+
+    def __init__(self, subset: str = "standard_10", **kwargs):
+        task_name = {
+            "standard_10": "mmmu_pro_standard_10",
+            "standard_4": "mmmu_pro_standard_4",
+        }.get(subset, subset)
+        super().__init__(task_name, **kwargs)
+
+    @click.command("mmmu_pro")
+    @click.option("--subset",
+                  type=click.Choice(["standard_10", "standard_4"]),
+                  default="standard_10",
+                  help=("MMMU Pro subset to evaluate. "
+                        "'standard_10' is the 10-option multiple-choice set "
+                        "reported on the Gemma4 model card (default); "
+                        "'standard_4' is the easier 4-option variant."))
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to MMMU Pro dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+    @click.option(
+        "--system_prompt",
+        type=str,
+        default=None,
+        help=
+        "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
+    )
+    @click.option("--max_input_length",
+                  type=int,
+                  default=8192,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=512,
+                  help="Maximum generation length.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        kwargs["is_multimodal"] = True
+        kwargs["apply_chat_template"] = True
+        kwargs["stop"] = "<|endoftext|>"
+        MMMUPro.command_harness(ctx, **kwargs)
+
+    @classmethod
+    def command_harness(cls, ctx, **kwargs):
+        llm = ctx.obj
+        subset = kwargs.pop("subset", "standard_10")
+
+        evaluator = cls(subset=subset,
+                        dataset_path=kwargs.pop("dataset_path", None),
+                        num_samples=kwargs.pop("num_samples", None),
+                        random_seed=kwargs.pop("random_seed", 0),
+                        apply_chat_template=kwargs.pop("apply_chat_template",
+                                                       False),
+                        system_prompt=kwargs.pop("system_prompt", None),
+                        is_multimodal=kwargs.pop("is_multimodal", False),
+                        chat_template_kwargs=kwargs.pop("chat_template_kwargs",
+                                                        None),
+                        log_samples=kwargs.pop("log_samples", False),
+                        output_path=kwargs.pop("output_path", None),
+                        output_dir=kwargs.pop("output_dir", None))
+
+        temperature = kwargs.pop("temperature", None)
+        top_p = kwargs.pop("top_p", None)
+        top_k = kwargs.pop("top_k", None)
+        seed = kwargs.pop("sampling_seed", None)
+        sampling_override = any(x is not None
+                                for x in (temperature, top_p, top_k, seed))
+        sp_kwargs = {}
+        if temperature is not None:
+            sp_kwargs["temperature"] = float(temperature)
+        if top_p is not None:
+            sp_kwargs["top_p"] = float(top_p)
+        if top_k is not None:
+            sp_kwargs["top_k"] = int(top_k)
+        if seed is not None:
+            sp_kwargs["seed"] = int(seed)
+        sampling_params = SamplingParams(
+            max_tokens=kwargs.pop("max_output_length"),
+            truncate_prompt_tokens=kwargs.pop("max_input_length"),
+            stop=kwargs.pop("stop", None),
+            **sp_kwargs)
+        evaluator.evaluate(llm,
+                           sampling_params,
+                           sampling_override=sampling_override)
+        llm.shutdown()
+
+
 class MMMU(LmEvalEvaluator):
 
     def __init__(self, **kwargs):

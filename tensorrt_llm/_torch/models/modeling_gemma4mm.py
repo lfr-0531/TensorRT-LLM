@@ -114,6 +114,61 @@ class Gemma4MultimodalEmbedder(nn.Module):
         return self.embedding_projection(normed)
 
 
+def _normalize_audio_inputs(audios, target_sr: int = 16000):
+    """Normalize multimodal audio payloads for the Gemma4 feature extractor.
+
+    The TRT-LLM multimodal input loader stores audio as ``(waveform, sr)``
+    tuples (from ``soundfile.read``); callers may also pass bare numpy or
+    torch arrays.  The Gemma4 feature extractor wants a list of 1-D numpy
+    float32 waveforms at its configured ``sampling_rate`` (16 kHz).
+
+    Steps applied per entry:
+    1. Strip the sampling-rate component of ``(array, sr)`` tuples.
+    2. Convert torch tensors to numpy.
+    3. Downmix multi-channel audio to mono by averaging channels.
+    4. Resample to ``target_sr`` if the source rate differs and is known.
+    """
+    import numpy as np
+
+    normalized = []
+    for a in audios:
+        src_sr = None
+        if isinstance(a, tuple) and len(a) == 2:
+            a, src_sr = a
+        if isinstance(a, torch.Tensor):
+            a = a.detach().cpu().numpy()
+        arr = np.asarray(a)
+        # Channels can appear as last or first axis depending on the loader.
+        if arr.ndim == 2:
+            # soundfile returns (samples, channels); librosa/torchaudio
+            # sometimes return (channels, samples).
+            if arr.shape[0] < arr.shape[1]:
+                arr = arr.T
+            arr = arr.mean(axis=1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(-1)
+        arr = arr.astype(np.float32, copy=False)
+        if src_sr is not None and src_sr != target_sr:
+            try:
+                import scipy.signal as sps
+
+                # Rational resample for simple ratios; fallback to polyphase
+                # resample_poly for arbitrary ratios.
+                gcd = np.gcd(int(src_sr), int(target_sr))
+                up = int(target_sr // gcd)
+                down = int(src_sr // gcd)
+                arr = sps.resample_poly(arr, up, down).astype(np.float32, copy=False)
+            except ImportError:
+                # Fallback: naive linear interp (accuracy is lower but the
+                # audio path is still functional).
+                target_len = int(arr.size * target_sr / src_sr)
+                arr = np.interp(
+                    np.linspace(0, arr.size - 1, target_len), np.arange(arr.size), arr
+                ).astype(np.float32)
+        normalized.append(arr)
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Input processor
 # ---------------------------------------------------------------------------
@@ -195,30 +250,57 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    @nvtx_range("[Vision] preprocess")
+    @nvtx_range("[MM] preprocess")
     def _preprocess(self, inputs):
         text_prompt = inputs.get("prompt")
         mm_data = inputs.get("multi_modal_data", {})
-        if mm_data and "image" not in mm_data:
-            raise KeyError("Expected image data in multimodal data for Gemma4.")
+        allowed_keys = {"image", "audio", "video"}
+        unknown = set(mm_data) - allowed_keys if mm_data else set()
+        if unknown:
+            raise KeyError(
+                f"Gemma4 multi_modal_data only supports {sorted(allowed_keys)}, "
+                f"got unknown keys {sorted(unknown)}."
+            )
 
         images = mm_data.get("image")
+        audios = mm_data.get("audio")
+        videos = mm_data.get("video")
         pixel_values = None
         image_position_ids = None
+        input_features = None
+        input_features_mask = None
 
-        if self._processor is not None and images is not None:
+        if self._processor is not None and (
+            images is not None or audios is not None or videos is not None
+        ):
             do_rescale = self._image_processor.do_rescale
-            if isinstance(images[0], torch.Tensor):
+            if images is not None and isinstance(images[0], torch.Tensor):
                 do_rescale = False
-            proc_out = self._processor(
-                text=text_prompt,
-                images=images,
-                do_rescale=do_rescale,
-                return_tensors="pt",
-            ).to(dtype=self.dtype)
+            proc_kwargs = dict(text=text_prompt, return_tensors="pt")
+            if images is not None:
+                proc_kwargs["images"] = images
+                proc_kwargs["do_rescale"] = do_rescale
+            if videos is not None:
+                # Pass videos through the processor; Gemma4Processor routes
+                # them via its video_processor which tokenizes each frame as
+                # an image patch.
+                proc_kwargs["videos"] = videos
+            if audios is not None:
+                # ``load_audio`` returns ``(array, sampling_rate)`` tuples; the
+                # Gemma4 processor's feature extractor only wants the raw 1-D
+                # waveform array, so strip the sampling rate and normalize the
+                # data to ``np.float32``.
+                norm_audios = _normalize_audio_inputs(
+                    audios,
+                    target_sr=getattr(self._processor.feature_extractor, "sampling_rate", 16000),
+                )
+                proc_kwargs["audio"] = norm_audios
+            proc_out = self._processor(**proc_kwargs).to(dtype=self.dtype)
             input_ids = proc_out["input_ids"]
             pixel_values = proc_out.get("pixel_values")
             image_position_ids = proc_out.get("image_position_ids")
+            input_features = proc_out.get("input_features")
+            input_features_mask = proc_out.get("input_features_mask")
         else:
             input_ids = self._tokenizer(
                 text_prompt,
@@ -230,8 +312,22 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                 if pixel_values is not None:
                     pixel_values = pixel_values.to(dtype=self.dtype)
                 image_position_ids = img_out.get("image_position_ids")
+            if (
+                audios is not None
+                and self._processor is not None
+                and hasattr(self._processor, "feature_extractor")
+            ):
+                norm_audios = _normalize_audio_inputs(
+                    audios,
+                    target_sr=getattr(self._processor.feature_extractor, "sampling_rate", 16000),
+                )
+                af = self._processor.feature_extractor(norm_audios, return_tensors="pt")
+                input_features = af.get("input_features")
+                input_features_mask = af.get("input_features_mask")
+                if input_features is not None:
+                    input_features = input_features.to(dtype=self.dtype)
 
-        return input_ids, pixel_values, image_position_ids
+        return (input_ids, pixel_values, image_position_ids, input_features, input_features_mask)
 
     @torch.inference_mode()
     def __call__(
@@ -239,15 +335,21 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         inputs: TextPrompt,
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        input_ids, pixel_values, image_position_ids = self._preprocess(inputs)
-        multimodal_data = None
+        (input_ids, pixel_values, image_position_ids, input_features, input_features_mask) = (
+            self._preprocess(inputs)
+        )
+        mm_inner: Dict = {}
         if pixel_values is not None:
             image_data: Dict = {"pixel_values": pixel_values}
             if image_position_ids is not None:
                 image_data["image_position_ids"] = image_position_ids
-            multimodal_data = {
-                "multimodal_data": {"image": image_data},
-            }
+            mm_inner["image"] = image_data
+        if input_features is not None:
+            audio_data: Dict = {"audio_features": input_features}
+            if input_features_mask is not None:
+                audio_data["audio_features_mask"] = input_features_mask
+            mm_inner["audio"] = audio_data
+        multimodal_data = {"multimodal_data": mm_inner} if mm_inner else None
         return input_ids[0].to(torch.int32).tolist(), multimodal_data
 
 
@@ -261,7 +363,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     Gemma4InputProcessor,
     model_type="gemma4",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<|image|>"},
+        placeholder_map={
+            "image": "<|image|>",
+            "audio": "<|audio|>",
+            "video": "<|video|>",
+        },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.OPENAI,
     ),
@@ -481,13 +587,30 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def _get_audio_features(
         self,
         audio_features: torch.Tensor,
+        audio_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Process audio features through audio tower and embedder."""
+        """Process audio features through audio tower and embedder.
+
+        Returns a 2-D tensor of shape (total_audio_tokens, text_hidden) so
+        that it can be concatenated with image features before being fused
+        into the LLM input embeddings.
+        """
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-            output = self.audio_tower(audio_features)
-            hidden = output.last_hidden_state
-            projected = self.embed_audio(hidden.to(target_dtype))
+            if audio_features_mask is not None:
+                output = self.audio_tower(
+                    audio_features, attention_mask=audio_features_mask.to(audio_features.device)
+                )
+            else:
+                output = self.audio_tower(audio_features)
+            hidden = output.last_hidden_state  # (B, T, H_audio)
+            projected = self.embed_audio(hidden.to(target_dtype))  # (B, T, H_text)
+        # Optionally drop padding frames reported by the audio tower.
+        tower_mask = getattr(output, "attention_mask", None)
+        if tower_mask is not None and tower_mask.dtype == torch.bool:
+            projected = projected[tower_mask]
+        else:
+            projected = projected.reshape(-1, projected.shape[-1])
         return projected.contiguous()
 
     @torch.inference_mode()
@@ -507,6 +630,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         image_position_ids_list = []
         # --- Extract audio data ---
         audio_features_list = []
+        audio_features_mask_list = []
         for mp in multimodal_params:
             img_data = mp.multimodal_data.get("image", {})
             pv = img_data.get("pixel_values")
@@ -520,6 +644,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             af = aud_data.get("audio_features")
             if af is not None:
                 audio_features_list.append(af)
+                afm = aud_data.get("audio_features_mask")
+                if afm is not None:
+                    audio_features_mask_list.append(afm)
 
         mm_embeds = []
         all_mm_token_ids = []
@@ -543,7 +670,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # --- Process audio features ---
         if len(audio_features_list) > 0 and self.audio_tower is not None:
             audio_input = torch.cat(audio_features_list)
-            audio_embeds = self._get_audio_features(audio_input)
+            audio_mask = (
+                torch.cat(audio_features_mask_list)
+                if len(audio_features_mask_list) == len(audio_features_list)
+                else None
+            )
+            audio_embeds = self._get_audio_features(audio_input, audio_mask)
             mm_embeds.append(audio_embeds)
             if self.audio_token_ids is not None:
                 all_mm_token_ids.append(self.audio_token_ids)

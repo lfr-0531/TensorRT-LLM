@@ -827,7 +827,8 @@ def _resolve_content_format(model_type: str,
 
 def _build_openai_content(
         conv: ConversationMessage,
-        mm_placeholder_count: dict[str, int]) -> list[dict[str, Any]]:
+        mm_placeholder_count: dict[str, int],
+        model_type: Optional[str] = None) -> list[dict[str, Any]]:
     """Reconstruct OpenAI-style content list from a ConversationMessage.
 
     Uses `content_parts` (preserving media position) when available, otherwise falls back to placing
@@ -844,12 +845,16 @@ def _build_openai_content(
                 media_type = part.get("type", "image")
                 content_list.append({"type": media_type})
     else:
-        # Fallback: text first, then media placeholders
+        # Fallback: order placeholders relative to text according to the
+        # model's registered ``placeholder_placement``.  Some models (e.g.
+        # Gemma4) require media to appear BEFORE the text in the OpenAI
+        # content list so the chat template can insert the soft-token
+        # sequence in the correct position.  Default to BEFORE_TEXT if the
+        # registry has no preference.
         text = conv.get("content", "")
-        if text:
-            content_list.append({"type": "text", "text": text})
+        text_entry = {"type": "text", "text": text} if text else None
+        media_entries = []
         for placeholder, count in mm_placeholder_count.items():
-            # Infer modality from placeholder (e.g. "<image>" -> "image")
             modality = "image"
             if "video" in placeholder.lower():
                 modality = "video"
@@ -857,7 +862,29 @@ def _build_openai_content(
             ) or "so_embedding" in placeholder.lower():
                 modality = "audio"
             for _ in range(count):
-                content_list.append({"type": modality})
+                media_entries.append({"type": modality})
+
+        placement = None
+        try:
+            from .registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+            if model_type is not None:
+                placement = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_placement(
+                    model_type)
+        except Exception:
+            placement = None
+
+        # ``MultimodalPlaceholderPlacement.AFTER_TEXT`` keeps the old
+        # behaviour (text first then media); all other values place media
+        # before text.
+        if (placement is not None
+                and getattr(placement, "name", None) == "AFTER_TEXT"):
+            if text_entry is not None:
+                content_list.append(text_entry)
+            content_list.extend(media_entries)
+        else:
+            content_list.extend(media_entries)
+            if text_entry is not None:
+                content_list.append(text_entry)
 
     return content_list
 
@@ -920,7 +947,8 @@ def apply_chat_template(
                                               mm_placeholder_counts):
             if mm_placeholder_count:
                 conv["content"] = _build_openai_content(conv,
-                                                        mm_placeholder_count)
+                                                        mm_placeholder_count,
+                                                        model_type=model_type)
     # STRING path: placeholders already inserted in content by caller
 
     result = tokenizer.apply_chat_template(
