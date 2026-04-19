@@ -88,7 +88,9 @@ class CoVoST2(Evaluator):
         apply_chat_template: bool = True,
         system_prompt: Optional[str] = None,
         output_dir: Optional[str] = None,
+        dump_samples_path: Optional[str] = None,
     ):
+        self._dump_samples_path = dump_samples_path
         super().__init__(
             random_seed=random_seed,
             apply_chat_template=apply_chat_template,
@@ -178,7 +180,7 @@ class CoVoST2(Evaluator):
         self, outputs: List[RequestOutput], references: List[str], *auxiliaries
     ) -> float:
         self._ensure_bleu()
-        predictions = [o.outputs[0].text.strip() for o in outputs]
+        predictions = [self._normalize_prediction(o.outputs[0].text) for o in outputs]
         # sacrebleu expects [[ref1_a, ref1_b, ...], [ref2_a, ...]] where the
         # outer list is over reference streams; we only have a single stream.
         bleu = self._bleu_scorer.corpus_bleu(
@@ -190,7 +192,56 @@ class CoVoST2(Evaluator):
             f"(sys_len={bleu.sys_len}, ref_len={bleu.ref_len}, "
             f"precisions={bleu.precisions})"
         )
+        if self._dump_samples_path:
+            self._dump_samples(predictions, references)
         return score
+
+    _COMMON_PREFIXES = (
+        "translation:",
+        "translated:",
+        "english translation:",
+        "the english translation is:",
+        "here's the translation:",
+        "here is the translation:",
+        "the translation is:",
+    )
+
+    @classmethod
+    def _normalize_prediction(cls, text: str) -> str:
+        """Strip common instruction-tuned wrappers before BLEU scoring.
+
+        The Gemma4 chat model sometimes emits ``Translation:``, ``Here is
+        the translation:`` or outer quote pairs even when asked for the
+        bare translation.  Dropping these prefixes (case-insensitive, only
+        when they land at the very start of the output) aligns outputs
+        with the CoVoST 2 reference text format and prevents BLEU 1-gram
+        precision from collapsing on zh-CN inputs.
+        """
+        stripped = text.strip().strip("\u200b\ufeff").strip()
+        lower = stripped.lower()
+        for pre in cls._COMMON_PREFIXES:
+            if lower.startswith(pre):
+                stripped = stripped[len(pre) :].strip()
+                lower = stripped.lower()
+        # Remove an outer pair of wrapping quotes if the whole response is
+        # quoted (e.g. ``"Hello, world."``) — the references are not quoted.
+        for quote in ('"', "'", "\u201c\u201d", "\u2018\u2019"):
+            if len(quote) == 2:
+                if stripped.startswith(quote[0]) and stripped.endswith(quote[1]):
+                    stripped = stripped[1:-1].strip()
+            elif stripped.startswith(quote) and stripped.endswith(quote) and len(stripped) > 1:
+                stripped = stripped[1:-1].strip()
+        return stripped
+
+    def _dump_samples(self, predictions: List[str], references: List[str]) -> None:
+        import json
+
+        path = self._dump_samples_path
+        with open(path, "w", encoding="utf-8") as fh:
+            for i, (p, r) in enumerate(zip(predictions, references)):
+                fh.write(json.dumps({"i": i, "pred": p, "ref": r}, ensure_ascii=False))
+                fh.write("\n")
+        logger.info(f"CoVoST2 per-sample (pred, ref) dump: {path}")
 
     def _sacrebleu_tokenizer(self) -> str:
         # Use BLEU tokenizers matching the target language to match the
@@ -235,6 +286,13 @@ class CoVoST2(Evaluator):
         "--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for greedy)."
     )
     @click.option("--output_dir", type=str, default=None, help="Directory to save the task infos.")
+    @click.option(
+        "--dump_samples_path",
+        type=str,
+        default=None,
+        help="If set, dump per-sample (prediction, reference) JSONL to this path "
+        "for BLEU debugging (useful for low-BLEU language pairs).",
+    )
     @click.pass_context
     @staticmethod
     def command(
@@ -249,6 +307,7 @@ class CoVoST2(Evaluator):
         max_output_length: int,
         temperature: float,
         output_dir: Optional[str],
+        dump_samples_path: Optional[str],
     ) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
@@ -264,6 +323,7 @@ class CoVoST2(Evaluator):
             apply_chat_template=apply_chat_template,
             system_prompt=system_prompt,
             output_dir=output_dir,
+            dump_samples_path=dump_samples_path,
         )
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

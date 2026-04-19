@@ -360,6 +360,32 @@ class KvCacheCreator:
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
 
+        # For VSWA (variable sliding window attention) models such as Gemma4
+        # hybrid, KVCacheManagerV2 creates a separate pool group per distinct
+        # attention window size. The quota passed via max_tokens is split
+        # across pool groups proportionally, so each pool ends up with roughly
+        # num_cache_blocks/num_pool_groups blocks in the worst case. A single
+        # context request of max_seq_len tokens then exceeds the full-attention
+        # pool's block budget and resize_context livelocks on suspend/retry
+        # (observed for Gemma4 multimodal at max_seq_len>=8K, e.g. MMMU Pro).
+        # Scale num_cache_blocks by the number of distinct pool groups so that
+        # each pool has enough blocks for the dummy request even after the
+        # proportional split. Inferred from the model config since the hybrid
+        # max_attention_window hasn't been populated in kv_cache_config yet at
+        # this stage (it's filled in later by _create_kv_cache_manager).
+        num_pool_groups = 1
+        model_cfg = self._model_engine.model.model_config.pretrained_config
+        layer_types = getattr(model_cfg, "layer_types", None)
+        if isinstance(layer_types, (list, tuple)):
+            distinct = len(set(layer_types))
+            if distinct > 1:
+                num_pool_groups = distinct
+        elif (self._kv_cache_config.max_attention_window is not None
+              and len(set(self._kv_cache_config.max_attention_window)) > 1):
+            num_pool_groups = len(
+                set(self._kv_cache_config.max_attention_window))
+        num_cache_blocks *= num_pool_groups
+
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
         max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(

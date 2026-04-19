@@ -220,9 +220,20 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             llm)
         self.is_force_single_image = is_force_single_image
 
-        # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
-        # So, until we support interleaved text and image, we set this to False.
-        self.interleave = False
+        # For OPENAI content-format templates (e.g., Gemma4, Qwen2.5-VL), preserve
+        # the original interleaved positions of images inside the question text.
+        # Benchmarks such as MMMU Pro embed ``<image N>`` tags inside the question
+        # (e.g., "Consider <image 1>. What does <image 2> show?") and lose answer
+        # grounding when all images are bulk-prepended before the text.  Setting
+        # interleave=True makes apply_chat_template below produce a
+        # ``content_parts`` list that interleaves text segments with media entries,
+        # which ``_build_openai_content`` turns into a correctly-ordered OpenAI
+        # content list.  Effect is bounded by the fraction of multi-image
+        # questions in the task — modest on MMMU Pro (~8% multi-image, ~+1 pp)
+        # but critical when it matters.  STRING-template paths still use the old
+        # strip-and-prepend behaviour (interleaving is handled via the registered
+        # placeholder_placement at the content-flattening step).
+        self.interleave = True
 
     def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
         """Extract model type from the model configuration."""
@@ -273,15 +284,40 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             image_count = min(self.max_images,
                               text.count(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER))
 
-            if self.interleave:
-                # TODO: Implement interleaved text and image.
-                text.split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
-                ...
+            # Interleaved content_parts is only meaningful for OPENAI
+            # templates (which consume a list-of-dicts content). STRING
+            # templates use add_multimodal_placeholders on the flat text.
+            build_interleaved = (self.interleave and image_count > 1
+                                 and content_format == ContentFormat.OPENAI)
+            content_parts = None
+            if build_interleaved:
+                segments = text.split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
+                # N images -> N+1 segments; keep only the first ``image_count``
+                # splits so trailing images past ``max_images`` are dropped.
+                if len(segments) > image_count + 1:
+                    segments = segments[:image_count] + [
+                        LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER.join(
+                            segments[image_count:])
+                    ]
+                content_parts = []
+                for seg_idx, seg in enumerate(segments):
+                    if seg:
+                        content_parts.append(seg)
+                    if seg_idx < image_count:
+                        content_parts.append({
+                            "type": "image",
+                            "media_index": seg_idx,
+                        })
+                # Also strip placeholders from the flat text in case any
+                # downstream path uses ``content`` directly.
+                text = "".join(s for s in segments)
             else:
                 text = text.replace(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER, "")
 
             conv = ConversationMessage(role=content.get("role", "user"),
                                        content=text)
+            if content_parts is not None:
+                conv["content_parts"] = content_parts
             mm_data_tracker = MultimodalDataTracker(self.model_type)
 
             # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.
