@@ -18,9 +18,11 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
 
 _LANG_PREFIX = "model.language_model."
 _MODEL_PREFIX = "model."
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)$")
 
 
 @register_mapper("HF", "Gemma4ForCausalLM")
@@ -30,6 +32,95 @@ class Gemma4HfWeightMapper(HfWeightMapper):
     def _is_vlm(self) -> bool:
         """Check if the model is a VLM (has vision/audio towers) or text-only."""
         return hasattr(self.model, "vision_tower")
+
+    def apply_callbacks(
+        self,
+        module: nn.Module,
+        module_name: str,
+        module_names_breakdown: list[str],
+        weights: dict,
+    ) -> list[dict]:
+        """Thread-safe override that inlines ``_duplicate_kv_weights`` with
+        per-layer ``head_dim``.
+
+        Gemma4 uses per-layer head_dim (256 for sliding, 512 for full).  The
+        base class's single ``self._head_dim`` miscomputes ``num_kv_heads``
+        for full-attention layers under TP>1, and the weight mapper is
+        called concurrently from a ``ThreadPoolExecutor`` so stashing the
+        value on ``self`` would race across threads.  Instead, compute the
+        correct head_dim locally here and pass it through a per-call
+        callback bound to that layer.
+        """
+        layer_head_dim = self._resolve_layer_head_dim(module_names_breakdown)
+        if layer_head_dim is None:
+            return super().apply_callbacks(module, module_name, module_names_breakdown, weights)
+
+        module_weights: list[dict] = []
+        for new_name in self._mapping[module_name]:
+            fw = self.filter_weights(".".join(module_names_breakdown + [new_name]), weights)
+            fw = self._duplicate_kv_weights_with_head_dim(module, new_name, fw, layer_head_dim)
+            module_weights.append(fw)
+        return module_weights
+
+    def _resolve_layer_head_dim(self, module_names_breakdown: list[str]):
+        """Return the ``head_dim`` of the attention layer addressed by
+        ``module_names_breakdown`` (e.g. ``["model", "layers", "4",
+        "self_attn"]``) or ``None`` if the breakdown does not name an
+        attention layer.
+        """
+        for i in range(len(module_names_breakdown) - 1):
+            if module_names_breakdown[i] == "layers" and module_names_breakdown[i + 1].isdigit():
+                layer_idx = int(module_names_breakdown[i + 1])
+                layers = self._find_decoder_layers()
+                if layers is not None and 0 <= layer_idx < len(layers):
+                    attn = getattr(layers[layer_idx], "self_attn", None)
+                    hd = getattr(attn, "head_dim", None)
+                    if isinstance(hd, int) and hd > 0:
+                        return hd
+        return None
+
+    def _find_decoder_layers(self):
+        root = self.model
+        if hasattr(root, "llm"):  # Gemma4ForConditionalGeneration wrapper
+            root = root.llm
+        inner = getattr(root, "model", None)
+        return getattr(inner, "layers", None)
+
+    def _duplicate_kv_weights_with_head_dim(
+        self,
+        module: nn.Module,
+        new_name: str,
+        weights: dict,
+        layer_head_dim: int,
+    ):
+        """Local, thread-safe replacement for the base ``_duplicate_kv_weights``
+        that uses the per-layer ``head_dim`` supplied by ``apply_callbacks``.
+        """
+        if new_name not in ("k_proj", "v_proj"):
+            return weights
+        if "weight" not in weights and "bias" not in weights:
+            return weights
+
+        kv_shape = weights["weight"].shape[0] if "weight" in weights else weights["bias"].shape[0]
+        if isinstance(module.quant_method, W4A16_AWQ_LinearMethod):
+            num_kv_heads = kv_shape * 2 // layer_head_dim
+        else:
+            num_kv_heads = kv_shape // layer_head_dim
+
+        duplicated_keys = ["weight", "bias"]
+        if module.quant_config is not None and module.quant_config.quant_mode.has_nvfp4():
+            duplicated_keys.append("weight_scale")
+
+        return {
+            k: self._duplicate_kv(
+                weight=v[:],
+                num_kv_heads=num_kv_heads,
+                tensor_parallel_size=self._tp_size,
+            )
+            if k in duplicated_keys
+            else v
+            for k, v in weights.items()
+        }
 
     def preprocess_weights(self, weights: dict) -> dict:
         """Rename HF checkpoint keys to TRT-LLM module names and handle

@@ -492,7 +492,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         config = model_config.pretrained_config
         super().__init__(config)
 
-        self._device = "cuda"
+        # Pin multimodal tensors to the local rank so each rank of a multi-GPU
+        # run operates on its own device (avoids silent cross-rank copies or
+        # multi-node crashes).  model_config.mapping is always populated; fall
+        # back to cuda:0 only for the unit-test path that never goes through
+        # Mapping.
+        _local_rank = getattr(getattr(model_config, "mapping", None), "local_rank", 0) or 0
+        self._device = f"cuda:{_local_rank}"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self._top_config = config  # Preserve before post_config replaces it
 

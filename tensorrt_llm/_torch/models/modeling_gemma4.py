@@ -43,7 +43,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -93,28 +93,20 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Q-only linear for KV shared layers
 # ---------------------------------------------------------------------------
-class _QOnlyLinear(nn.Linear):
+class _QOnlyLinear(Linear):
     """Q-only linear with load_weights compatible with QKV fused path.
 
-    Used by KV shared layers where HF doesn't create k/v projections.
+    Used by KV shared layers where HF doesn't create k/v projections.  Must
+    be a TRT-LLM Linear so that out_features are sharded correctly under
+    tensor parallelism (COLUMN mode).  The weight mapper routes the usual
+    QKV list-of-three [q, k, v] dict-payload through ``load_weights``; the
+    k/v entries are empty (HF does not emit them for shared layers) so we
+    only consume index 0 and delegate to the vanilla TP-aware loader.
     """
 
-    # Satisfy weight loader attribute checks (must have quant_config with
-    # quant_mode for _duplicate_kv_weights callback in weight_mapper).
-    quant_method = None
-
-    @property
-    def quant_config(self):
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-
-        return QuantConfig()
-
     def load_weights(self, weights, allow_partial_loading=False):
-        # weights is a list of [q_dict, k_dict, v_dict] from fused QKV mapper.
-        # Only load q_proj weights; ignore k/v (not present for shared layers).
         q_weights = weights[0] if isinstance(weights, list) else weights
-        if isinstance(q_weights, dict) and "weight" in q_weights:
-            self.weight.data.copy_(q_weights["weight"])
+        super().load_weights([q_weights], allow_partial_loading=allow_partial_loading)
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +265,24 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # KV shared layers: replace fused QKV with Q-only projection.
         # HF doesn't create k/v for shared layers, so we match that.
+        #
+        # Reuse the parent's fused-QKV Linear's local Mapping (which has
+        # ``tp_size=1`` under AttentionDP and ``tp_size=N`` under pure TP), so
+        # the Q-only Linear follows the same sharding rule as q_proj inside
+        # the parent's fused qkv_proj.
         if is_kv_shared:
+            qkv_mapping = self.qkv_proj.mapping
             self.qkv_proj = _QOnlyLinear(
-                config.hidden_size,
-                self.q_size,
+                in_features=config.hidden_size,
+                out_features=qkv_mapping.tp_size * self.q_size,
                 bias=False,
                 dtype=config.torch_dtype,
+                mapping=qkv_mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
+                quant_config=None,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
             )
 
         # v_norm: always present in Gemma4 (no learnable scale).
@@ -377,11 +381,15 @@ class Gemma4Router(nn.Module):
     """Router for Gemma4 MoE.
 
     Applies: RMSNorm(no weight) -> scale * hidden_size^{-0.5} -> Linear proj
-    to produce raw logits for expert selection.
+    to produce raw logits for expert selection.  Under TP/EP the router
+    output must be computed on the FULL hidden state so every rank sees
+    the full routing table before top-k dispatch; we therefore keep
+    ``self.proj`` replicated (no ``tensor_parallel_mode``).
     """
 
-    def __init__(self, config: Gemma4TextConfig):
+    def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
         super().__init__()
+        config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
         self.scalar_root_size = self.hidden_size**-0.5
 
@@ -392,8 +400,13 @@ class Gemma4Router(nn.Module):
             has_weights=False,
         )
         self.scale = nn.Parameter(torch.ones(self.hidden_size, dtype=config.torch_dtype))
-        self.proj = nn.Linear(
-            config.hidden_size, config.num_experts, bias=False, dtype=config.torch_dtype
+        self.proj = Linear(
+            in_features=config.hidden_size,
+            out_features=config.num_experts,
+            bias=False,
+            dtype=config.torch_dtype,
+            mapping=model_config.mapping,
+            quant_config=None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -448,7 +461,7 @@ class Gemma4MoE(nn.Module):
     ):
         super().__init__()
         config = model_config.pretrained_config
-        self.router = Gemma4Router(config)
+        self.router = Gemma4Router(model_config)
         self.per_expert_scale = nn.Parameter(
             torch.ones(config.num_experts, dtype=config.torch_dtype)
         )
@@ -472,9 +485,18 @@ class Gemma4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
 
-    def forward(self, hidden_states: torch.Tensor, router_input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_input: torch.Tensor,
+        all_rank_num_tokens: Optional[list] = None,
+    ) -> torch.Tensor:
         router_logits = self.router(router_input)
-        return self.experts(hidden_states, router_logits)
+        return self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +545,12 @@ class Gemma4DecoderLayer(DecoderLayer):
             cache_layer_idx=cache_layer_idx,
         )
 
-        # Dense MLP
+        # Dense MLP.  Under AttentionDP each rank runs its own MLP on its
+        # own tokens (no TP sharding), so we force ``overridden_tp_size=1``
+        # which also disables the internal down_proj allreduce.  Under pure
+        # TP we take the default (full tp_size) and rely on the down_proj
+        # allreduce to produce a full-rank activation.
+        mlp_tp_size = 1 if model_config.mapping.enable_attention_dp else None
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
@@ -532,6 +559,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            overridden_tp_size=mlp_tp_size,
         )
 
         # Layer norms (same pattern as Gemma3)
@@ -606,6 +634,11 @@ class Gemma4DecoderLayer(DecoderLayer):
         per_layer_input: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # lora_params is handled explicitly by the MLP call below; drop it
+        # from kwargs so it is not forwarded into self.self_attn (base
+        # Attention.forward would raise on the extra kwarg).
+        lora_params = kwargs.pop("lora_params", None)
+
         # Ensure dtype consistency (E2E warmup may pass float32)
         target_dtype = self.input_layernorm.weight.dtype
         if hidden_states.dtype != target_dtype:
@@ -630,7 +663,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Feed-forward (dense MLP + optional MoE in parallel)
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, lora_params=kwargs.get("lora_params", None))
+        hidden_states = self.mlp(hidden_states, lora_params=lora_params)
 
         if self.enable_moe_block:
             # MLP path: post-norm the MLP output
@@ -638,7 +671,15 @@ class Gemma4DecoderLayer(DecoderLayer):
             # MoE path: router input is the residual (before MLP layernorm)
             hidden_states_flat = residual.reshape(-1, residual.shape[-1])
             moe_input = self.pre_feedforward_layernorm_2(hidden_states_flat)
-            hidden_states_moe = self.moe(moe_input, hidden_states_flat)
+            # Under AttentionDP, the FusedMoE all-to-all / all-gather needs
+            # each rank's token count; under pure TP (no ADP) this list is
+            # None and FusedMoE falls back to x.shape[0].
+            all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
+            hidden_states_moe = self.moe(
+                moe_input,
+                hidden_states_flat,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
             hidden_states_moe = hidden_states_moe.reshape(residual.shape)
             hidden_states_moe = self.post_feedforward_layernorm_2(hidden_states_moe)
             # Combine MLP + MoE
@@ -671,15 +712,29 @@ class Gemma4TextModel(DecoderModel):
         pretrained = config.pretrained_config
         self.hidden_size = pretrained.hidden_size
 
-        self.embed_tokens = Gemma4TextScaledWordEmbedding(
-            pretrained.vocab_size,
-            pretrained.hidden_size,
-            dtype=pretrained.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-            embed_scale=math.sqrt(pretrained.hidden_size),
-        )
+        # Under AttentionDP, each rank runs the full sequence locally so the
+        # embedding must be replicated (tp_size=1 effectively); otherwise
+        # embed_tokens is COLUMN-sharded by vocab.  This mirrors the
+        # tied-lm_head assertion in DecoderModelForCausalLM.__init__ which
+        # requires embed_tokens.tp_size == lm_head.tp_size (lm_head drops to
+        # tp_size=1 under ADP).
+        if config.mapping.enable_attention_dp:
+            self.embed_tokens = Gemma4TextScaledWordEmbedding(
+                pretrained.vocab_size,
+                pretrained.hidden_size,
+                dtype=pretrained.torch_dtype,
+                embed_scale=math.sqrt(pretrained.hidden_size),
+            )
+        else:
+            self.embed_tokens = Gemma4TextScaledWordEmbedding(
+                pretrained.vocab_size,
+                pretrained.hidden_size,
+                dtype=pretrained.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                embed_scale=math.sqrt(pretrained.hidden_size),
+            )
 
         self.layers = nn.ModuleList(
             [
@@ -703,15 +758,23 @@ class Gemma4TextModel(DecoderModel):
                 pretrained, "vocab_size_per_layer_input", pretrained.vocab_size
             )
 
-            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
-                vocab_size_ple,
-                num_layers * ple_dim,
-                dtype=pretrained.torch_dtype,
-                mapping=config.mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-                embed_scale=math.sqrt(ple_dim),
-            )
+            if config.mapping.enable_attention_dp:
+                self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                    vocab_size_ple,
+                    num_layers * ple_dim,
+                    dtype=pretrained.torch_dtype,
+                    embed_scale=math.sqrt(ple_dim),
+                )
+            else:
+                self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                    vocab_size_ple,
+                    num_layers * ple_dim,
+                    dtype=pretrained.torch_dtype,
+                    mapping=config.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
+                    embed_scale=math.sqrt(ple_dim),
+                )
 
             self.per_layer_model_projection = nn.Linear(
                 pretrained.hidden_size,
@@ -839,6 +902,21 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         self,
         model_config: ModelConfig[Gemma4TextConfig],
     ):
+        mapping = model_config.mapping
+        assert mapping.pp_size == 1, (
+            "Gemma4 does not support pipeline parallelism "
+            "(layer_scalar broadcast + hybrid VSWA pool pinning not yet implemented); "
+            "use tensor_parallel_size or attention_dp instead."
+        )
+        assert mapping.cp_size == 1, (
+            "Gemma4 does not support context parallelism "
+            "(conflicts with per-layer head_dim + VSWA)."
+        )
+        if mapping.moe_ep_size > 1:
+            assert getattr(model_config.pretrained_config, "enable_moe_block", False), (
+                "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
+            )
+
         super().__init__(
             Gemma4TextModel(model_config),
             config=model_config,
