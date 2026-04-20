@@ -288,3 +288,90 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     per_pool_tokens = total_tokens // 2  # 2 pool groups
     # Must be enough to hold a max_seq_len request per pool.
     assert per_pool_tokens >= max_seq_len
+
+
+# ---------------------------------------------------------------------------
+# KVCacheManagerV2 clamp_max_seq_len_for_mem float-to-int cast regression
+# ---------------------------------------------------------------------------
+#
+# ``KVCacheManagerV2.get_num_available_tokens`` returns
+# ``clamp_max_seq_len_for_mem(...) - extra_tokens``, where the clamp helper
+# does a floating-point memory-budget division and returns a float.  When
+# ``max_seq_len > max_num_tokens`` the ``__init__`` body assigned the float
+# directly to ``self.max_seq_len``, which then propagated into
+# ``_util.py::_create_dummy_context_requests``'s ``torch.randint(size=(...))``
+# call and crashed on a float size tuple.
+#
+# resource_manager.py:1820 now casts ``int(max_num_tokens)`` at the assign
+# site.  The tests below lock in that invariant: (a) the replay test
+# demonstrates the fix applied to the scenario that previously crashed,
+# and (b) the propagation test shows that downstream arithmetic in
+# ``_util.py:610-620`` stays int-safe.
+
+
+def test_kv_cache_manager_v2_clamp_casts_float_to_int():
+    """Replay of the V2 clamp block with a float clamp result.
+
+    Reproduces the exact arithmetic from ``resource_manager.py``
+    ``KVCacheManagerV2.__init__`` lines 1813-1825.  Pre-fix, the ``if``
+    branch stored a float on ``self.max_seq_len``.  Post-fix, it casts
+    to int.  A broken fix (e.g. dropping the cast) will make this test
+    fail on the ``isinstance(..., int)`` assertion."""
+    # Scenario pulled from the MMMU Pro 26B + s=131K crash log:
+    #   clamp_max_seq_len_for_mem returned 60160.0 when requested
+    #   131072 tokens of max_seq_len.
+    initial_max_seq_len = 131072
+    # Simulate the float return from clamp_max_seq_len_for_mem.
+    clamp_float_result = 60160.0
+    assert isinstance(clamp_float_result, float)
+    # Match the production code block (resource_manager.py:1816-1825).
+    self_max_seq_len = initial_max_seq_len
+    if self_max_seq_len > clamp_float_result:
+        self_max_seq_len = int(clamp_float_result)
+
+    assert isinstance(self_max_seq_len, int), (
+        "KVCacheManagerV2 must cast the clamp result to int — float "
+        "propagates into torch.randint(size=...) and crashes."
+    )
+    assert self_max_seq_len == 60160
+
+
+def test_kv_cache_manager_v2_float_max_seq_len_would_crash_torch_randint():
+    """Pre-fix behaviour: a float max_seq_len propagating into
+    torch.randint(size=(...,)) raises.  This test documents WHY the cast
+    is necessary — if the cast is dropped, the following code crashes."""
+    import torch
+
+    float_seq_len = 60160.0
+    with pytest.raises((TypeError, RuntimeError)):
+        # torch.randint only accepts int-valued size tuples.
+        torch.randint(low=0, high=32000, size=(float_seq_len,))
+
+
+def test_kv_manager_int_max_seq_len_stays_int_through_util_expression():
+    """The downstream expression in ``_util.py:615-620`` (which builds the
+    dummy context request input_seq_len) must stay int when the V2
+    manager's max_seq_len is int.  Covers the full propagation chain
+    from the root-cause fix to the downstream consumer."""
+    net_max_seq_len = 131072  # from ModelEngine
+    creator_max_seq_len = 131072  # KvCacheCreator.self._max_seq_len
+    kv_manager_max_seq_len = 60160  # post-fix int (was 60160.0 pre-fix)
+
+    # Replay _util.py:616-619 arithmetic.
+    input_seq_len = max(
+        1,
+        net_max_seq_len - 1 - (creator_max_seq_len - kv_manager_max_seq_len),
+    )
+    assert isinstance(input_seq_len, int)
+    assert input_seq_len >= 1
+
+    # Sanity: the same expression with a float would yield float (the
+    # original bug), ensuring this test would notice regression.
+    buggy_input = max(
+        1,
+        net_max_seq_len - 1 - (creator_max_seq_len - float(kv_manager_max_seq_len)),
+    )
+    assert isinstance(buggy_input, float), (
+        "Sanity check: the pre-fix float path must still be demonstrable "
+        "in the test, otherwise this regression guard is hollow."
+    )

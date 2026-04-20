@@ -116,9 +116,19 @@ class CoVoST2(Evaluator):
         self._bleu_scorer = None
 
     def _prompt_text(self) -> str:
+        # Use the exact AST (Automatic Speech Translation) prompt documented
+        # in the Gemma4 HF model card README ("Best Practices" section 6).
+        # Asks the model to transcribe + translate in a fixed two-line format
+        # (transcription in source lang, then "{TARGET_LANGUAGE}: <translation>");
+        # the transcription step grounds the model on what was actually said
+        # and significantly improves translation fidelity (especially on
+        # zh-CN inputs).
         return (
-            f"Translate the following {self.src_name} audio to {self.tgt_name}. "
-            f"Respond with only the {self.tgt_name} translation, no other text."
+            f"Transcribe the following speech segment in {self.src_name}, "
+            f"then translate it into {self.tgt_name}.\n"
+            f"When formatting the answer, first output the transcription in "
+            f"{self.src_name}, then one newline, then output the string "
+            f"'{self.tgt_name}: ', then the translation in {self.tgt_name}."
         )
 
     def generate_samples(self) -> Iterable[tuple]:
@@ -180,7 +190,10 @@ class CoVoST2(Evaluator):
         self, outputs: List[RequestOutput], references: List[str], *auxiliaries
     ) -> float:
         self._ensure_bleu()
-        predictions = [self._normalize_prediction(o.outputs[0].text) for o in outputs]
+        predictions = [
+            self._extract_translation(o.outputs[0].text, self.tgt_name)
+            for o in outputs
+        ]
         # sacrebleu expects [[ref1_a, ref1_b, ...], [ref2_a, ...]] where the
         # outer list is over reference streams; we only have a single stream.
         bleu = self._bleu_scorer.corpus_bleu(
@@ -232,6 +245,37 @@ class CoVoST2(Evaluator):
             elif stripped.startswith(quote) and stripped.endswith(quote) and len(stripped) > 1:
                 stripped = stripped[1:-1].strip()
         return stripped
+
+    @classmethod
+    def _extract_translation(cls, text: str, target_lang_name: str) -> str:
+        """Extract the translation section from the HF-format AST response.
+
+        The Gemma4 HF model-card AST prompt instructs the model to emit
+        transcription first, then ``"{TARGET_LANGUAGE}: <translation>"``.
+        To score BLEU we need the translation only, not the transcription.
+        Strategy: look for the ``"{target_lang_name}:"`` marker on its own
+        line (most robust) or after a newline.  If found, return the text
+        after the last occurrence (the final translation line when the
+        model emits multiple sections).  If not found (model disobeyed the
+        format, thinking-mode output, etc.), fall back to
+        ``_normalize_prediction`` on the whole response.
+        """
+        if not text:
+            return ""
+        marker = f"{target_lang_name}:"
+        lower = text.lower()
+        marker_lower = marker.lower()
+        # rfind so that if the model dumps chain-of-thought with the
+        # target language name mentioned earlier, we still pick the
+        # last (= canonical) translation line.
+        idx = lower.rfind(marker_lower)
+        if idx >= 0:
+            translation = text[idx + len(marker):]
+            # Stop at the next all-caps language tag (e.g. "CHINESE:") if
+            # the model looped back — rare but defensive.
+            translation = translation.split("\n\n", 1)[0]
+            return cls._normalize_prediction(translation)
+        return cls._normalize_prediction(text)
 
     def _dump_samples(self, predictions: List[str], references: List[str]) -> None:
         import json

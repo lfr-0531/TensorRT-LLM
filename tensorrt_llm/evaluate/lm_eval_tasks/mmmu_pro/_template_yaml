@@ -12,7 +12,11 @@ generation_kwargs:
     - "<|endoftext|>"
   temperature: 0.0
   do_sample: false
-  max_gen_toks: 512
+  # Raised from 512 to 32000 so thinking-mode reasoning chains (typically
+  # 1.5-2.5K tokens) can complete instead of being truncated by the task
+  # yaml's max_gen_toks cap (which is fed into our SamplingParams even
+  # when sampling_override is set).
+  max_gen_toks: 32000
 metric_list:
   - metric: acc
     aggregation: mean

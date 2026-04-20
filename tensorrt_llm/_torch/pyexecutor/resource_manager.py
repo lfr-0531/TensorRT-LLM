@@ -1867,7 +1867,10 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.warning(
                 f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} that can be allocated in kv cache manager, setting max_seq_len to {max_num_tokens}"
             )
-            self.max_seq_len = max_num_tokens
+            # max_num_tokens is a float from clamp_max_seq_len_for_mem; cast
+            # so downstream int-only consumers (torch.randint size, range)
+            # stay int.
+            self.max_seq_len = int(max_num_tokens)
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse

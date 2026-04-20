@@ -12,6 +12,7 @@
 # task, with minor adjustments to support MMMU Pro's 10-option multiple-choice
 # format and its uniform (all multiple-choice) question type.
 import ast
+import os
 import random
 import re
 
@@ -20,11 +21,25 @@ import numpy as np
 random.seed(42)
 
 
-MULTI_CHOICE_EXAMPLE_FORMAT = """{}
+# The prompt suffix is switched by setting MMMU_PRO_PROMPT_MODE=cot in the
+# environment before launching ``trtllm-eval mmmu_pro``.  "direct" mirrors
+# the MMMU-Benchmark's ``direct/standard`` template; "cot" mirrors the
+# ``cot/standard`` template and is the one the Gemma4 HF blog numbers
+# appear to use (close to +10-25 pp headline on MMMU Pro, especially for
+# smaller / MoE models that benefit the most from chain-of-thought).
+# Source: https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu-pro/prompts.yaml
+_PROMPT_SUFFIX_DIRECT = "Answer with the option's letter from the given choices directly."
+_PROMPT_SUFFIX_COT = (
+    "Answer the preceding multiple choice question. The last line of "
+    "your response should be of the following format: 'Answer: $LETTER' "
+    "(without quotes) where LETTER is one of options. Think step by step "
+    "before answering."
+)
 
-{}
+_MODE = os.environ.get("MMMU_PRO_PROMPT_MODE", "direct").lower()
+_PROMPT_SUFFIX = _PROMPT_SUFFIX_COT if _MODE == "cot" else _PROMPT_SUFFIX_DIRECT
 
-Answer with the option's letter from the given choices directly."""
+MULTI_CHOICE_EXAMPLE_FORMAT = "{}\n\n{}\n\n" + _PROMPT_SUFFIX
 
 
 START_CHR = "A"
@@ -76,7 +91,23 @@ def process_results(doc, results):
 
 
 # ----------- Answer parsing (from MMMU/MMMU) -----------
+_ANSWER_RE = re.compile(
+    r"(?:^|\n)\s*(?:final\s+)?answer\s*(?:is\s*)?[:\-]?\s*\(?\s*([A-J])\s*\)?",
+    re.IGNORECASE,
+)
+
+
 def parse_multi_choice_response(response, all_choices, index2ans):
+    # CoT prompts ask for "Answer: $LETTER" on the last line — pick that up
+    # first so we don't accidentally match an earlier letter that appears
+    # inside the reasoning.  Walk the response lines in reverse so the
+    # LAST matching letter wins (final answer lines typically come last).
+    valid_set = set(all_choices)
+    for line in reversed(response.splitlines()):
+        m = _ANSWER_RE.search(line)
+        if m and m.group(1).upper() in valid_set:
+            return m.group(1).upper()
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "
