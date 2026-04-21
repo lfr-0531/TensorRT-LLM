@@ -190,10 +190,7 @@ class CoVoST2(Evaluator):
         self, outputs: List[RequestOutput], references: List[str], *auxiliaries
     ) -> float:
         self._ensure_bleu()
-        predictions = [
-            self._extract_translation(o.outputs[0].text, self.tgt_name)
-            for o in outputs
-        ]
+        predictions = [self._extract_translation(o.outputs[0].text, self.tgt_name) for o in outputs]
         # sacrebleu expects [[ref1_a, ref1_b, ...], [ref2_a, ...]] where the
         # outer list is over reference streams; we only have a single stream.
         bleu = self._bleu_scorer.corpus_bleu(
@@ -270,7 +267,7 @@ class CoVoST2(Evaluator):
         # last (= canonical) translation line.
         idx = lower.rfind(marker_lower)
         if idx >= 0:
-            translation = text[idx + len(marker):]
+            translation = text[idx + len(marker) :]
             # Stop at the next all-caps language tag (e.g. "CHINESE:") if
             # the model looped back — rare but defensive.
             translation = translation.split("\n\n", 1)[0]

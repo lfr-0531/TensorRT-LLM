@@ -306,20 +306,20 @@ class Gemma4Attention(QKNormRoPEAttention):
     ):
         # Split QKV, apply QK norm
         if not self.fuse_qk_norm_rope:
-            # KV shared layers: only q was produced (no k/v proj).
-            # Pad with zeros to match expected q+k+v size so split_qkv works.
+            # KV shared layers: only q was produced (no k/v proj).  Apply
+            # q_norm and rotary directly to q (Q-only fast path) without
+            # the zero-padding / split_qkv / rope-on-zeros round-trip.
             if self.is_kv_shared:
                 q_raw = self.q_norm(q.reshape(-1, self.head_dim)).reshape(-1, self.q_size)
-                # Pad with zeros for k/v to satisfy split_qkv in convert_qkv
-                kv_pad = q_raw.new_zeros(q_raw.shape[0], 2 * self.kv_size)
-                q_padded = torch.cat([q_raw, kv_pad], dim=-1)
-                q_padded, k_dummy, v_dummy = self.split_qkv(q_padded, None, None)
-                if not self.skip_rope:
-                    q_padded, _, _ = super(QKNormRoPEAttention, self).apply_rope(
-                        q_padded, k_dummy, v_dummy, position_ids
-                    )
-                # Return None for k/v so FlashInfer skips cache append
-                return q_padded, None, None
+                if not self.skip_rope and self.rotary_emb is not None:
+                    # self.rotary_emb.forward supports a list of targets;
+                    # pass only [q] to rotate Q in place.  The single-target
+                    # path rejects the 2-target flashinfer fast path and
+                    # falls through to the reference rotate_half
+                    # implementation — correct regardless of head_dim.
+                    [q_raw] = self.rotary_emb(position_ids, [q_raw])
+                # Return None for k/v so FlashInfer skips cache append.
+                return q_raw, None, None
 
             q, k, v = self.split_qkv(q, k, v)
             # For K=V layers, weight mapper duplicates k_proj weights into
