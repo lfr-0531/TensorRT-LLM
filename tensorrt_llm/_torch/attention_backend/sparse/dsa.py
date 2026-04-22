@@ -34,8 +34,6 @@ from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.utils.fp4_utils import \
-    fp4_quantize_1x32_sf_transpose
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -1545,9 +1543,9 @@ class Indexer(nn.Module):
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
             k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
-            # q_scale arrives as (N, n_heads, 1) from fp4_quantize_1x32_sf_transpose
-            # (keeps the trailing num_blocks//4=1 dim for byte-identical parity with
-            # DeepGEMM's reference util). The kernel asserts q_sf is 2D.
+            # q_scale arrives as (N*n_heads, 1) from fused_cat_fp4 (one int32
+            # per row carrying four UE8M0 exponents). The kernel asserts q_sf
+            # is 2D, so reshape to (N, n_heads).
             q_scale_2d = q_scale.reshape(-1, self.n_heads)
             return fp8_fp4_mqa_logits(
                 (q_fp8, q_scale_2d),
@@ -1915,13 +1913,12 @@ class Indexer(nn.Module):
         """Concatenate and quantize for Q or K.
 
         FP8 mode: fused cat + FP8 quantize via CUDA kernel.
-        FP4 mode: cat + per-block-32 FP4 quantize via Triton kernel. The
-        returned packed bytes are int8 (two FP4 codes per byte) and the
+        FP4 mode: fused cat + per-block-32 FP4 E2M1 quantize via CUDA kernel.
+        The returned packed bytes are int8 (two FP4 codes per byte) and the
         scale is int32 (four UE8M0 exponents packed little-endian).
         """
         if self.use_fp4:
-            cat = torch.cat([qk_pe, qk_nope], dim=-1)
-            return fp4_quantize_1x32_sf_transpose(cat)
+            return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
         fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
             qk_pe, qk_nope, self.scale_fmt == "ue8m0")
         return fp8_out, scale

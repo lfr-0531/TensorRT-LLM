@@ -8,13 +8,13 @@
 """Integration tests for the DSA FP4 indexer path (B200 / SM100 only).
 
 These tests drive the DeepGEMM FP4 MQA logits kernel through the TRT-LLM
-Indexer's FP4 quantization utility and the Indexer._call_mqa_logits dispatch.
+Indexer's FP4 quantization op and the Indexer._call_mqa_logits dispatch.
 Compared against the FP8 reference:
 - Topk intersection rate between FP4 and FP8 should be >= 95% for the
   same inputs, confirming the two indexer implementations pick
   essentially the same candidate key tokens.
 - The FP4 kernel must accept head_dim=128, num_heads in {32, 64}, and
-  the packed int8/int32 layouts produced by fp4_quantize_1x32_sf_transpose.
+  the packed int8/int32 layouts produced by torch.ops.trtllm.fused_cat_fp4.
 
 The DSA config validator rejects FP4 on SM<100 and on non-128 head_dim,
 so skip when either precondition isn't met.
@@ -22,6 +22,9 @@ so skip when either precondition isn't met.
 
 import pytest
 import torch
+
+# Import tensorrt_llm to load C++ custom operators (registers trtllm::fused_cat_fp4).
+import tensorrt_llm  # noqa: F401
 
 try:
     from tensorrt_llm import deep_gemm
@@ -36,7 +39,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from utils.util import skip_pre_blackwell  # noqa: E402
 
-from tensorrt_llm.quantization.utils.fp4_utils import fp4_quantize_1x32_sf_transpose  # noqa: E402
+
+def _fp4_quantize_sf_transpose(x: torch.Tensor):
+    """Wrap trtllm::fused_cat_fp4 for tests that already hold a concatenated
+    tensor. The op takes (pe, nope); split at an arbitrary boundary since the
+    kernel reconstructs the concat internally. Returns shapes matching the
+    original helper: (*leading, head_dim//2) int8 packed and (*leading, 1) int32.
+    """
+    head_dim = x.shape[-1]
+    assert head_dim == 128, f"expected head_dim=128, got {head_dim}"
+    pe, nope = x.split([head_dim // 2, head_dim // 2], dim=-1)
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+    leading = x.shape[:-1]
+    return packed.view(*leading, head_dim // 2), scale.view(*leading, 1)
 
 
 def _fp8_quantize_sf(x: torch.Tensor):
@@ -69,12 +84,12 @@ def test_fp4_mqa_logits_shape_and_topk_intersection(num_heads):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     cu_ks, cu_ke = _dense_context_bounds(seq_len, seq_len_kv, q.device)
 
-    # FP4 path: pack Q and K. fp4_quantize_1x32_sf_transpose keeps a trailing
+    # FP4 path: pack Q and K. _fp4_quantize_sf_transpose keeps a trailing
     # num_blocks//4 dim to stay byte-identical with DeepGEMM's reference util,
     # so squeeze it for the kernel (q_sf is 2D, kv_sf is 1D).
-    q_fp4, q_scale_full = fp4_quantize_1x32_sf_transpose(q)
+    q_fp4, q_scale_full = _fp4_quantize_sf_transpose(q)
     q_scale = q_scale_full.view(seq_len, num_heads)
-    k_fp4, k_scale_full = fp4_quantize_1x32_sf_transpose(k)
+    k_fp4, k_scale_full = _fp4_quantize_sf_transpose(k)
     k_scale_fp4 = k_scale_full.reshape(-1)
 
     # The FP4 kernel scales q internally; weights carry softmax_scale only.
@@ -149,7 +164,7 @@ def test_fp4_quantize_roundtrip_matches_bf16_kv():
     head_dim = 128
     k = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16) * 2.0
 
-    k_fp4, scale = fp4_quantize_1x32_sf_transpose(k)
+    k_fp4, scale = _fp4_quantize_sf_transpose(k)
 
     fp4_values = torch.tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
@@ -239,7 +254,7 @@ def test_fp4_paged_mqa_logits_jit_first_compile_latency(next_n):
     max_context_len = 512
 
     q = torch.randn(batch_size, next_n, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    q_fp4, q_scale = fp4_quantize_1x32_sf_transpose(q)
+    q_fp4, q_scale = _fp4_quantize_sf_transpose(q)
     q_scale = q_scale.view(batch_size, next_n, num_heads)
 
     per_token_bytes = head_dim // 2 + 4  # FP4 layout

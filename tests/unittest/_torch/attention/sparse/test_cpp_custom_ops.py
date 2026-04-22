@@ -16,13 +16,27 @@
 
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
+- ``torch.ops.trtllm.fused_cat_fp4``
 """
+
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
 # Import tensorrt_llm to load C++ custom operators
 import tensorrt_llm  # noqa: F401
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.util import skip_pre_blackwell  # noqa: E402
+
+try:
+    from tensorrt_llm.deep_gemm.utils.math import per_token_cast_to_fp4
+
+    HAS_DEEPGEMM_REF = True
+except ImportError:
+    HAS_DEEPGEMM_REF = False
 
 # ---------------------------------------------------------------------------
 # Constants matching the C++ kernel (DeepSeek-V3.2 indexer config)
@@ -419,3 +433,97 @@ def test_convert_req_index_to_global_block_table_padding():
     )
 
     assert (out == -1).all(), "All outputs should be -1 when block_table is all padding"
+
+
+# ===================================================================
+# Test 3: fused_cat_fp4 — bit-exact vs DeepGEMM per_token_cast_to_fp4
+# ===================================================================
+
+
+@pytest.mark.skipif(
+    not HAS_DEEPGEMM_REF,
+    reason="tensorrt_llm.deep_gemm.utils.math.per_token_cast_to_fp4 unavailable",
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 128),
+        (1, 32, 128),
+        (3, 7, 128),
+        (2, 5, 4, 128),
+    ],
+)
+@pytest.mark.parametrize("seed", [0, 42, 2026])
+def test_fused_cat_fp4_matches_deepgemm(shape, seed):
+    """Packed bytes and UE8M0 scale int32 must match DeepGEMM byte-for-byte."""
+    torch.manual_seed(seed)
+    head_dim = shape[-1]
+    leading = shape[:-1]
+    rope_dim = head_dim // 2
+    pe = torch.randn(*leading, rope_dim, device="cuda", dtype=torch.bfloat16)
+    nope = torch.randn(*leading, head_dim - rope_dim, device="cuda", dtype=torch.bfloat16)
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    # Reference expects 2D (M, head_dim); flatten leading dims.
+    cat_2d = torch.cat([pe, nope], dim=-1).reshape(-1, head_dim).contiguous()
+    ref_packed, ref_scale = per_token_cast_to_fp4(
+        cat_2d, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+
+    M = packed.size(0)
+    assert packed.shape == (M, head_dim // 2)
+    assert scale.shape == (M, 1)
+    assert torch.equal(
+        packed.view(-1).contiguous(),
+        ref_packed.reshape(-1).to(torch.int8).contiguous(),
+    ), "FP4 packed bytes mismatch vs DeepGEMM reference"
+    assert torch.equal(
+        scale.view(-1).contiguous(),
+        ref_scale.reshape(-1).to(torch.int32).contiguous(),
+    ), "UE8M0 scale int32 mismatch vs DeepGEMM reference"
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "pe_dim,nope_dim",
+    [
+        (64, 64),
+        (32, 96),
+        (16, 112),
+        (96, 32),
+    ],
+)
+def test_fused_cat_fp4_shape_dispatch(pe_dim, nope_dim):
+    """Verify the op handles asymmetric pe/nope splits and returns correct shapes."""
+    torch.manual_seed(0)
+    M = 8
+    pe = torch.randn(M, pe_dim, device="cuda", dtype=torch.bfloat16)
+    nope = torch.randn(M, nope_dim, device="cuda", dtype=torch.bfloat16)
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    assert packed.dtype == torch.int8
+    assert scale.dtype == torch.int32
+    assert packed.shape == (M, (pe_dim + nope_dim) // 2)
+    assert scale.shape == (M, 1)
+
+
+@skip_pre_blackwell
+def test_fused_cat_fp4_noncontiguous_split():
+    """Op must accept non-contiguous pe/nope views from torch.split()."""
+    torch.manual_seed(0)
+    M = 16
+    head_dim = 128
+    x = torch.randn(M, head_dim, device="cuda", dtype=torch.bfloat16)
+    pe, nope = x.split([head_dim // 2, head_dim // 2], dim=-1)
+    assert not pe.is_contiguous()
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    # Contiguous reference via pre-materialized copies.
+    packed_ref, scale_ref = torch.ops.trtllm.fused_cat_fp4(pe.contiguous(), nope.contiguous())
+
+    assert torch.equal(packed, packed_ref)
+    assert torch.equal(scale, scale_ref)
