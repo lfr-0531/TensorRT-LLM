@@ -1589,11 +1589,12 @@ class Indexer(nn.Module):
 
         q_scale is only consumed by the FP4 dispatch; FP8 path ignores it.
         """
-        # The KVCacheManager keeps the layout-defining quant_block_size at
-        # 128 even in FP4 mode (the indexer's per-block-32 scales use the
-        # same 4 bytes/token as the FP8 per-block-128 scales at head_dim=128).
+        # DSACacheManager hardcodes quant_block_size=128 (see its __init__);
+        # FP4 uses per-block-32 UE8M0 scales but packs four of them into one
+        # int32 so the cache-layout contribution is the same 4 bytes/token as
+        # FP8 per-block-128 at head_dim=128.
         assert metadata.kv_cache_manager is None or \
-            metadata.kv_cache_manager.quant_block_size in (128, 32), \
+            metadata.kv_cache_manager.quant_block_size == 128, \
             f"Unexpected quant_block_size {metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
         # Update the indexer k cache before prefill chunks gather from it.
         self._update_k_cache(k_fp8, k_scale, metadata)
@@ -1963,9 +1964,13 @@ class Indexer(nn.Module):
         k_fp8, k_scale = k
         if self.use_fp4:
             # FP4 packs two codes per byte, so the trailing dim is head_dim // 2.
-            # The DeepGEMM FP4 kernel applies the per-block q_scale internally,
-            # so weights carry only softmax_scale * n_heads^-0.5.
+            # fused_cat_fp4 flattens the leading dims to M=N*n_heads; restore
+            # the (N, n_heads, ...) shape so downstream slicing in
+            # sparse_attn_indexer (which indexes by token) lines up with
+            # q_fp8. The DeepGEMM FP4 kernel applies the per-block q_scale
+            # internally, so weights carry only softmax_scale * n_heads^-0.5.
             q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim // 2)
+            q_scale = q_scale.view(-1, self.n_heads, 1)
             weights = weights * self.weight_scale_factor
         else:
             q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
@@ -2218,6 +2223,12 @@ class DSACacheManager(KVCacheManager):
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
         quant_block_size = 128
+        # Under FP4 the indexer stores two E2M1 codes per byte, so the
+        # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
+        # the scale bytes are unchanged (4 per token, one int32 holding four
+        # UE8M0 exponents at quant_block_size=32 after packing).
+        use_fp4 = getattr(sparse_attn_config, "indexer_k_dtype", "fp8") == "fp4"
+        indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -2234,7 +2245,7 @@ class DSACacheManager(KVCacheManager):
         mem_per_token *= num_attention_layers * head_dim
 
         # 1 for K, others for indexer K cache
-        head_dim_factor = (index_head_dim +
+        head_dim_factor = (indexer_data_dim +
                            index_head_dim // quant_block_size * 4) / head_dim
         kv_factor = 1 + head_dim_factor
         mem_per_token *= kv_factor
@@ -2242,8 +2253,11 @@ class DSACacheManager(KVCacheManager):
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
-        # self.kv_factor for K, others for indexer K cache
-        head_dim_factor = (self.index_head_dim + self.index_head_dim //
+        # self.kv_factor for K, others for indexer K cache.
+        # Under FP4 the indexer data portion is halved (two E2M1 codes per
+        # byte); scale bytes are unchanged.
+        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        head_dim_factor = (indexer_data_dim + self.index_head_dim //
                            self.quant_block_size * 4) / self.head_dim
         kv_factor = self.kv_factor + head_dim_factor
         cache_size_per_token = math.ceil(

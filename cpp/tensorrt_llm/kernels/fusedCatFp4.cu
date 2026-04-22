@@ -34,6 +34,11 @@ namespace
 {
 
 // Constants (fixed for DSV3.2 FP4 indexer: head_dim=128, per-block-32 quant).
+//
+// INV_FP4_E2M1_MAX / MIN_AMAX mirror DeepGEMM's per_token_cast_to_fp4 reference
+// (use_ue8m0=True, gran_k=32, use_packed_ue8m0=True) at
+// tensorrt_llm/deep_gemm/utils/math.py. Keep in sync with that helper when
+// bumping DeepGEMM — test_fused_cat_fp4_matches_deepgemm is the guard.
 constexpr int HEAD_DIM = 128;
 constexpr int WARP_SIZE = 32;
 constexpr int ELEMS_PER_THREAD = 4;                           // 128 / 32 = 4 elements per thread.
@@ -41,8 +46,8 @@ constexpr int ROWS_PER_BLOCK = 8;                             // 8 rows per CTA 
 constexpr int FP4_BLOCK_SIZE = 32;                            // One UE8M0 scale per 32 elements.
 constexpr int LANES_PER_FP4_BLOCK = 8;                        // 32 elements / 4 per lane = 8 lanes.
 constexpr int FP4_BLOCKS_PER_ROW = HEAD_DIM / FP4_BLOCK_SIZE; // = 4.
-constexpr float INV_FP4_E2M1_MAX = 1.0f / 6.0f;               // Largest FP4 E2M1 magnitude.
-constexpr float MIN_AMAX = 1.0e-12f;
+constexpr float INV_FP4_E2M1_MAX = 1.0f / 6.0f;               // 1 / max representable FP4 E2M1 magnitude (6.0).
+constexpr float MIN_AMAX = 1.0e-12f;                          // Floor on amax to keep ratio normal in ceil_to_ue8m0.
 
 /// Helper union for vectorized BF16 loads (4 BF16 values = 8 bytes).
 union BF16x4

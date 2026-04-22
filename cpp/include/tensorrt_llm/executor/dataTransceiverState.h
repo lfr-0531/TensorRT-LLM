@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -115,7 +115,10 @@ public:
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
             && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType
-            && mRnnCacheState == other.mRnnCacheState && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;
+            && mRnnCacheState == other.mRnnCacheState && mHasIndexerKCache == other.mHasIndexerKCache
+            && mIndexerDimPerHead == other.mIndexerDimPerHead
+            && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
+            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;
     }
 
     struct ModelConfig

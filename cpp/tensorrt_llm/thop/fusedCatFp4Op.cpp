@@ -38,6 +38,16 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp4(at::Tensor const& pe, at::Tenso
     TORCH_CHECK(pe.stride(-1) == 1, "pe must have contiguous innermost dim (stride(-1)==1), got ", pe.stride(-1));
     TORCH_CHECK(nope.stride(-1) == 1, "nope must have contiguous innermost dim (stride(-1)==1), got ", nope.stride(-1));
 
+    // The kernel issues 8-byte vectorized loads (int2 reinterpret of 4x BF16).
+    // PyTorch CUDA storage is 256-byte aligned and split() preserves BF16
+    // alignment when the split boundary is a multiple of 4 elements (all
+    // current call sites satisfy this), but check explicitly so an
+    // out-of-tree caller can't silently misalign the load.
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(pe.data_ptr()) % 8 == 0,
+        "pe.data_ptr() must be 8-byte aligned for vectorized BF16 loads");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(nope.data_ptr()) % 8 == 0,
+        "nope.data_ptr() must be 8-byte aligned for vectorized BF16 loads");
+
     auto const pe_dim = static_cast<int32_t>(pe.size(-1));
     auto const nope_dim = static_cast<int32_t>(nope.size(-1));
     auto const head_dim = pe_dim + nope_dim;
