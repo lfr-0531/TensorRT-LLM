@@ -597,15 +597,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # The fp8_paged_mqa_logits kernel needs different layout of the metadata buffer for MTP=3.
-        if self.max_draft_tokens == 3:
-            self.scheduler_metadata_buffer_mtp3 = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.num_sms // 2 + 1, 2),
-                cache_name="scheduler_metadata_buffer_mtp3",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -1044,12 +1035,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
-            elif self.max_draft_tokens == 3:
-                scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
-                    context_lens_2d, self.kv_cache_manager.tokens_per_block,
-                    self.num_sms // 2)
-                self.scheduler_metadata_buffer_mtp3.copy_(
-                    scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -1426,12 +1411,6 @@ class Indexer(nn.Module):
                     context_lens_2d, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer.copy_(
                     scheduler_metadata_buffer, non_blocking=True)
-                if metadata.max_draft_tokens == 3:
-                    scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
-                        context_lens_2d, tokens_per_block,
-                        metadata.num_sms // 2)
-                    metadata.scheduler_metadata_buffer_mtp3.copy_(
-                        scheduler_metadata_buffer_mtp3, non_blocking=True)
             else:
                 # Expand schedule metadata buffer (only generation). The new
                 # DeepGEMM API requires 2D; each expanded token becomes a (1,)
@@ -1543,9 +1522,11 @@ class Indexer(nn.Module):
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
             k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
-            # q_scale arrives as (N*n_heads, 1) from fused_cat_fp4 (one int32
-            # per row carrying four UE8M0 exponents). The kernel asserts q_sf
-            # is 2D, so reshape to (N, n_heads).
+            # q_scale arrives here as (chunk_tokens, n_heads, 1) — fused_cat_fp4
+            # emits one int32 per (token, head) carrying four UE8M0 exponents,
+            # pre_indexer_proj reshapes back to (N, n_heads, 1), and
+            # sparse_attn_indexer chunk-slices on axis 0. The DeepGEMM FP4
+            # kernel asserts q_sf is 2D, so collapse the trailing unit axis.
             q_scale_2d = q_scale.reshape(-1, self.n_heads)
             return fp8_fp4_mqa_logits(
                 (q_fp8, q_scale_2d),
@@ -1766,10 +1747,7 @@ class Indexer(nn.Module):
                                                         next_n]
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
-                if q_decode.shape[1] == 4:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_mtp3
-                else:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]

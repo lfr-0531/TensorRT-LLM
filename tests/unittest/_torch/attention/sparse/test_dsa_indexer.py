@@ -566,11 +566,6 @@ def _create_mock_metadata(request_ids,
                 self.block_table_expanded, device='cpu', pin_memory=True)
             self.scheduler_metadata_buffer_expanded = torch.zeros(
                 (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
-            if self.max_draft_tokens == 3:
-                self.scheduler_metadata_buffer_mtp3 = torch.zeros(
-                    (self.num_sms // 2 + 1, 2),
-                    device='cuda',
-                    dtype=torch.int32)
             if self.use_expanded_buffers_for_mtp:
                 gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
                 gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
@@ -1060,9 +1055,12 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         # New DeepGEMM 2D context_lens API: shape (batch_size, next_n).
         context_lens = metadata_gen.kv_lens_cuda_2d[0:batch_size, 0:next_n]
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
-        # The upgraded DeepGEMM paged MQA logits kernel atomizes arbitrary
-        # next_n on SM100, so the old mtp3 (num_sms // 2 + 1) metadata layout
-        # is no longer used — always forward the base scheduler buffer.
+        # The upgraded DeepGEMM paged MQA logits kernel picks
+        # num_kv_multicast=1 on SM100 for every next_n it supports
+        # (verified by the _schedule_meta_size assertion in
+        # deepgemm-src/csrc/apis/attention.hpp firing when we try to pass
+        # the legacy (num_sms // 2 + 1, 2) layout). The base scheduler
+        # buffer is the only layout the kernel will accept now.
         scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
     else:
         q_fp8 = q_fp8.view(-1, 1, *q_fp8.shape[2:])

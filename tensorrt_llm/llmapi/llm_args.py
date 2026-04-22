@@ -372,14 +372,16 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
             if self.index_head_dim is not None and self.index_head_dim != 128:
                 raise ValueError(
                     f"indexer_k_dtype='fp4' requires index_head_dim=128, "
-                    f"got {self.index_head_dim}.")
+                    f"got {self.index_head_dim}. Set indexer_k_dtype='fp8' "
+                    f"for non-128 indexer head dims.")
             if torch.cuda.is_available():
                 from tensorrt_llm._utils import get_sm_version
                 sm = get_sm_version()
                 if sm < 100:
                     raise ValueError(
                         f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
-                        f"current device is SM{sm}.")
+                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
+                        f"for non-Blackwell GPUs.")
         return self
 
     def supports_backend(self, backend: str) -> bool:

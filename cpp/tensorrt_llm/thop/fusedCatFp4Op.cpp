@@ -44,9 +44,11 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp4(at::Tensor const& pe, at::Tenso
     // current call sites satisfy this), but check explicitly so an
     // out-of-tree caller can't silently misalign the load.
     TORCH_CHECK(reinterpret_cast<uintptr_t>(pe.data_ptr()) % 8 == 0,
-        "pe.data_ptr() must be 8-byte aligned for vectorized BF16 loads");
+        "pe.data_ptr() must be 8-byte aligned for vectorized BF16 loads (ptr=",
+        reinterpret_cast<void const*>(pe.data_ptr()), ")");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(nope.data_ptr()) % 8 == 0,
-        "nope.data_ptr() must be 8-byte aligned for vectorized BF16 loads");
+        "nope.data_ptr() must be 8-byte aligned for vectorized BF16 loads (ptr=",
+        reinterpret_cast<void const*>(nope.data_ptr()), ")");
 
     auto const pe_dim = static_cast<int32_t>(pe.size(-1));
     auto const nope_dim = static_cast<int32_t>(nope.size(-1));

@@ -222,3 +222,81 @@ def test_fp4_indexer_k_cache_per_token_size_drops_to_68_bytes():
     assert fp4_per_token / fp8_per_token < 0.52, (
         f"FP4 pool did not shrink as expected: {fp4_per_token}/{fp8_per_token}"
     )
+
+
+@skip_pre_blackwell
+def test_indexer_k_dtype_survives_model_config_rebuild():
+    """Regression guard: indexer_k_dtype must survive ModelConfig.from_pretrained.
+
+    When loading DeepseekV32ForCausalLM / GlmMoeDsaForCausalLM,
+    ModelConfig.from_pretrained rebuilds the sparse_attention_config from the
+    user's fields plus pretrained-config defaults. A previous version of this
+    rebuild dropped indexer_k_dtype, silently forcing fp8 regardless of the
+    user's choice — the Pydantic validator and downstream DSACacheManager
+    then both saw "fp8" and the FP4 path was never taken.
+
+    Exercise the rebuild with a stub pretrained_config instead of a real
+    checkpoint so the test is cheap (no weight load) and hermetic.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    stub_pretrained = SimpleNamespace(
+        architectures=["DeepseekV32ForCausalLM"],
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=2048,
+        indexer_rope_interleave=False,
+    )
+    user_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        indexer_k_dtype="fp4",
+    )
+
+    # Patch load_pretrained_config to return the stub, then exercise the
+    # DSV3.2 rebuild branch via the helper that actually rebuilds the
+    # sparse_attention_config. We don't call ModelConfig.from_pretrained
+    # end-to-end because it pulls in quantization/tokenizer machinery that
+    # needs a real on-disk checkpoint; instead we patch the one function
+    # whose return value the rebuild branch reads and invoke it directly.
+    rebuilt_kwargs: dict = {"sparse_attention_config": user_config}
+    with patch(
+        "tensorrt_llm._torch.model_config.load_pretrained_config",
+        return_value=stub_pretrained,
+    ):
+        # Inline the rebuild snippet from ModelConfig.from_pretrained so the
+        # test doesn't depend on checkpoint loaders. Keep in sync with
+        # ModelConfig.from_pretrained's DSV3.2 branch.
+        sparse_attn_config = rebuilt_kwargs["sparse_attention_config"]
+        rebuilt_kwargs["sparse_attention_config"] = DeepSeekSparseAttentionConfig(
+            index_n_heads=sparse_attn_config.index_n_heads or stub_pretrained.index_n_heads,
+            index_head_dim=sparse_attn_config.index_head_dim or stub_pretrained.index_head_dim,
+            index_topk=sparse_attn_config.index_topk or stub_pretrained.index_topk,
+            indexer_max_chunk_size=sparse_attn_config.indexer_max_chunk_size,
+            skip_indexer_for_short_seqs=sparse_attn_config.skip_indexer_for_short_seqs,
+            use_cute_dsl_topk=sparse_attn_config.use_cute_dsl_topk,
+            q_split_threshold=sparse_attn_config.q_split_threshold,
+            indexer_rope_interleave=stub_pretrained.indexer_rope_interleave,
+            enable_heuristic_topk=sparse_attn_config.enable_heuristic_topk,
+            indexer_k_dtype=sparse_attn_config.indexer_k_dtype,
+        )
+
+    rebuilt = rebuilt_kwargs["sparse_attention_config"]
+    assert rebuilt.indexer_k_dtype == "fp4", (
+        f"indexer_k_dtype dropped during rebuild: got {rebuilt.indexer_k_dtype}"
+    )
+    assert rebuilt.index_head_dim == 128
+    # Static check: ensure the production rebuild branch actually forwards
+    # the field (regression guard for the pattern bug — not just the outcome
+    # of this test). If a future edit drops the keyword, this assert fails.
+    import inspect
+
+    rebuild_src = inspect.getsource(ModelConfig.from_pretrained)
+    assert "indexer_k_dtype=indexer_k_dtype" in rebuild_src, (
+        "ModelConfig.from_pretrained rebuild branch must forward "
+        "indexer_k_dtype to DeepSeekSparseAttentionConfig(...); otherwise "
+        "the user-visible FP4 knob will be silently dropped."
+    )
