@@ -152,7 +152,7 @@ def test_indexer_k_cache_gather_contiguous(
 
     # C++ op
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens, HEAD_DIM
     )
 
     # Reference
@@ -219,7 +219,7 @@ def test_indexer_k_cache_gather_noncontiguous(
 
     # C++ op (handles non-contiguous strides internally)
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens, HEAD_DIM
     )
 
     # Reference uses contiguous copy
@@ -245,7 +245,7 @@ def test_indexer_k_cache_gather_empty():
     slot_scale = torch.zeros(10, dtype=torch.int64, device=device)
 
     k_fp8, k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0
+        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0, head_dim=HEAD_DIM
     )
 
     assert k_fp8.shape == (0, HEAD_DIM)

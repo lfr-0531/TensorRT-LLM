@@ -1792,13 +1792,16 @@ class MLA(nn.Module):
             return [q, compressed_kv, k_pe, latent_cache]
 
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
-        # compute (cublas_mm, rope, FP8 quantize, weight scaling) with no
-        # access to batch-specific metadata or the k cache.
-        q_fp8, k_fp8, k_scale, weights = self.mqa.indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids)
+        # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
+        # access to batch-specific metadata or the k cache. Returns q_scale
+        # as a 5th element so the FP4 dispatch can forward it to the kernel;
+        # the FP8 path ignores it in forward_dsa_attn.
+        q_fp8, k_fp8, k_scale, weights, q_scale = (
+            self.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
 
         return [
-            q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights
+            q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
+            weights, q_scale
         ]
 
     def forward_dsa_attn(
@@ -1842,13 +1845,14 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
         else:
-            q_fp8, k_fp8, k_scale, weights = indexer_intermediates
+            q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
             # Slice indexer intermediates to actual num_tokens (they were
             # computed on the full padded tensor in Op 1).
             q_fp8 = q_fp8[:num_tokens, ...]
             k_fp8 = k_fp8[:num_tokens, ...]
             k_scale = k_scale[:num_tokens, ...]
             weights = weights[:num_tokens, ...]
+            q_scale = q_scale[:num_tokens, ...]
             topk_indices = self.mqa.indexer.sparse_attn_indexer(
                 attn_metadata,
                 q,  # only used for shape/device in buffer allocation
@@ -1856,6 +1860,7 @@ class MLA(nn.Module):
                 k_fp8,
                 k_scale,
                 weights,
+                q_scale=q_scale,
             )
 
         assert output is not None, "output must be provided"

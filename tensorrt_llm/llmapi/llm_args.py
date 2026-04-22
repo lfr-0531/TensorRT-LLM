@@ -347,6 +347,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "Whether to reuse previous step's TopK indices as heuristic hints "
         "for the decode indexer TopK kernel, reducing threshold search iterations."
     )
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp8",
+        description="The dtype of the indexer K cache. Only fp4 and fp8 are"
+        " supported.",
+    )
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

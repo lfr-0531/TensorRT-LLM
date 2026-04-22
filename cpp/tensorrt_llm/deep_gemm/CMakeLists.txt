@@ -40,6 +40,9 @@ foreach(SOURCE_FILE ${DEEP_GEMM_ALL_FILES})
     file(READ ${SOURCE_FILE} _content)
     string(REPLACE "from . import _C" "import tensorrt_llm.deep_gemm_cpp_tllm"
                    _content "${_content}")
+    string(REPLACE "from .. import _C"
+                   "import tensorrt_llm.deep_gemm_cpp_tllm as _C" _content
+                   "${_content}")
     string(REPLACE ".._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content
                    "${_content}")
     string(REPLACE "._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content

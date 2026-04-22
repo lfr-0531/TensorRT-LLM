@@ -1167,9 +1167,10 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
-          slot_mapping_scale: torch.Tensor, k_token_start: int,
-          num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_fp8 = k_cache.new_empty([num_tokens, 128], dtype=torch.float8_e4m3fn)
+          slot_mapping_scale: torch.Tensor, k_token_start: int, num_tokens: int,
+          head_dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_fp8 = k_cache.new_empty([num_tokens, head_dim],
+                                  dtype=torch.float8_e4m3fn)
         k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
         return k_fp8, k_scale
 
