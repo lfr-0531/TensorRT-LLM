@@ -23,11 +23,18 @@ import unittest
 import unittest.mock
 from copy import deepcopy
 
+import pytest
 import torch
-from transformers import Gemma4Config, Gemma4TextConfig
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_gemma4 import (
+# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
+pytest.importorskip(
+    "transformers", minversion="5.5.0", reason="Gemma4 requires transformers>=5.5.0"
+)
+
+from transformers import Gemma4Config, Gemma4TextConfig  # noqa: E402
+
+from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
+from tensorrt_llm._torch.models.modeling_gemma4 import (  # noqa: E402
     Gemma4Attention,
     Gemma4DecoderLayer,
     Gemma4ForCausalLM,
@@ -35,7 +42,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Small test configs

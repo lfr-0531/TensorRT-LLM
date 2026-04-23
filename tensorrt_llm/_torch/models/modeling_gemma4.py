@@ -19,8 +19,9 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import transformers
+from packaging.version import Version
 from torch import nn
-from transformers import Gemma4TextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
@@ -47,6 +48,16 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+
+_MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
+if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
+    raise ImportError(
+        f"Gemma4 requires transformers>={_MIN_TRANSFORMERS_FOR_GEMMA4}, "
+        f"but found transformers=={transformers.__version__}. "
+        f"Please upgrade: pip install 'transformers>={_MIN_TRANSFORMERS_FOR_GEMMA4}'"
+    )
+
+from transformers import Gemma4TextConfig  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

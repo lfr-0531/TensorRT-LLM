@@ -26,8 +26,9 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import transformers
+from packaging.version import Version
 from torch import nn
-from transformers import AutoModel, AutoTokenizer, Gemma4Config, PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 
@@ -49,6 +50,22 @@ from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+_MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
+if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
+    raise ImportError(
+        f"Gemma4 requires transformers>={_MIN_TRANSFORMERS_FOR_GEMMA4}, "
+        f"but found transformers=={transformers.__version__}. "
+        f"Please upgrade: pip install 'transformers>={_MIN_TRANSFORMERS_FOR_GEMMA4}'"
+    )
+
+from transformers import (  # noqa: E402
+    AutoModel,
+    AutoTokenizer,
+    Gemma4Config,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -1073,3 +1073,10 @@ class NemotronHMTP(nn.Module):
                 lora_params=lora_params,
             )
         return hidden_states
+
+
+try:
+    AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)
+except ValueError:
+    # Already registered natively (transformers>=5)
+    pass

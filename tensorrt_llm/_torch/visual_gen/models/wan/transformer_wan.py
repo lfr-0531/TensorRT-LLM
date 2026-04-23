@@ -17,10 +17,13 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-
-# get_parameter_device removed in transformers 5.x
-def get_parameter_device(module):
-    return next(module.parameters()).device
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
 
 
 # =========================================================================

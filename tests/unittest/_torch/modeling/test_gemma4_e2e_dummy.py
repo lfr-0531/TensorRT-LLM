@@ -28,6 +28,15 @@ import shutil
 import tempfile
 
 import pytest
+import transformers
+from packaging.version import Version
+
+# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
+# Applied per-test so unrelated helpers in this module can still be collected.
+requires_gemma4_transformers = pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.0"),
+    reason="Gemma4 requires transformers>=5.5.0",
+)
 
 # Models root: use LLM_MODELS_ROOT env var, with fallback for local dev
 _LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT")
@@ -168,6 +177,7 @@ def _make_dummy_config_dir(
 # ---------------------------------------------------------------------------
 
 
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("26B"), reason="gemma-4-26B-A4B-it not found")
 def test_e2e_text_26b_dummy():
     """E2E text generation for 26B-A4B (MoE + K=V + softcap + hybrid attn)."""
@@ -184,6 +194,7 @@ def test_e2e_text_26b_dummy():
         shutil.rmtree(dummy_dir, ignore_errors=True)
 
 
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("E2B"), reason="gemma-4-E2B-it not found")
 def test_e2e_text_e2b_dummy():
     """E2E text generation for E2B (KV sharing + PLE + double-wide MLP)."""
@@ -200,6 +211,7 @@ def test_e2e_text_e2b_dummy():
         shutil.rmtree(dummy_dir, ignore_errors=True)
 
 
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("31B"), reason="gemma-4-31B-it not found")
 def test_e2e_text_31b_dummy():
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""
@@ -216,6 +228,7 @@ def test_e2e_text_31b_dummy():
         shutil.rmtree(dummy_dir, ignore_errors=True)
 
 
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("E4B"), reason="gemma-4-E4B-it not found")
 def test_e2e_text_e4b_dummy():
     """E2E text generation for E4B (KV sharing + hybrid attn)."""
@@ -237,6 +250,7 @@ def test_e2e_text_e4b_dummy():
 # ---------------------------------------------------------------------------
 
 
+@requires_gemma4_transformers
 @pytest.mark.skipif(not _model_available("26B"), reason="gemma-4-26B-A4B-it not found")
 def test_e2e_multimodal_26b_dummy():
     """E2E multimodal: image → vision tower → embedder → LLM → output."""

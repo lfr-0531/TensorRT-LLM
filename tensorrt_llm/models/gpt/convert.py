@@ -41,9 +41,6 @@ from ..convert_utils import (generate_int8, get_weight, get_weight_and_bias,
                              retrieved_layer_index_from_name, smooth_gemm)
 from .config import GPTConfig
 
-# AutoModelForVision2Seq was removed in transformers 5.x
-AutoModelForVision2Seq = None
-
 
 def rename_keys(model_state, layer_rename_config: Dict[str, str]):
     if not layer_rename_config:
@@ -912,6 +909,10 @@ def quantize(hf_model_dir: str,
 
 def load_hf_gpt(model_dir: str, load_model_on_cpu: bool = False):
     if 'kosmos-2' in model_dir:
+        # AutoModelForVision2Seq was removed in transformers 5.x; import lazily
+        # so `import tensorrt_llm` works under newer transformers versions even
+        # though kosmos-2 conversion itself still requires transformers<5.
+        from transformers import AutoModelForVision2Seq
         hf_model = AutoModelForVision2Seq.from_pretrained(
             model_dir, trust_remote_code=True)
     else:

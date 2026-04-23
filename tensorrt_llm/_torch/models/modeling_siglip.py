@@ -11,18 +11,9 @@ from tensorrt_llm._utils import prefer_pinned
 from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
-from .modeling_clip import CLIPEncoder
+from .modeling_clip import (CLIPEncoder, get_parameter_device,
+                            get_parameter_dtype)
 from .modeling_utils import _load_weights_impl, register_auto_model
-
-
-# get_parameter_device/dtype removed in transformers 5.x
-def get_parameter_device(module):
-    return next(module.parameters()).device
-
-
-def get_parameter_dtype(module):
-    return next(module.parameters()).dtype
-
 
 SiglipEncoder = CLIPEncoder
 

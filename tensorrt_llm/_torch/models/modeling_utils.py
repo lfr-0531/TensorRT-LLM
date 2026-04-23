@@ -747,6 +747,12 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
 
 
+_GEMMA4_ARCHITECTURES = (
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+)
+
+
 def get_model_architecture(
         model_config: TConfig) -> Tuple[Type[nn.Module], str]:
     cls = None
@@ -757,8 +763,13 @@ def get_model_architecture(
         raise RuntimeError(f"Model architecture is not provided.")
 
     if cls is None:
-        raise RuntimeError(
-            f"Unknown model architecture: {model_config.architectures[0]}")
+        arch = model_config.architectures[0]
+        if arch in _GEMMA4_ARCHITECTURES:
+            raise RuntimeError(
+                f"Gemma4 model support requires transformers>=5.5.0, "
+                f"please upgrade: pip install 'transformers>=5.5.0' "
+                f"(architecture: {arch}).")
+        raise RuntimeError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 

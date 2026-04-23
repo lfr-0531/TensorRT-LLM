@@ -12,6 +12,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     PositionalEmbeddingParams,
@@ -42,12 +43,21 @@ from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 # fmt: off
 # TODO: Remove this once we have a proper transformers package
-from transformers import PretrainedConfig  # isort: skip
+from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
 class ExaoneMoEConfig(PretrainedConfig):
     model_type = "exaone_moe"
 
-# exaone_moe is natively supported in transformers 5.x; skip manual registration.
+try:
+    AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
+    logger.warning_once(
+        "transformers does not support 'ExaoneMoEConfig'. "
+        "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
+        key="EXAONE_MOE_REGISTER_WARNING",
+    )
+except ValueError:
+    # Already registered natively (transformers>=5)
+    pass
 # End of the config register.
 # fmt: on
 

@@ -24,7 +24,9 @@ from tensorrt_llm.evaluate.lm_eval import LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER, Mul
 from tensorrt_llm.inputs.content_format import ContentFormat
 
 
-def _make_wrapper(model_type: str = "gemma4") -> MultimodalLmEvalWrapper:
+# Uses ``gemma3`` by default because it is always registered regardless of
+# transformers version; the wrapper's interleave logic itself is generic.
+def _make_wrapper(model_type: str = "gemma3") -> MultimodalLmEvalWrapper:
     fake_llm = MagicMock()
     fake_llm.tokenizer = MagicMock()
     fake_llm.input_processor = MagicMock()

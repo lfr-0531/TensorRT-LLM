@@ -20,15 +20,22 @@ and Gemma4InputProcessor with HF reference comparison.
 
 import unittest
 
+import pytest
 import torch
-from transformers import AutoModel, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_gemma4mm import (
+# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
+pytest.importorskip(
+    "transformers", minversion="5.5.0", reason="Gemma4 requires transformers>=5.5.0"
+)
+
+from transformers import AutoModel, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig  # noqa: E402
+
+from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
+from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # Small vision config for testing
 SMALL_VISION_CONFIG = {
