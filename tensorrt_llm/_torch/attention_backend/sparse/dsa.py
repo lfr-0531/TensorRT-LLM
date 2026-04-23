@@ -56,8 +56,9 @@ def _compute_slot_mappings(
     head_dim: int,
     tokens_per_block: int,
     quant_block_size: int,
+    data_bytes_per_token: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute flat byte indices for FP8 data and scales from global token positions.
+    """Compute flat byte indices for indexer K data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
     duplicating the slot mapping arithmetic.
@@ -66,16 +67,23 @@ def _compute_slot_mappings(
         global_positions: Per-token absolute position in the KV sequence.
         block_offsets: [num_seqs, max_blocks_per_seq] block offset table.
         req_indices: Per-token request index.
-        head_dim: Indexer head dimension.
+        head_dim: Indexer head dimension (used for the scale-size formula).
         tokens_per_block: Tokens stored per cache block.
         quant_block_size: Quantization block size.
+        data_bytes_per_token: Bytes of quantized data per token in the cache
+            pool. FP8 stores one byte per element (= head_dim). FP4 packs two
+            E2M1 codes per byte (= head_dim // 2). Defaults to ``head_dim``
+            when unset, preserving the FP8 layout for callers that haven't
+            threaded the FP4 dtype through.
 
     Returns:
         (fp8_indices, scale_indices): Flat byte offsets into the cache pool.
     """
+    if data_bytes_per_token is None:
+        data_bytes_per_token = head_dim
     scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
-    block_stride = tokens_per_block * (head_dim + scale_size)
-    scale_base_offset = tokens_per_block * head_dim
+    block_stride = tokens_per_block * (data_bytes_per_token + scale_size)
+    scale_base_offset = tokens_per_block * data_bytes_per_token
 
     block_indices_in_seq = global_positions // tokens_per_block
     pos_in_blocks = global_positions % tokens_per_block
@@ -91,7 +99,7 @@ def _compute_slot_mappings(
 
     block_ids = block_offsets[req_indices, block_indices_in_seq].to(torch.int64)
 
-    fp8_indices = block_ids * block_stride + pos_in_blocks * head_dim
+    fp8_indices = block_ids * block_stride + pos_in_blocks * data_bytes_per_token
     scale_indices = (block_ids * block_stride + scale_base_offset +
                      pos_in_blocks * scale_size)
     return fp8_indices, scale_indices
@@ -981,13 +989,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
+            # Under FP4 the indexer cache stores two E2M1 codes per byte, so
+            # the per-token data footprint is head_dim // 2; otherwise it is
+            # head_dim (one FP8 byte per element). Feed the real byte count
+            # into _compute_slot_mappings so scatter/gather see offsets that
+            # match the pool layout produced by createIndexerKCachePools.
+            use_fp4 = getattr(self.kv_cache_manager, 'use_fp4', False)
+            index_head_dim = self.kv_cache_manager.index_head_dim
+            data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
             fp8_indices, scale_indices = _compute_slot_mappings(
                 global_positions,
                 self.indexer_k_cache_block_offsets,
                 req_indices,
-                self.kv_cache_manager.index_head_dim,
+                index_head_dim,
                 self.kv_cache_manager.tokens_per_block,
                 self.kv_cache_manager.quant_block_size,
+                data_bytes_per_token=data_bytes_per_token,
             )
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
             self.slot_mapping_scale[:self.num_tokens] = scale_indices
@@ -1287,6 +1304,9 @@ class Indexer(nn.Module):
         head_dim = kv_cache_manager.index_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         quant_block_size = kv_cache_manager.quant_block_size
+        use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
+        # FP4 packs two E2M1 codes per byte; FP8 stores one byte per element.
+        data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         total_tokens = seq_lens.sum().item()
 
@@ -1310,6 +1330,7 @@ class Indexer(nn.Module):
             head_dim,
             tokens_per_block,
             quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
         )
 
         metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
@@ -1434,10 +1455,12 @@ class Indexer(nn.Module):
         if _need_full_kv_gathering:
             head_dim = kv_cache_manager.index_head_dim
             quant_block_size = kv_cache_manager.quant_block_size
+            use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
+            data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
             cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
             scale_size = head_dim // quant_block_size * 4
-            tokens_per_block * (head_dim + scale_size)
-            tokens_per_block * head_dim
+            tokens_per_block * (data_bytes_per_token + scale_size)
+            tokens_per_block * data_bytes_per_token
             start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
@@ -1466,6 +1489,7 @@ class Indexer(nn.Module):
                 head_dim,
                 tokens_per_block,
                 quant_block_size,
+                data_bytes_per_token=data_bytes_per_token,
             )
 
             host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
