@@ -115,7 +115,8 @@ public:
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
             && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType
-            && mRnnCacheState == other.mRnnCacheState && mHasIndexerKCache == other.mHasIndexerKCache
+            && mRnnCacheState == other.mRnnCacheState && mEnableBlockReuse == other.mEnableBlockReuse
+            && mEnablePartialReuse == other.mEnablePartialReuse && mHasIndexerKCache == other.mHasIndexerKCache
             && mIndexerDimPerHead == other.mIndexerDimPerHead
             && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
             && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;

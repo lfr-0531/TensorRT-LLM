@@ -18,6 +18,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAGuard.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,6 +29,12 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp4(at::Tensor const& pe, at::Tenso
 {
     CHECK_TH_CUDA(pe);
     CHECK_TH_CUDA(nope);
+    TORCH_CHECK(pe.device() == nope.device(), "pe and nope must be on the same CUDA device; got pe=", pe.device(),
+        ", nope=", nope.device());
+    // Scope subsequent CUDA calls (empty_cuda, getCurrentCUDAStream, kernel
+    // launch) to pe.device() so a caller whose current device differs cannot
+    // cross-dereference the raw data pointers.
+    c10::cuda::CUDAGuard deviceGuard{pe.device()};
 
     TORCH_CHECK(pe.scalar_type() == at::ScalarType::BFloat16, "pe must be BF16, got ", pe.scalar_type());
     TORCH_CHECK(nope.scalar_type() == at::ScalarType::BFloat16, "nope must be BF16, got ", nope.scalar_type());

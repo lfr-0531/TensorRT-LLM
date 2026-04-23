@@ -28,10 +28,12 @@ import tensorrt_llm  # noqa: F401
 
 try:
     from tensorrt_llm import deep_gemm
-
-    HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
-except Exception:
+except ImportError:
+    # Only skip on actual module-missing failures — any other error should
+    # surface rather than silently turn into a test-wide skip.
     HAS_DEEP_GEMM = False
+else:
+    HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
 import sys
 from pathlib import Path
