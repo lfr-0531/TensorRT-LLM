@@ -163,11 +163,7 @@ class MMLU(Evaluator):
         return f"{workspace}/data"
 
     def format_subject(self, subject):
-        line = subject.split("_")
-        s = ""
-        for entry in line:
-            s += " " + entry
-        return s
+        return subject.replace("_", " ")
 
     def format_example(self, df, idx, include_answer=True):
         prompt = df.iloc[idx, 0]
