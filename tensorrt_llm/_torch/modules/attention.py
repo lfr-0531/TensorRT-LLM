@@ -1060,11 +1060,11 @@ def _mla_dsa_proj_fake(
         q_fp8 = hidden_states.new_empty(
             [num_tokens, indexer.n_heads, indexer.head_dim // 2],
             dtype=torch.int8)
-        k_fp8 = hidden_states.new_empty(
-            [num_tokens, indexer.head_dim // 2], dtype=torch.int8)
+        k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim // 2],
+                                        dtype=torch.int8)
         k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.int32)
-        q_scale = hidden_states.new_empty(
-            [num_tokens, indexer.n_heads, 1], dtype=torch.int32)
+        q_scale = hidden_states.new_empty([num_tokens, indexer.n_heads, 1],
+                                          dtype=torch.int32)
     else:
         q_fp8 = hidden_states.new_empty(
             [num_tokens, indexer.n_heads, indexer.head_dim],
