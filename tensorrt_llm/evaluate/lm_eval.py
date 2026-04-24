@@ -1313,3 +1313,239 @@ class LongBenchV1(LmEvalEvaluator):
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
+
+
+class AIME2026(LmEvalEvaluator):
+    """AIME 2026 no-tools (30 problems, MathArena/aime_2026).
+
+    Task yaml + process_results utilities live under
+    ``tensorrt_llm/evaluate/lm_eval_tasks/aime/`` since upstream lm-eval does
+    not ship an ``aime26`` task as of writing. ``LmEvalEvaluator`` passes
+    ``include_path`` for that directory to the lm-eval ``TaskManager`` so the
+    local yaml is discoverable alongside upstream tasks.
+
+    "no tools" = no code interpreter / calculator, which is the default for
+    lm-eval generate_until tasks. As with aime25, the harness yaml is greedy
+    / single-sample; pass ``--temperature``/``--top_p``/``--top_k`` with
+    multiple ``--sampling_seed`` runs to approximate model-card avg@k.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("aime26", **kwargs)
+
+    @click.command("aime26")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to AIME 2026 dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub "
+                  "(MathArena/aime_2026).")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help=
+        "Number of samples to run the evaluation; None means full dataset (30)."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  type=click.BOOL,
+                  default=True,
+                  show_default=True,
+                  help="Whether to apply chat template. Default True — "
+                  "AIME is generation+chat-tuned-model, raw completion-style "
+                  "prompt typically degenerates on instruct models.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default='{"thinking_budget": 32768}',
+        show_default=True,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help='Chat template kwargs as JSON string. Default enables Gemma-style '
+        'thinking with a 32k budget (set thinking_budget to 0 to disable '
+        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
+        'templates).')
+    @click.option("--fewshot_as_multiturn",
+                  is_flag=True,
+                  default=False,
+                  help="Apply fewshot as multiturn.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=32768,
+                  show_default=True,
+                  help="Maximum generation length "
+                  "(AIME is long-CoT; upstream yaml uses max_gen_toks=32768). "
+                  "Must fit within trtllm-eval --max_seq_len = "
+                  "max_input_length + max_output_length.")
+    @click.option("--temperature",
+                  type=float,
+                  default=1.0,
+                  show_default=True,
+                  help="Sampling temperature. Default matches the Gemma 4 "
+                  "recommended recipe (temperature=1.0); overrides task yaml "
+                  "gen_kwargs (which is greedy). Pass --temperature 0 to "
+                  "reproduce the lm-eval greedy leaderboard score.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=0.95,
+        show_default=True,
+        help="Nucleus sampling top_p. Default 0.95 per Gemma 4 recipe. "
+        "Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=64,
+                  show_default=True,
+                  help="Top-k sampling. Default 64 per Gemma 4 recipe. "
+                  "Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling "
+                  "(per-request; does not affect dataset order).")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        if kwargs.get("fewshot_as_multiturn", False):
+            assert kwargs.get(
+                "apply_chat_template", False
+            ), "apply_chat_template must be True when fewshot_as_multiturn is True"
+        AIME2026.command_harness(ctx, **kwargs)
+
+
+class AIME2025(LmEvalEvaluator):
+    """AIME 2025 (30 problems) via upstream lm-evaluation-harness ``aime25`` task.
+
+    Defaults to the harness's greedy / single-sample recipe, which matches the
+    lm-eval leaderboard. To reproduce model-card style avg@k scores, pass
+    ``--temperature``/``--top_p``/``--top_k`` (sampling_override=True) and run
+    multiple times with different ``--sampling_seed`` values, then average.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("aime25", **kwargs)
+
+    @click.command("aime25")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to AIME 2025 dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub "
+                  "(math-ai/aime25).")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help=
+        "Number of samples to run the evaluation; None means full dataset (30)."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  type=click.BOOL,
+                  default=True,
+                  show_default=True,
+                  help="Whether to apply chat template. Default True — "
+                  "AIME is generation+chat-tuned-model, raw completion-style "
+                  "prompt typically degenerates on instruct models.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default='{"thinking_budget": 32768}',
+        show_default=True,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help='Chat template kwargs as JSON string. Default enables Gemma-style '
+        'thinking with a 32k budget (set thinking_budget to 0 to disable '
+        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
+        'templates).')
+    @click.option("--fewshot_as_multiturn",
+                  is_flag=True,
+                  default=False,
+                  help="Apply fewshot as multiturn.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=32768,
+                  show_default=True,
+                  help="Maximum generation length "
+                  "(AIME is long-CoT; upstream yaml uses max_gen_toks=32768). "
+                  "Must fit within trtllm-eval --max_seq_len = "
+                  "max_input_length + max_output_length.")
+    @click.option("--temperature",
+                  type=float,
+                  default=1.0,
+                  show_default=True,
+                  help="Sampling temperature. Default matches the Gemma 4 "
+                  "recommended recipe (temperature=1.0); overrides task yaml "
+                  "gen_kwargs (which is greedy). Pass --temperature 0 to "
+                  "reproduce the lm-eval greedy leaderboard score.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=0.95,
+        show_default=True,
+        help="Nucleus sampling top_p. Default 0.95 per Gemma 4 recipe. "
+        "Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=64,
+                  show_default=True,
+                  help="Top-k sampling. Default 64 per Gemma 4 recipe. "
+                  "Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling "
+                  "(per-request; does not affect dataset order).")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        if kwargs.get("fewshot_as_multiturn", False):
+            assert kwargs.get(
+                "apply_chat_template", False
+            ), "apply_chat_template must be True when fewshot_as_multiturn is True"
+        AIME2025.command_harness(ctx, **kwargs)

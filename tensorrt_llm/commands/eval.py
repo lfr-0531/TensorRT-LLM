@@ -20,9 +20,9 @@ import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
-from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, CoVoST2, GPQADiamond,
-                        GPQAExtended, GPQAMain, JsonModeEval, LongBenchV1,
-                        LongBenchV2, MMMUPro)
+from ..evaluate import (AIME2025, AIME2026, GSM8K, MMLU, MMMU, CnnDailymail,
+                        CoVoST2, GPQADiamond, GPQAExtended, GPQAMain,
+                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro)
 from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
@@ -213,6 +213,8 @@ main.add_command(MMMUPro.command)
 main.add_command(CoVoST2.command)
 main.add_command(LongBenchV1.command)
 main.add_command(LongBenchV2.command)
+main.add_command(AIME2025.command)
+main.add_command(AIME2026.command)
 
 if __name__ == "__main__":
     main()
