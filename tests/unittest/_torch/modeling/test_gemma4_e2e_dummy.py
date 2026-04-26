@@ -38,13 +38,11 @@ requires_gemma4_transformers = pytest.mark.skipif(
     reason="Gemma4 requires transformers>=5.5.0",
 )
 
-# Models root: use LLM_MODELS_ROOT env var, with fallback for local dev
+# Models root: require LLM_MODELS_ROOT env var (skip module if unset).
 _LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT")
-_GEMMA4_MODELS = (
-    os.path.join(_LLM_MODELS_ROOT, "gemma4")
-    if _LLM_MODELS_ROOT
-    else "/home/scratch.fanrongl_coreai/models/gemma4"
-)
+if _LLM_MODELS_ROOT is None:
+    pytest.skip("LLM_MODELS_ROOT not set", allow_module_level=True)
+_GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma4")
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {

@@ -91,8 +91,7 @@ def _get_model_path():
     llm_models_root = os.environ.get("LLM_MODELS_ROOT")
     if llm_models_root:
         return os.path.join(llm_models_root, "gemma4/gemma-4-26B-A4B-it")
-    # Fallback for local development
-    return "/home/scratch.fanrongl_coreai/models/gemma4/gemma-4-26B-A4B-it"
+    return None
 
 
 MODEL_26B_PATH = _get_model_path()
@@ -101,6 +100,8 @@ MODEL_26B_PATH = _get_model_path()
 def _model_available():
     import os
 
+    if MODEL_26B_PATH is None:
+        return False
     return os.path.isfile(os.path.join(MODEL_26B_PATH, "config.json"))
 
 
