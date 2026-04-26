@@ -49,6 +49,15 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --tensorrt --polygraphy --mpi4py --pytorch --opencv
 
+# Install nvidia-cutlass-dsl with the CUDA-version-specific extra (cu12/cu13).
+# Must run after pytorch install since the script reads torch.version.cuda.
+# requirements.txt pins the version (==4.4.2) but cannot specify the extra,
+# so a later `pip install -r requirements.txt` finds the version satisfied
+# and skips, preserving the [cu12]/[cu13] libs installed here.
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    --mount=type=cache,target=/root/.cache/pip \
+    bash /opt/docker/common/install_cutlass_dsl.sh
+
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
