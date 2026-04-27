@@ -13,6 +13,10 @@ def is_gemma4_hybrid(config):
             and global_head_dim != head_dim)
 
 
+def is_hybrid_linear(config):
+    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+
+
 def is_nemotron_hybrid(config):
     if hasattr(config, "hybrid_override_pattern"
                ) and config.hybrid_override_pattern is not None and len(

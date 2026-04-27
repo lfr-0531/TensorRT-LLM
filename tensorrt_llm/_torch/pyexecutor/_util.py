@@ -30,13 +30,14 @@ from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (get_qwen3_hybrid_layer_masks, is_gemma4_hybrid,
-                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
+                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -62,7 +63,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
+    elif is_hybrid_linear(config):
         return MambaHybridCacheManager
     else:
         # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
@@ -99,6 +100,7 @@ class KvCacheCreator:
         speculative_config: SpeculativeConfig,
         sparse_attention_config: SparseAttentionConfig,
         profiling_stage_data: Optional[dict],
+        is_disagg: bool,
         execution_stream: Optional[torch.cuda.Stream] = None,
         draft_config: Optional[ModelConfig] = None,
         skip_est: bool = False,
@@ -122,6 +124,7 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
+        self._is_disagg = is_disagg
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)
@@ -610,6 +613,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -752,6 +756,7 @@ class KvCacheCreator:
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
+            is_disagg=self._is_disagg,
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
@@ -915,6 +920,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        is_disagg: bool = False,
         estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -1079,7 +1085,7 @@ def _create_kv_cache_manager(
             # - If layer_mask[i] is True, include layer i
             # - For layers beyond hybrid_override_pattern, treat them as attention layers
             pattern_len = len(config.hybrid_override_pattern)
-            hybrid_layer_mask = []
+            full_attention_layer_mask = []
             mamba_layer_mask = []
             for i, include in enumerate(layer_mask):
                 if i < pattern_len:
@@ -1090,13 +1096,14 @@ def _create_kv_cache_manager(
                     # Beyond the pattern (e.g., MTP/draft layers), treat as attention-only
                     is_attention = True
                     is_mamba = False
-                hybrid_layer_mask.append(is_attention and include)
+                full_attention_layer_mask.append(is_attention and include)
                 mamba_layer_mask.append(is_mamba and include)
-            num_layers = sum(hybrid_layer_mask)
+            num_full_attention_layers = sum(full_attention_layer_mask)
             mamba_num_layers = sum(mamba_layer_mask)
         else:
-            num_layers = config.hybrid_override_pattern.count("*")
-            hybrid_layer_mask = [
+            num_full_attention_layers = config.hybrid_override_pattern.count(
+                "*")
+            full_attention_layer_mask = [
                 char == "*" for char in config.hybrid_override_pattern
             ]
             mamba_num_layers = config.hybrid_override_pattern.count("M")
@@ -1112,9 +1119,9 @@ def _create_kv_cache_manager(
                 from ..speculative.utils import get_num_spec_layers
                 num_spec_layers = get_num_spec_layers(spec_config)
                 if num_spec_layers > 0:
-                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    full_attention_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
-                    num_layers += num_spec_layers
+                    num_full_attention_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1127,11 +1134,12 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1153,9 +1161,9 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
-        hybrid_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
+        full_attention_layer_mask, mamba_layer_mask = get_qwen3_hybrid_layer_masks(
             config)
-        # For hybrid models, hybrid_layer_mask is always passed as
+        # For hybrid models, full_attention_layer_mask is always passed as
         # layer_mask to KVCacheManager, which means get_pp_layers
         # sees a non-None layer_mask and won't auto-add spec layers.
         # Extend the masks here to include MTP spec layers (full
@@ -1164,9 +1172,9 @@ def _create_kv_cache_manager(
             from ..speculative.utils import get_num_spec_layers
             num_spec_layers = get_num_spec_layers(spec_config)
             if num_spec_layers > 0:
-                hybrid_layer_mask.extend([True] * num_spec_layers)
+                full_attention_layer_mask.extend([True] * num_spec_layers)
                 mamba_layer_mask.extend([False] * num_spec_layers)
-        num_layers = sum(hybrid_layer_mask)
+        num_full_attention_layers = sum(full_attention_layer_mask)
         num_mamba_layers = sum(mamba_layer_mask)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -1180,11 +1188,12 @@ def _create_kv_cache_manager(
             config.torch_dtype,
             quant_config.mamba_ssm_cache_dtype
             if quant_config is not None else None,
+            is_disagg,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            layer_mask=hybrid_layer_mask,
+            num_layers=num_full_attention_layers,
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -1204,7 +1213,9 @@ def _create_kv_cache_manager(
         binding_model_config = None
         if is_vswa and kv_cache_manager_cls.__name__ == "KVCacheManager":
             binding_model_config = _model_config.get_bindings_model_config(
-                tokens_per_block=tokens_per_block)
+                tokens_per_block=tokens_per_block,
+                kv_cache_config=kv_cache_config,
+                spec_config=spec_config)
 
         # KVCacheManager (V1) doesn't support per-layer head_dim lists;
         # use max for estimation. KVCacheManagerV2 handles lists natively.
@@ -1277,7 +1288,8 @@ def create_py_executor_instance(
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-
+    is_disagg = (cache_transceiver_config is not None
+                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -1301,7 +1313,7 @@ def create_py_executor_instance(
                 )
 
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
-        )
+            is_disagg=is_disagg)
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
@@ -1497,7 +1509,7 @@ def create_py_executor_instance(
 
     # For hybrid models, this has both impl and mamba_impl
     mamba_cache_manager = None
-    if isinstance(kv_cache_manager, MambaHybridCacheManager):
+    if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
