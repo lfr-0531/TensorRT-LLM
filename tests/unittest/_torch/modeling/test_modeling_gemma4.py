@@ -590,87 +590,92 @@ GEMMA4_26B_REAL_DIMS_CONFIG = {
 }
 
 
+def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, batch_size=1):
+    """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
+
+    Mirrors ``Gemma4Attention``'s layout (global kv heads only for K=V layers)
+    and the ``_util.py::is_gemma4_hybrid`` VSWA pool grouping so the page
+    sizes line up with what the model actually requests at runtime.
+    """
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
+
+    dtype = config.torch_dtype
+    if dtype == torch.half:
+        kv_dtype = tensorrt_llm.bindings.DataType.HALF
+    else:
+        kv_dtype = tensorrt_llm.bindings.DataType.BF16
+
+    layer_types = config.layer_types
+    attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
+    head_dim_per_layer = []
+    num_kv_heads_per_layer = []
+    for lt in layer_types:
+        is_sliding = lt == "sliding_attention"
+        use_k_eq_v = attention_k_eq_v and not is_sliding
+        if is_sliding:
+            head_dim_per_layer.append(config.head_dim)
+            num_kv_heads_per_layer.append(config.num_key_value_heads)
+        else:
+            head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
+            if use_k_eq_v:
+                num_kv_heads_per_layer.append(
+                    getattr(config, "num_global_key_value_heads", None)
+                    or config.num_key_value_heads
+                )
+            else:
+                num_kv_heads_per_layer.append(config.num_key_value_heads)
+
+    # Use scalar if all layers have same value
+    head_dim = head_dim_per_layer if len(set(head_dim_per_layer)) > 1 else head_dim_per_layer[0]
+    num_kv_heads = (
+        num_kv_heads_per_layer
+        if len(set(num_kv_heads_per_layer)) > 1
+        else num_kv_heads_per_layer[0]
+    )
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    max_seq_len = num_blocks * tokens_per_block
+
+    # Set per-layer max_attention_window when head_dim or kv_heads differ
+    # across layers, so V2 creates separate pool groups for different page
+    # sizes.  ``max_seq_len - 1`` on sliding layers prevents V2 block
+    # eviction that would cause FlashInfer page index OOB when kv_lens
+    # exceeds sliding_window.
+    sliding_window = getattr(config, "sliding_window", None)
+    max_attn_window = None
+    needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
+    if not needs_vswa:
+        needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
+    if needs_vswa and sliding_window:
+        max_attn_window = [
+            max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
+        ]
+
+    kv_cache_config = KvCacheConfigV2(
+        max_tokens=num_blocks * tokens_per_block,
+        enable_block_reuse=False,
+        max_attention_window=max_attn_window,
+    )
+    return KVCacheManagerV2(
+        kv_cache_config,
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=config.num_hidden_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=kv_dtype,
+    )
+
+
 class TestGemma4HFComparison(unittest.TestCase):
     """Compare TRT-LLM Gemma4 outputs against HuggingFace reference."""
 
-    def _get_kv_cache_manager(self, config, num_blocks=4, tokens_per_block=32, batch_size=1):
-        """Create KVCacheManagerV2 supporting per-layer head_dim."""
-        import tensorrt_llm
-        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
-        from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
-
-        dtype = config.torch_dtype
-        if dtype == torch.half:
-            kv_dtype = tensorrt_llm.bindings.DataType.HALF
-        else:
-            kv_dtype = tensorrt_llm.bindings.DataType.BF16
-
-        # Build per-layer head_dim and num_kv_heads lists
-        # (must match Gemma4Attention logic: global kv heads only for K=V layers)
-        layer_types = config.layer_types
-        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
-        head_dim_per_layer = []
-        num_kv_heads_per_layer = []
-        for lt in layer_types:
-            is_sliding = lt == "sliding_attention"
-            use_k_eq_v = attention_k_eq_v and not is_sliding
-            if is_sliding:
-                head_dim_per_layer.append(config.head_dim)
-                num_kv_heads_per_layer.append(config.num_key_value_heads)
-            else:
-                head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
-                if use_k_eq_v:
-                    num_kv_heads_per_layer.append(
-                        getattr(config, "num_global_key_value_heads", None)
-                        or config.num_key_value_heads
-                    )
-                else:
-                    num_kv_heads_per_layer.append(config.num_key_value_heads)
-
-        # Use scalar if all layers have same value
-        unique_hd = set(head_dim_per_layer)
-        head_dim = head_dim_per_layer if len(unique_hd) > 1 else head_dim_per_layer[0]
-        unique_kv = set(num_kv_heads_per_layer)
-        num_kv_heads = num_kv_heads_per_layer if len(unique_kv) > 1 else num_kv_heads_per_layer[0]
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        max_seq_len = num_blocks * tokens_per_block
-
-        # Set per-layer max_attention_window when head_dim or kv_heads differ
-        # across layers, so V2 creates separate pool groups for different page
-        # sizes (same logic as _util.py::is_gemma4_hybrid).
-        sliding_window = getattr(config, "sliding_window", None)
-        max_attn_window = None
-        needs_vswa = False
-        if isinstance(head_dim, list) and len(set(head_dim)) > 1:
-            needs_vswa = True
-        if isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1:
-            needs_vswa = True
-        if needs_vswa and sliding_window:
-            # Use max_seq_len - 1 for sliding layers (same as _util.py fix)
-            # to prevent V2 block eviction that would cause FlashInfer
-            # page index OOB when kv_lens > sliding_window.
-            max_attn_window = [
-                max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
-            ]
-
-        kv_cache_config = KvCacheConfigV2(
-            max_tokens=num_blocks * tokens_per_block,
-            enable_block_reuse=False,
-            max_attention_window=max_attn_window,
-        )
-        return KVCacheManagerV2(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_dtype,
-        )
+    _get_kv_cache_manager = staticmethod(_build_gemma4_kv_cache_manager)
 
     def _assert_most_elems_close(self, actual, ref, atol=0.5, rtol=0.5, max_failed_frac=0.01):
         matches = torch.isclose(actual, ref, atol=atol, rtol=rtol)
@@ -2063,72 +2068,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
 class TestGemma4CUDAGraph(unittest.TestCase):
     """Tests for Gemma4 attention with CUDA graph capture/replay."""
 
-    def _get_kv_cache_manager(self, config, num_blocks=2, tokens_per_block=32, batch_size=4):
-        """Create KVCacheManagerV2 with per-layer head_dim (VSWA)."""
-        import tensorrt_llm
-        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
-        from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
-
-        dtype = config.torch_dtype
-        if dtype == torch.half:
-            kv_dtype = tensorrt_llm.bindings.DataType.HALF
-        else:
-            kv_dtype = tensorrt_llm.bindings.DataType.BF16
-
-        layer_types = config.layer_types
-        attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
-        head_dim_per_layer = []
-        num_kv_heads_per_layer = []
-        for lt in layer_types:
-            is_sliding = lt == "sliding_attention"
-            use_k_eq_v = attention_k_eq_v and not is_sliding
-            if is_sliding:
-                head_dim_per_layer.append(config.head_dim)
-                num_kv_heads_per_layer.append(config.num_key_value_heads)
-            else:
-                head_dim_per_layer.append(getattr(config, "global_head_dim", config.head_dim))
-                if use_k_eq_v:
-                    num_kv_heads_per_layer.append(
-                        getattr(config, "num_global_key_value_heads", None)
-                        or config.num_key_value_heads
-                    )
-                else:
-                    num_kv_heads_per_layer.append(config.num_key_value_heads)
-
-        unique_hd = set(head_dim_per_layer)
-        head_dim = head_dim_per_layer if len(unique_hd) > 1 else head_dim_per_layer[0]
-        unique_kv = set(num_kv_heads_per_layer)
-        num_kv_heads = num_kv_heads_per_layer if len(unique_kv) > 1 else num_kv_heads_per_layer[0]
-
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        max_seq_len = num_blocks * tokens_per_block
-        sliding_window = getattr(config, "sliding_window", None)
-        max_attn_window = None
-        needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
-        if not needs_vswa:
-            needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
-        if needs_vswa and sliding_window:
-            max_attn_window = [
-                max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
-            ]
-
-        kv_cache_config = KvCacheConfigV2(
-            max_tokens=num_blocks * tokens_per_block,
-            enable_block_reuse=False,
-            max_attention_window=max_attn_window,
-        )
-        return KVCacheManagerV2(
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_dtype,
-        )
+    _get_kv_cache_manager = staticmethod(_build_gemma4_kv_cache_manager)
 
     @torch.no_grad()
     @unittest.mock.patch(

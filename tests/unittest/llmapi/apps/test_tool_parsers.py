@@ -2697,99 +2697,112 @@ def _g4_s(val: str) -> str:
 class TestGemma4ParsingHelpers:
     """Tests for low-level Gemma4 format parsing functions."""
 
-    def test_find_matching_brace_simple(self):
-        assert _find_matching_brace("{hello}", 0) == 6
+    @pytest.mark.parametrize(
+        "text,start,expected",
+        [
+            ("{hello}", 0, 6),
+            ("{a:{b:1}}", 0, 8),
+            # Brace inside a string-delim'd value is ignored.
+            ('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}', 0,
+             len('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}') - 1),
+            # No matching closer => -1.
+            ("{incomplete", 0, -1),
+        ],
+        ids=["simple", "nested", "string_delim", "unmatched"],
+    )
+    def test_find_matching_brace(self, text, start, expected):
+        assert _find_matching_brace(text, start) == expected
 
-    def test_find_matching_brace_nested(self):
-        assert _find_matching_brace("{a:{b:1}}", 0) == 8
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (STRING_DELIM + "hello" + STRING_DELIM, "hello"),
+            ("42", 42),
+            ("3.14", 3.14),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        ],
+        ids=["string", "int", "float", "bool_true", "bool_false", "null"],
+    )
+    def test_parse_value(self, raw, expected):
+        assert _parse_gemma4_value(raw) == expected
 
-    def test_find_matching_brace_with_string_delim(self):
-        text = '{key:' + _g4_s('v{al}') + '}'
-        assert _find_matching_brace(text, 0) == len(text) - 1
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("[]", []),
+            (f'[{_g4_s("a")},{_g4_s("b")}]', ["a", "b"]),
+            (f'[{_g4_s("hello")},42,true]', ["hello", 42, True]),
+            (
+                f'[{{name:{_g4_s("Alice")}}},{{name:{_g4_s("Bob")}}}]',
+                [{
+                    "name": "Alice"
+                }, {
+                    "name": "Bob"
+                }],
+            ),
+        ],
+        ids=["empty", "strings", "mixed_types", "nested_objects"],
+    )
+    def test_parse_array(self, raw, expected):
+        assert _parse_gemma4_array(raw) == expected
 
-    def test_find_matching_brace_unmatched(self):
-        assert _find_matching_brace("{incomplete", 0) == -1
-
-    def test_parse_value_string(self):
-        assert _parse_gemma4_value(_g4_s("hello")) == "hello"
-
-    def test_parse_value_int(self):
-        assert _parse_gemma4_value("42") == 42
-
-    def test_parse_value_float(self):
-        assert _parse_gemma4_value("3.14") == 3.14
-
-    def test_parse_value_bool_true(self):
-        assert _parse_gemma4_value("true") is True
-
-    def test_parse_value_bool_false(self):
-        assert _parse_gemma4_value("false") is False
-
-    def test_parse_value_null(self):
-        assert _parse_gemma4_value("null") is None
-
-    def test_parse_array_empty(self):
-        assert _parse_gemma4_array("[]") == []
-
-    def test_parse_array_strings(self):
-        text = f'[{_g4_s("a")},{_g4_s("b")}]'
-        assert _parse_gemma4_array(text) == ["a", "b"]
-
-    def test_parse_array_mixed_types(self):
-        text = f'[{_g4_s("hello")},42,true]'
-        assert _parse_gemma4_array(text) == ["hello", 42, True]
-
-    def test_parse_array_nested_objects(self):
-        text = (f'[{{name:{_g4_s("Alice")}}},'
-                f'{{name:{_g4_s("Bob")}}}]')
-        assert _parse_gemma4_array(text) == [{"name": "Alice"}, {"name": "Bob"}]
-
-    def test_parse_args_single_string(self):
-        text = f'location:{_g4_s("Tokyo")}'
-        assert _parse_gemma4_args(text) == {"location": "Tokyo"}
-
-    def test_parse_args_multiple_values(self):
-        text = (f'location:{_g4_s("Tokyo")},'
-                f'unit:{_g4_s("celsius")}')
-        assert _parse_gemma4_args(text) == {
-            "location": "Tokyo",
-            "unit": "celsius",
-        }
-
-    def test_parse_args_mixed_types(self):
-        text = f'name:{_g4_s("test")},count:42,active:true'
-        assert _parse_gemma4_args(text) == {
-            "name": "test",
-            "count": 42,
-            "active": True,
-        }
-
-    def test_parse_args_nested_object(self):
-        text = (f'loc:{{city:{_g4_s("Tokyo")},'
-                f'country:{_g4_s("Japan")}}}')
-        assert _parse_gemma4_args(text) == {
-            "loc": {
-                "city": "Tokyo",
-                "country": "Japan"
-            },
-        }
-
-    def test_parse_args_with_array(self):
-        text = f'tags:[{_g4_s("a")},{_g4_s("b")}]'
-        assert _parse_gemma4_args(text) == {"tags": ["a", "b"]}
-
-    def test_parse_args_empty(self):
-        assert _parse_gemma4_args("") == {}
-
-    def test_parse_args_string_with_colon(self):
-        text = f'url:{_g4_s("http://example.com:8080")}'
-        assert _parse_gemma4_args(text) == {
-            "url": "http://example.com:8080",
-        }
-
-    def test_parse_args_string_with_braces(self):
-        text = 'tpl:' + _g4_s('Hello {name}')
-        assert _parse_gemma4_args(text) == {"tpl": "Hello {name}"}
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (f'location:{_g4_s("Tokyo")}', {
+                "location": "Tokyo"
+            }),
+            (
+                f'location:{_g4_s("Tokyo")},unit:{_g4_s("celsius")}',
+                {
+                    "location": "Tokyo",
+                    "unit": "celsius"
+                },
+            ),
+            (
+                f'name:{_g4_s("test")},count:42,active:true',
+                {
+                    "name": "test",
+                    "count": 42,
+                    "active": True
+                },
+            ),
+            (
+                f'loc:{{city:{_g4_s("Tokyo")},country:{_g4_s("Japan")}}}',
+                {
+                    "loc": {
+                        "city": "Tokyo",
+                        "country": "Japan"
+                    }
+                },
+            ),
+            (f'tags:[{_g4_s("a")},{_g4_s("b")}]', {
+                "tags": ["a", "b"]
+            }),
+            ("", {}),
+            # Strings carrying : or { must not be parsed as separators / braces.
+            (f'url:{_g4_s("http://example.com:8080")}', {
+                "url": "http://example.com:8080"
+            }),
+            ('tpl:' + _g4_s('Hello {name}'), {
+                "tpl": "Hello {name}"
+            }),
+        ],
+        ids=[
+            "single_string",
+            "multiple_values",
+            "mixed_types",
+            "nested_object",
+            "with_array",
+            "empty",
+            "string_with_colon",
+            "string_with_braces",
+        ],
+    )
+    def test_parse_args(self, raw, expected):
+        assert _parse_gemma4_args(raw) == expected
 
     def test_extract_tool_calls_single(self):
         text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
@@ -2809,6 +2822,7 @@ class TestGemma4ParsingHelpers:
         assert _extract_tool_calls("regular text") == []
 
     def test_extract_tool_calls_incomplete(self):
+        # Missing EOT_TOKEN — must yield no calls.
         text = (f'{BOT_TOKEN}{CALL_PREFIX}'
                 f'func{{arg:{_g4_s("val")}}}')
         assert _extract_tool_calls(text) == []
