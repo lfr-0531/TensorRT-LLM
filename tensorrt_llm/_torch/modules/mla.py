@@ -17,13 +17,13 @@ import functools
 import math
 import os
 import weakref
-from typing import List, Optional, cast
+from typing import Optional, cast
 
 import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -40,24 +40,20 @@ from ..attention_backend.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
 )
-from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata,
-    transform_local_topk_and_prepare_pool_view,
-)
+from ..attention_backend.sparse.registry import lower_sparse_attention_params
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..utils import is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
+from ..utils import maybe_compiled_cat, maybe_compiled_copy_
 from .attention import (
     _helix_cp_allgather_input,
     _helix_cp_output_projection,
     _helix_post_process,
     _helix_zero_kv_mask,
-    _lower_sparse_attention_params,
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode
-from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
@@ -74,6 +70,24 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
+def _forward_impl_with_dsa(*args, **kwargs):
+    from ..attention_backend.sparse.dsa.module import forward_impl_with_dsa
+
+    return forward_impl_with_dsa(*args, **kwargs)
+
+
+def _forward_impl_with_deepseek_v4(*args, **kwargs):
+    from ..attention_backend.sparse.deepseek_v4.module import forward_impl_with_deepseek_v4
+
+    return forward_impl_with_deepseek_v4(*args, **kwargs)
+
+
+def _deepseek_v4_o_proj(*args, **kwargs):
+    from ..attention_backend.sparse.deepseek_v4.module import deepseek_v4_o_proj
+
+    return deepseek_v4_o_proj(*args, **kwargs)
+
+
 @torch.library.custom_op("trtllm::mla_custom_op_inplace", mutates_args=("output",))
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
@@ -84,108 +98,13 @@ def mla_custom_op_inplace(
 ) -> None:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
     if mla_layer.is_deepseek_v4:
-        mla_layer.forward_impl_with_deepseek_v4(
-            position_ids, hidden_states, metadata, output=output
+        _forward_impl_with_deepseek_v4(
+            mla_layer, position_ids, hidden_states, metadata, output=output
         )
     else:
         mla_layer.forward_impl(
             position_ids, hidden_states, metadata, output=output, latent_cache_gen=latent_cache_gen
         )
-
-
-@torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
-def mla_dsa_proj(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    """Token-wise projections for DSA MLA (CUDA-graph-capturable).
-
-    Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-    indexer.pre_indexer_proj (FP8/FP4 quantize, weight scaling).  Does NOT
-    update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
-    because the scatter kernel accesses batch-specific metadata.
-
-    Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
-    handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
-    k_fp8, k_scale, weights, q_scale] when the indexer runs.  Under torch
-    compile, _should_use_short_mha returns False so the result is always
-    length 9, keeping control flow straight-line for CUDA graph capture.
-    The trailing q_scale is only consumed by the FP4 dispatch; the FP8
-    path ignores it in forward_dsa_attn.
-    """
-    metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
-
-
-@mla_dsa_proj.register_fake
-def _mla_dsa_proj_fake(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    # Under torch compile _should_use_short_mha is False, so the result is
-    # always 9 tensors (4 attention inputs + 5 indexer intermediates, with
-    # q_scale as the 9th carried for the FP4 dispatch).
-    metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    num_tokens = hidden_states.shape[0]
-    indexer = mla_layer.mqa.indexer
-    q = hidden_states.new_empty([num_tokens, mla_layer.num_heads_tp * mla_layer.qk_head_dim])
-    compressed_kv = hidden_states.new_empty([num_tokens, mla_layer.kv_lora_rank])
-    k_pe = hidden_states.new_empty([num_tokens, mla_layer.qk_rope_head_dim])
-    latent_cache = hidden_states.new_empty(
-        [num_tokens, mla_layer.kv_lora_rank + mla_layer.qk_rope_head_dim]
-    )
-    if indexer is None:
-        # DSA "shared" layer: no indexer, mirror forward_dsa_proj's early
-        # return of only the 4 base tensors (no indexer intermediates).
-        return [q, compressed_kv, k_pe, latent_cache]
-    # Indexer intermediates: q_fp8, k_fp8, k_scale, weights, q_scale.
-    # Under FP4 q_fp8's trailing dim is head_dim // 2 (two E2M1 codes per
-    # byte) and q_scale carries one int32 per (token, head) packing four
-    # UE8M0 exponents; under FP8 q_fp8's trailing dim is head_dim and
-    # q_scale carries one float32 per (token, head).
-    if indexer.use_fp4:
-        q_fp8 = hidden_states.new_empty(
-            [num_tokens, indexer.n_heads, indexer.head_dim // 2], dtype=torch.int8
-        )
-        k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim // 2], dtype=torch.int8)
-        k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.int32)
-        q_scale = hidden_states.new_empty([num_tokens, indexer.n_heads, 1], dtype=torch.int32)
-    else:
-        q_fp8 = hidden_states.new_empty(
-            [num_tokens, indexer.n_heads, indexer.head_dim], dtype=torch.float8_e4m3fn
-        )
-        k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim], dtype=torch.float8_e4m3fn)
-        k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.float32)
-        q_scale = hidden_states.new_empty([num_tokens, indexer.n_heads, 1], dtype=torch.float32)
-    weights = hidden_states.new_empty([num_tokens, indexer.n_heads], dtype=torch.float32)
-    return [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights, q_scale]
-
-
-@torch.library.custom_op("trtllm::mla_dsa_attn_inplace", mutates_args=("output",))
-def mla_dsa_attn_inplace(
-    q: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    k_pe: torch.Tensor,
-    latent_cache: torch.Tensor,
-    indexer_intermediates: List[torch.Tensor],
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-    output: torch.Tensor,
-) -> None:
-    """Batch-structure-dependent attention dispatch for DSA MLA.
-
-    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale] when
-    the indexer ran in Op 1, or [] when short-MHA handled all tokens. The
-    trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
-    ignores it. Runs sparse_attn_indexer then dispatches context/generation
-    attention. This op is excluded from CUDA graph capture.
-    """
-    metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    mla_layer.forward_dsa_attn(
-        q, compressed_kv, k_pe, latent_cache, indexer_intermediates, position_ids, metadata, output
-    )
 
 
 def fp8_block_scaling_bmm_out(
@@ -223,40 +142,6 @@ def fp8_block_scaling_bmm_out(
             torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
-
-
-_q_b_proj_cute_dsl_import_ok: Optional[bool] = None
-
-
-def _q_b_proj_cute_dsl_bf16(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """BF16 dense GEMM via CuTe DSL.
-
-    Computes ``q @ weight.T`` for [M, K] @ [N, K]^T -> [M, N].
-
-    Delegates to ``torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell`` (which
-    runs its own autotune over (use_2cta, mma_tiler, cluster_shape)). Falls
-    back to ``torch.nn.functional.linear`` if CuTe DSL is unavailable.
-    """
-    global _q_b_proj_cute_dsl_import_ok
-    if _q_b_proj_cute_dsl_import_ok is None:
-        try:
-            from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-            _q_b_proj_cute_dsl_import_ok = IS_CUTLASS_DSL_AVAILABLE
-        except ImportError:
-            _q_b_proj_cute_dsl_import_ok = False
-    if not _q_b_proj_cute_dsl_import_ok or not is_sm_100f():
-        return torch.nn.functional.linear(q, weight)
-
-    assert q.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "q_b_proj cute_dsl path requires bfloat16 inputs"
-    )
-    q = q.contiguous()
-    weight = weight.contiguous()
-    m, n = q.shape[0], weight.shape[0]
-    out = q.new_empty((m, n), dtype=torch.bfloat16)
-    torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
-    return out
 
 
 class MLA(nn.Module):
@@ -353,7 +238,7 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
-            _lower_sparse_attention_params(
+            lower_sparse_attention_params(
                 sparse_attn_cfg,
                 pretrained_config=config.pretrained_config,
                 layer_idx=self.layer_idx,
@@ -862,68 +747,6 @@ class MLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe.view(-1, self.num_heads_tp, self.qk_rope_head_dim)
         return k_pe
 
-    def _deepseek_v4_q_b_layernorm(self, q: torch.Tensor) -> torch.Tensor:
-        assert q.dim() == 2 and q.shape[1] == self.num_heads_tp * self.qk_head_dim
-        return torch.ops.trtllm.deepseek_v4_q_norm(
-            q, self.num_heads_tp, self.qk_head_dim, float(self.q_b_layernorm.variance_epsilon)
-        )
-
-    def _is_fused_q_fp8_quant_enabled(self, num_generations: int = 0) -> bool:
-        # Context-only batches: the fused path leaves a placeholder bf16 q_buf
-        # that forward_generation_sparse_mla would read uninitialized, so
-        # mixed/gen batches must take the legacy unfused path.
-        # `TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1` opts back into the legacy
-        # two-kernel Q-quant path as a kill switch.
-        if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
-            return False
-        if not self.is_deepseek_v4:
-            return False
-        if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
-            return False
-        if num_generations > 0:
-            return False
-        return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
-
-    def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
-        # Returns (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv).
-        # `placeholder_q` keeps the [num_tokens, num_heads*head_dim] bf16 layout
-        # the downstream `forward_absorption_context` needs for its `q.shape[0]`
-        # check and `q.view().split()` call. Its contents are never read on the
-        # fused FP8 path: the nope segment lives in `quant_q_buffer`, the rope
-        # segment is passed in `q_pe`, and the split's `q_nope`/`q_pe` outputs
-        # are either overridden by the caller or discarded by the DSv4 branch.
-        # Reusing `q_proj` (q_b_proj output) avoids a ~num_tokens x hidden bf16
-        # allocation per forward.
-        assert q_proj.dim() == 2
-        assert q_proj.shape[1] == self.num_heads_tp * self.qk_head_dim
-        if getattr(self, "_quant_scale_qkv", None) is None:
-            self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q_proj.device)
-        # q_pe is 3D so thop.attention's sparse-MLA context branch passes its
-        # q_pe->dim() == 3 check; the kernel op consumes the flat 2D view.
-        num_tokens = q_proj.shape[0]
-        rope_dim = self.qk_head_dim - self.kv_lora_rank
-        quant_q_buffer = q_proj.new_empty(
-            (num_tokens, self.num_heads_tp * self.qk_head_dim), dtype=torch.float8_e4m3fn
-        )
-        q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp, rope_dim))
-        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-            q_proj,
-            quant_q_buffer,
-            q_pe.view(num_tokens, self.num_heads_tp * rope_dim),
-            self.num_heads_tp,
-            self.qk_head_dim,
-            self.kv_lora_rank,
-            float(self.q_b_layernorm.variance_epsilon),
-            self._quant_scale_qkv,
-        )
-        # Both buffers must be live for the fused path; the downstream
-        # absorption-context op switches on `quant_scale_qkv is not None`
-        # to enable the C++ fusion (see trtllm.py `thop.attention` call).
-        assert self._quant_scale_qkv is not None, (
-            "fused FP8-Q quant requires _quant_scale_qkv to be set"
-        )
-        return q_proj, quant_q_buffer, q_pe, self._quant_scale_qkv
-
     def _attn_forward_gen(
         self,
         attn_backend: AttentionBackend,
@@ -997,87 +820,6 @@ class MLA(nn.Module):
         attn_scale = _get_attn_scale(position_ids)
         q = (q * attn_scale).to(q.dtype)
         return q
-
-    def _deepseek_v4_o_proj(
-        self, attn_out_latent: torch.Tensor, position_ids: torch.Tensor
-    ) -> torch.Tensor:
-        num_tokens = attn_out_latent.shape[0]
-        attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp, -1)
-
-        # When o_a_proj is FP8 on SM100 (which is always the case for DSv4
-        # under FP8 block-scales after init), fuse the inverse-RoPE into the
-        # FP8-quant epilogue (vLLM-ported Triton kernel) and call
-        # cute_dsl_fp8_bmm_blackwell directly. Saves one BF16 read+write of
-        # the latent vs the mla_rope_inplace +
-        # fp8_batched_quantize_1x128_permute102 pair. Decoupled from
-        # use_cute_dsl_blockscaling_bmm (which gates the separate K/V
-        # absorption BMM kernel choice).
-        fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
-        if fused_inv_rope_fp8:
-            heads_per_group = self.num_heads_tp // self.n_local_groups
-            attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
-                attn_out_latent,
-                position_ids.view(-1),
-                self.inverse_rotary_emb.rotary_cos_sin,
-                self.n_local_groups,
-                heads_per_group,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                128,
-                self.inverse_rotary_emb.is_neox,
-            )
-            o_lora = torch.empty(
-                [num_tokens, self.n_local_groups, self.o_lora_rank],
-                device=attn_out_latent.device,
-                dtype=self.dtype,
-            )
-            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-                attn_fp8, self.o_a_proj, attn_scale, self.o_a_proj_scale, o_lora.transpose(0, 1)
-            )
-            o_lora = o_lora.flatten(1)
-            return self.o_b_proj(o_lora)
-
-        # Fused in-place inverse RoPE on the rope portion of each head
-        torch.ops.trtllm.mla_rope_inplace(
-            attn_out_latent,
-            position_ids.view(-1),
-            self.inverse_rotary_emb.rotary_cos_sin,
-            self.num_heads_tp,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            True,
-            self.inverse_rotary_emb.is_neox,
-        )
-
-        # Output projections
-        o_lora = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=attn_out_latent.device,
-            dtype=attn_out_latent.dtype,
-        )
-        if self.o_a_proj.dtype == torch.bfloat16:
-            # dim = head_dim * num_head // num_group
-            # [num_groups, num_tokens, dim] x [num_groups, dim, o_lora_rank]
-            # -> [num_groups, num_tokens, o_lora_rank]
-            torch.ops.trtllm.bmm_out(
-                attn_out_latent.view(num_tokens, self.n_local_groups, -1).transpose(0, 1),
-                self.o_a_proj.transpose(1, 2),
-                o_lora.transpose(0, 1),
-            )
-        elif self.o_a_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(
-                attn_out_latent.view(num_tokens, self.n_local_groups, -1),
-                self.o_a_proj,
-                self.o_a_proj_scale,
-                o_lora.transpose(0, 1),
-                self.o_a_proj_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.o_a_proj.dtype}.")
-        o_lora = o_lora.flatten(1)
-        output = self.o_b_proj(o_lora)
-        return output
 
     def forward_impl(
         self,
@@ -1188,479 +930,6 @@ class MLA(nn.Module):
                 latent_cache=latent_cache_gen,
             )
 
-    def forward_impl_with_dsa(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> None:
-        """
-        Forward pass for the MLA module with DSA (always in MQA mode).
-        Writes result into output tensor in-place.
-
-        Delegates to forward_dsa_proj (token-wise projections) followed by
-        forward_dsa_attn (batch-dependent attention dispatch).
-
-        Args:
-            position_ids (Optional[torch.IntTensor]): The position IDs.
-            hidden_states (torch.Tensor): The hidden states.
-            attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): The output tensor to write results into.
-        """
-        proj_outputs = self.forward_dsa_proj(position_ids, hidden_states, attn_metadata)
-        q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-        indexer_intermediates = proj_outputs[4:]
-        self.forward_dsa_attn(
-            q,
-            compressed_kv,
-            k_pe,
-            latent_cache,
-            indexer_intermediates,
-            position_ids,
-            attn_metadata,
-            output,
-        )
-
-    def forward_dsa_proj(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> List[torch.Tensor]:
-        """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
-
-        Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-        indexer.pre_indexer_proj().
-
-        IMPORTANT: This method must NOT slice tensors by num_tokens or
-        access batch-specific metadata, so that all operations are
-        unconditionally straight-line for CUDA graph capture.  Slicing
-        to num_tokens happens in forward_dsa_attn (Op 2, outside graph).
-
-        Returns [q, compressed_kv, k_pe, latent_cache] when short-MHA
-        handles all tokens (eager only), or
-        [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-        weights, q_scale] when the indexer runs.  q_scale is unused on the
-        FP8 path but always present so CUDA graph capture sees a stable
-        9-tensor shape regardless of indexer dtype.
-        """
-        assert self.mqa is not None, "DSA is only supported in MQA mode"
-
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
-        )
-
-        q, compressed_kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(compressed_kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-        q = self.q_b_proj(q)
-
-        use_short_mha_for_ctx = self._should_use_short_mha(attn_metadata, position_ids)
-
-        # Skip the indexer when the short MHA path handles all context
-        # tokens and there are no generation tokens.
-        if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
-            return [q, compressed_kv, k_pe, latent_cache]
-
-        # DSA "shared" layer: no indexer; reuses the previous full layer's
-        # top-k (in forward_dsa_attn), so skip the projection.
-        if self.mqa.indexer is None:
-            return [q, compressed_kv, k_pe, latent_cache]
-
-        # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
-        # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
-        # access to batch-specific metadata or the k cache. Returns q_scale
-        # as a 5th element so the FP4 dispatch can forward it to the kernel;
-        # the FP8 path ignores it in forward_dsa_attn.
-        q_fp8, k_fp8, k_scale, weights, q_scale = self.mqa.indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids
-        )
-
-        return [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights, q_scale]
-
-    def forward_dsa_attn(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        indexer_intermediates: List[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> None:
-        """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
-
-        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale]
-        when the indexer ran in Op 1, or [] when short-MHA handled all tokens.
-
-        All num_tokens slicing happens here (not in Op 1) because
-        num_tokens comes from batch-specific metadata and must not be
-        baked into CUDA graph capture.
-        """
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        num_tokens = attn_metadata.num_tokens
-
-        # Slice Op 1 outputs to actual num_tokens (Op 1 operates on the
-        # full padded tensor for CUDA graph compatibility).
-        q = q[:num_tokens, ...]
-        compressed_kv = compressed_kv[:num_tokens, ...]
-        k_pe = k_pe[:num_tokens, ...]
-        latent_cache = latent_cache[:num_tokens, ...]
-        if position_ids is not None:
-            position_ids = position_ids[..., :num_tokens]
-
-        use_short_mha_for_ctx = num_contexts > 0 and self._should_use_short_mha(
-            attn_metadata, position_ids
-        )
-
-        if use_short_mha_for_ctx and num_generations == 0:
-            topk_indices = None
-        elif self.mqa.indexer is None:
-            # DSA "shared" layer: reuse the previous full layer's top-k. These
-            # are local token positions, so they are layer-agnostic; each layer
-            # applies its own paged-KV transform downstream.
-            topk_indices = getattr(attn_metadata, "shared_topk_indices", None)
-            assert topk_indices is not None, (
-                "DSA shared layer has no top-k from a preceding full indexer "
-                "layer; check the index_topk_pattern/freq schedule."
-            )
-        else:
-            q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
-            # Slice indexer intermediates to actual num_tokens (they were
-            # computed on the full padded tensor in Op 1).
-            q_fp8 = q_fp8[:num_tokens, ...]
-            k_fp8 = k_fp8[:num_tokens, ...]
-            k_scale = k_scale[:num_tokens, ...]
-            weights = weights[:num_tokens, ...]
-            q_scale = q_scale[:num_tokens, ...]
-            topk_indices = self.mqa.indexer.sparse_attn_indexer(
-                attn_metadata,
-                q,  # only used for shape/device in buffer allocation
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                q_scale=q_scale,
-            )
-            # Stash for subsequent DSA "shared" layers (full -> shared reuse);
-            # unused by a dense per-layer indexer.
-            attn_metadata.shared_topk_indices = topk_indices
-
-        assert output is not None, "output must be provided"
-
-        if num_contexts > 0:
-            q_ctx = q[:num_ctx_tokens, ...]
-            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
-            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            ctx_position_ids = (
-                position_ids[..., :num_ctx_tokens] if position_ids is not None else None
-            )
-            if self.apply_rotary_emb:
-                assert ctx_position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
-
-            self.forward_context_sparse_mla(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None,
-                position_ids=ctx_position_ids,
-            )
-
-        if num_generations > 0:
-            q_gen = q[num_ctx_tokens:, ...]
-            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
-            k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            gen_position_ids = (
-                position_ids[..., num_ctx_tokens:num_tokens] if position_ids is not None else None
-            )
-            if self.apply_rotary_emb:
-                assert gen_position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-
-            self.forward_generation_sparse_mla(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                latent_cache=latent_cache_gen,
-                topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
-                position_ids=gen_position_ids,
-            )
-
-    def forward_impl_with_deepseek_v4(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> None:
-        """
-        Forward pass for the MLA module with DeepSeek-V4 (always in MQA mode).
-
-        Args:
-            position_ids (Optional[torch.IntTensor]): The position IDs.
-            hidden_states (torch.Tensor): The hidden states.
-            attn_metadata (AttentionMetadata): The attention metadata.
-
-        Returns:
-            torch.Tensor: The output tensor.
-        """
-        assert self.mha is None and self.mqa is not None, (
-            "DeepSeek-V4 is only supported in MQA mode"
-        )
-        # split q, k, v into context and gen batches
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        num_tokens = attn_metadata.num_tokens
-
-        hidden_states = hidden_states[:num_tokens, ...]
-        if position_ids is not None:
-            position_ids = position_ids[..., :num_tokens]
-
-        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
-        # outer compressor and the ratio-4 indexer can execute concurrently
-        # with q_b_proj + q_b_layernorm. The indexer is launched on a
-        # dedicated stream and still uses a different aux stream for its
-        # internal q-proj/weights-proj split.
-        _v4_extra_overlap = (
-            os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1") == "1"
-            and self.compressor is not None
-            and self.aux_stream is not None
-        )
-        _use_indexer_overlap = (
-            _v4_extra_overlap
-            and do_multi_stream()
-            and self.indexer is not None
-            and self.indexer_stream is not None
-        )
-
-        # Pre-launch the outer compressor on compressor_stream BEFORE
-        # kv_a_proj_with_mqa. The compressor only reads hidden_states +
-        # attn_metadata, so it has no data dependency on the kv_a_proj GEMM or
-        # the downstream q_a/kv_a LN split. A dedicated stream (not aux_stream)
-        # keeps kv_a_layernorm free to run on aux_stream in parallel.
-        # _q_branch will be queued onto this same stream further down so it
-        # runs strictly serial after the compressor; dsv4_compressor_event is
-        # recorded only at the end of _q_branch, gating the caller's downstream
-        # waits on both compressor + _q_branch completion.
-        if _use_indexer_overlap:
-            self.dsv4_compressor_start_event.record()
-            with torch.cuda.stream(self.compressor_stream):
-                self.dsv4_compressor_start_event.wait()
-                self.compressor(hidden_states, attn_metadata)
-
-        # Pre-launch the qr-independent half of the indexer prepare phase
-        # (weights_proj + internal compressor + k_cache_update) on the
-        # indexer's aux stream (self.indexer_aux_stream, wired into the
-        # indexer module as its aux_stream). Only reads hidden_states +
-        # attn_metadata, so it can overlap with the kv_a_proj -> LN -> split
-        # chain on the caller stream and the outer compressor on
-        # compressor_stream. The returned tuple is fed back into
-        # self.indexer() via pre_aux so the later _indexer_branch skips its
-        # own aux-stream launch.
-        _indexer_pre_aux = None
-        if _use_indexer_overlap:
-            _indexer_pre_aux = self.indexer.precompute_aux(hidden_states, attn_metadata)
-
-        q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
-        )
-
-        q, kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        compressed_kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-        # CuTe DSL path for q_b_proj (hardware-default cluster count).
-        # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
-        # swap only kicks in where the prologue overlap is exercised; other
-        # layers keep the cuBLAS path. Set TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL=0
-        # to disable. Bias and quantization are not handled.
-        _use_q_b_cute = (
-            self.has_dsv4_indexer
-            and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
-            and self.q_b_proj.bias is None
-            and self.q_b_proj.weight.dtype == torch.bfloat16
-        )
-
-        def _q_branch():
-            # CuTe DSL bf16 path is bench-only and intentionally bypasses the
-            # FP8-fused-quant branch (weights are bf16, so the fused FP8 path
-            # would never apply anyway, but assert to make the contract
-            # explicit and catch any future config drift).
-            if _use_q_b_cute:
-                assert not self._is_fused_q_fp8_quant_enabled(num_generations=num_generations), (
-                    "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
-                )
-                q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
-                # Cross-iter cleanup: forward_absorption_* downstream gates
-                # the fused-FP8 attention path on these attrs being non-None.
-                # The FP8 path cannot trigger when weights are bf16, but clear
-                # them so stale buffers cannot silently re-enable fusion.
-                self._fused_quant_q_buffer = None
-                self._fused_q_pe = None
-                return self._deepseek_v4_q_b_layernorm(q_proj)
-            q_proj = self.q_b_proj(q)
-            if self._is_fused_q_fp8_quant_enabled(num_generations=num_generations):
-                placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv = (
-                    self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
-                )
-                self._fused_quant_q_buffer = quant_q_buffer
-                self._fused_q_pe = q_pe
-                self._quant_scale_qkv = quant_scale_qkv
-                return placeholder_q
-            self._fused_quant_q_buffer = None
-            self._fused_q_pe = None
-            return self._deepseek_v4_q_b_layernorm(q_proj)
-
-        def _compressor_branch():
-            self.compressor(hidden_states, attn_metadata)
-            return None
-
-        def _indexer_branch():
-            return self.indexer(
-                qr,
-                hidden_states,
-                attn_metadata,
-                position_ids,
-                pre_aux=_indexer_pre_aux,
-            )
-
-        topk_indices = None
-        indexer_ran = False
-        if _v4_extra_overlap:
-            if _use_indexer_overlap:
-                # Compressor + indexer-aux are already in flight from the
-                # pre-launch block above. The outer compressor's tail is
-                # deferred until after _q_branch so the single wait below
-                # gates both compressor and _q_branch completion.
-                self.dsv4_overlap_start_event.record()
-
-                with torch.cuda.stream(self.indexer_stream):
-                    self.dsv4_overlap_start_event.wait()
-                    topk_indices = _indexer_branch()
-                    indexer_ran = True
-                    self.dsv4_indexer_event.record()
-
-                # _q_branch reads qr (post-q_a_layernorm), so it must wait for
-                # dsv4_overlap_start_event. Queuing it on compressor_stream
-                # serializes compressor -> q_b_proj -> q_b_layernorm while
-                # freeing the caller stream during the prologue window.
-                with torch.cuda.stream(self.compressor_stream):
-                    self.dsv4_overlap_start_event.wait()
-                    q = _q_branch()
-                    self.dsv4_compressor_event.record()
-
-                self.dsv4_compressor_event.wait()
-                self.dsv4_indexer_event.wait()
-
-                # q/topk_indices were produced on other streams; record on the
-                # consuming stream so the caching allocator cannot recycle them mid-use.
-                cur_stream = torch.cuda.current_stream()
-                if q is not None:
-                    q.record_stream(cur_stream)
-                if topk_indices is not None:
-                    topk_indices.record_stream(cur_stream)
-            else:
-                q, _ = maybe_execute_in_parallel(
-                    _q_branch,
-                    _compressor_branch,
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    self.aux_stream,
-                )
-        else:
-            q = _q_branch()
-            if self.compressor is not None:
-                self.compressor(hidden_states, attn_metadata)
-
-        if self.indexer is not None:
-            if not indexer_ran:
-                topk_indices = _indexer_branch()
-
-        assert q.shape[0] == num_tokens, (
-            f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
-        )
-
-        assert output is not None, "output must be provided"
-
-        if num_contexts > 0:
-            q_ctx = q[:num_ctx_tokens, ...]
-            topk_indices_ctx = (
-                topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None
-            )
-            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
-            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            ctx_position_ids = (
-                position_ids[..., :num_ctx_tokens] if position_ids is not None else None
-            )
-            if self.apply_rotary_emb:
-                assert ctx_position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
-
-            self.forward_context_sparse_mla(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                position_ids=ctx_position_ids,
-                latent_cache=latent_cache_ctx,
-                topk_indices=topk_indices_ctx,
-            )
-
-        if num_generations > 0:
-            q_gen = q[num_ctx_tokens:, ...]
-            topk_indices_gen = (
-                topk_indices[num_ctx_tokens:num_tokens, :] if topk_indices is not None else None
-            )
-            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
-            k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            gen_position_ids = (
-                position_ids[..., num_ctx_tokens:num_tokens] if position_ids is not None else None
-            )
-            if self.apply_rotary_emb:
-                assert gen_position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-
-            self.forward_generation_sparse_mla(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                position_ids=gen_position_ids,
-                latent_cache=latent_cache_gen,
-                topk_indices=topk_indices_gen,
-            )
-
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -1707,120 +976,6 @@ class MLA(nn.Module):
         )
 
         return attn_output
-
-    def _should_use_short_mha(
-        self, attn_metadata: AttentionMetadata, position_ids: Optional[torch.Tensor]
-    ) -> bool:
-        """Check if the short-seq MHA optimization should be used for context.
-
-        Uses max_ctx_kv_len (max total KV length per context sequence,
-        including cached tokens) when available, to correctly account for
-        chunked context where the full attention span exceeds the threshold
-        even if the new token count is small.  Falls back to num_ctx_tokens
-        (total new context tokens) when max_ctx_kv_len is not set.
-
-        Disabled under torch compile so that the split DSA custom ops
-        (mla_dsa_proj / mla_dsa_attn_inplace) have unconditionally
-        straight-line control flow for CUDA graph capture.
-        """
-        if is_torch_compiling():
-            return False
-        if not (
-            self.short_seq_mha_threshold > 0
-            and not self.apply_rotary_emb
-            and self.mapping.cp_size == 1
-            and position_ids is not None
-        ):
-            return False
-        effective_len = getattr(attn_metadata, "max_ctx_kv_len", attn_metadata.num_ctx_tokens)
-        return effective_len <= self.short_seq_mha_threshold
-
-    def forward_context_sparse_mla(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Run context-phase attention for DSA models.
-
-        Dispatches to the short-seq MHA path (forward_context) when the max
-        per-sequence KV length (including cached tokens) is within the
-        threshold, or falls through to the absorption/sparse MLA path
-        otherwise.  forward_context() further dispatches to the appropriate
-        handler (forward_context_default, forward_context_with_cached_kv, or
-        forward_context_with_chunked_prefill) based on cached-KV state.
-
-        Args:
-            q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
-            compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
-            k_pe: RoPE key portion, shape [num_ctx_tokens, qk_rope_head_dim].
-            attn_metadata: Attention metadata for the current batch.
-            output: Pre-allocated output tensor, written in-place.
-            latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
-            topk_indices: Sparse routing indices from the indexer (None when
-                the short-seq MHA path is used).
-            position_ids: Token position IDs (required for short-seq MHA).
-        """
-        # Short-sequence MHA: bypass absorption path for short prefills,
-        # using kv_b_proj expansion + standard attention instead.
-        # See __init__ comment for rationale. topk_indices is not used
-        # because dense attention is faster than sparse routing at this scale.
-        # forward_context() handles cached tokens by dispatching to
-        # forward_context_with_cached_kv or forward_context_with_chunked_prefill.
-        if self._should_use_short_mha(attn_metadata, position_ids):
-            return self.forward_context(
-                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
-            )
-
-        if get_sm_version() >= 100:
-            return self.forward_absorption_context(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                position_ids=position_ids,
-                latent_cache=latent_cache,
-                topk_indices=topk_indices,
-            )
-        else:
-            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
-            )
-
-    def forward_generation_sparse_mla(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if get_sm_version() >= 100:
-            return self.forward_absorption_generation(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                position_ids=position_ids,
-                latent_cache=latent_cache,
-                topk_indices=topk_indices,
-            )
-        else:
-            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
-            )
 
     def forward_context_with_cached_kv(
         self,
@@ -2528,154 +1683,6 @@ class MLA(nn.Module):
 
         return output
 
-    @nvtx_range("forward_sparse_mla_kvcache_bf16")
-    def forward_sparse_mla_kvcache_bf16(
-        self,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        attn_metadata: DSAtrtllmAttentionMetadata,
-        output: torch.Tensor,
-        topk_indices: torch.Tensor,
-        is_generation: bool = False,
-    ) -> torch.Tensor:
-        """
-        Forward sparse MLA (DSA) for BF16 KV cache for both context and generation phases using FlashMLA kernels
-
-        To form the input for FlashMLA kernel and adapt our KV cache manager, we need to:
-        1. Append current tokens to paged cache and apply rope to q/k via mla_rope_append_paged_kv_assign_q
-        2. Load full kv cache from paged memory (with k rope applied)
-        3. Call FlashMLA sparse attention kernel for sparse prefill/decode
-        """
-        assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
-            "DSA requires DSAtrtllmAttentionMetadata"
-        )
-        # Append current tokens to paged cache and apply RoPE to q
-        # This writes latent_cache to paged KV and modifies q in-place
-        trtllm_attention = self.mqa
-        with nvtx_range_debug(f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"):
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(
-                q, latent_cache, attn_metadata, is_generation=is_generation
-            )
-
-        num_tokens = q.shape[0]
-        q_nope, q_rope = q.view(-1, self.num_heads_tp, self.qk_head_dim).split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_nope_out = torch.empty(
-            [num_tokens, self.num_heads_tp, (self.kv_lora_rank)],
-            dtype=q.dtype,
-            device=q.device,
-        )
-
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope_t = q_nope.transpose(0, 1)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-            # The output of bmm is written directly into fused_q
-            self._bmm_bf16_out(
-                q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
-            )
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            fp8_block_scaling_bmm_out(
-                q_nope,
-                self.k_b_proj_trans,
-                self.k_b_proj_trans_scale,
-                q_nope_out,
-                self.k_b_proj_trans_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-        q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
-
-        sm_version = get_sm_version()
-        # FlashMLA sparse kernel (bf16) requires num_heads=128 on sm100 or a
-        # multiple of 64 on sm90.
-        if sm_version >= 100:
-            padding = 128
-            assert self.num_heads_tp <= padding, (
-                f"SM100 FlashMLA sparse kernel requires exactly {padding} heads, "
-                f"got {self.num_heads_tp}. Padding from values > {padding} is not supported."
-            )
-        else:  # SM90
-            padding = ((self.num_heads_tp + 63) // 64) * 64  # multiple of 64
-
-        if self.num_heads_tp != padding:
-            logger.warning_once(
-                f"Padding num_heads from {self.num_heads_tp} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement",
-                key="sparse_mla_padding_warning",
-            )
-
-            # Create padded tensor with zeros for extra heads
-            q_padded = q_concat.new_empty((num_tokens, padding, q_concat.shape[2]))
-            q_padded[:, : self.num_heads_tp, :] = q_concat
-            q_concat = q_padded
-
-        # Convert indices and return all-layer KV pool
-        # Note: underlying pool is layer-interleaved: [num_blocks, num_layers,
-        # kv_factor, tokens_per_block, num_kv_heads, head_dim]. To avoid a
-        # reshape(copy) per-layer KV cache, return the all-layer KV pool with
-        # topk indices adjusted by stride_factor=num_layers*tokens_per_block.
-        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
-            topk_indices,
-            attn_metadata,
-            layer_idx=self.layer_idx,
-            is_generation=is_generation,
-        )
-        topk_indices_pool = topk_indices_pool.view(num_tokens, 1, -1)
-        if flash_mla_sparse_fwd is not None:
-            attn_out_latent = flash_mla_sparse_fwd(
-                q_concat, kv_cache_pool, topk_indices_pool, self.softmax_scale
-            )[0]
-        else:
-            raise RuntimeError(
-                "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
-            )
-
-        # [seq, num_heads, kv_lora_rank], account for padding
-        attn_out_latent = attn_out_latent[:, : self.num_heads_tp, :]
-        attn_out_latent = attn_out_latent.view([-1, self.num_heads_tp, self.kv_lora_rank])
-        if self.num_heads_tp != padding:
-            attn_out_latent = attn_out_latent.contiguous()
-
-        assert (
-            attn_out_latent.shape[0] == q.shape[0] and attn_out_latent.shape[1] == self.num_heads_tp
-        )
-
-        attn_output = output.view([num_tokens, self.num_heads_tp, self.v_head_dim])
-
-        if self.v_b_proj.dtype == torch.bfloat16:
-            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-            # -> [num_heads, seq, v_head_dim]
-            self._bmm_bf16_out(
-                attn_out_latent.transpose(0, 1),
-                self.v_b_proj,
-                self.v_b_proj.transpose(1, 2),
-                attn_output.transpose(0, 1),
-            )
-        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(
-                attn_out_latent,
-                self.v_b_proj,
-                self.v_b_proj_scale,
-                attn_output.transpose(0, 1),
-                self.v_b_proj_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-        return output
-
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2713,12 +1720,12 @@ class MLA(nn.Module):
                     hidden_states, position_ids, self.layer_idx_str, attn_output, latent_cache_gen
                 )
         elif self.is_dsa:
-            self.forward_impl_with_dsa(
-                position_ids, hidden_states, attn_metadata, output=attn_output
+            _forward_impl_with_dsa(
+                self, position_ids, hidden_states, attn_metadata, output=attn_output
             )
         elif self.is_deepseek_v4:
-            self.forward_impl_with_deepseek_v4(
-                position_ids, hidden_states, attn_metadata, output=attn_output
+            _forward_impl_with_deepseek_v4(
+                self, position_ids, hidden_states, attn_metadata, output=attn_output
             )
         else:
             self.forward_impl(
@@ -2730,7 +1737,7 @@ class MLA(nn.Module):
             )
 
         if self.is_deepseek_v4:
-            attn_output = self._deepseek_v4_o_proj(attn_output, position_ids)
+            attn_output = _deepseek_v4_o_proj(self, attn_output, position_ids)
         else:
             attn_output = _helix_cp_output_projection(
                 self.o_proj,

@@ -14,6 +14,7 @@ from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
+from ..attention_backend.sparse.registry import lower_sparse_attention_params
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -24,19 +25,6 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-
-
-def _lower_sparse_attention_params(sparse_attn_cfg,
-                                   pretrained_config=None,
-                                   layer_idx: Optional[int] = None):
-    if getattr(sparse_attn_cfg, "algorithm", None) == "deepseek_v4":
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
-            make_deepseek_v4_sparse_params
-
-        return make_deepseek_v4_sparse_params(
-            sparse_attn_cfg, pretrained_config=pretrained_config)
-    return sparse_attn_cfg.to_sparse_params(pretrained_config=pretrained_config,
-                                            layer_idx=layer_idx)
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -609,7 +597,7 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config
-        sparse_params = (_lower_sparse_attention_params(
+        sparse_params = (lower_sparse_attention_params(
             sparse_attn_cfg,
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
