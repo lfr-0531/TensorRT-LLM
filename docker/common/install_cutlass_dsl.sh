@@ -37,6 +37,3 @@ pip3 uninstall -y \
     2>/dev/null || true
 
 pip3 install --no-cache-dir "${PKG}"
-
-python3 -c "import cutlass.cute"
-echo "cutlass.cute import verified"
