@@ -1056,7 +1056,7 @@ def _mla_dsa_proj_fake(
     # byte) and q_scale carries one int32 per (token, head) packing four
     # UE8M0 exponents; under FP8 q_fp8's trailing dim is head_dim and
     # q_scale carries one float32 per (token, head).
-    if getattr(indexer, "use_fp4", False):
+    if indexer.use_fp4:
         q_fp8 = hidden_states.new_empty(
             [num_tokens, indexer.n_heads, indexer.head_dim // 2],
             dtype=torch.int8)

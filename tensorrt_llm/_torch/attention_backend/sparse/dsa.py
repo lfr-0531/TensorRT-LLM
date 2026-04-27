@@ -1146,8 +1146,7 @@ class Indexer(nn.Module):
         # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
         # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
         # kernel asserts SM100 + head_dim=128 at launch time under FP4.
-        self.use_fp4 = getattr(sparse_attention_config, "indexer_k_dtype",
-                               "fp8") == "fp4"
+        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
@@ -2164,8 +2163,7 @@ class DSACacheManager(KVCacheManager):
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
-        self.use_fp4 = getattr(sparse_attn_config, "indexer_k_dtype",
-                               "fp8") == "fp4"
+        self.use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
 
         super().__init__(
             kv_cache_config,
@@ -2229,7 +2227,7 @@ class DSACacheManager(KVCacheManager):
         # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
         # the scale bytes are unchanged (4 per token, one int32 holding four
         # UE8M0 exponents at quant_block_size=32 after packing).
-        use_fp4 = getattr(sparse_attn_config, "indexer_k_dtype", "fp8") == "fp4"
+        use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
         indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
         # get kv cache dtype bytes
