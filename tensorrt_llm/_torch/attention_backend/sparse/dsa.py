@@ -357,6 +357,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
+        assert isinstance(self.kv_cache_manager, DSACacheManager), \
+            f"DSAtrtllmAttentionMetadata requires DSACacheManager, got {type(self.kv_cache_manager)}"
 
         self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
@@ -994,7 +996,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # head_dim (one FP8 byte per element). Feed the real byte count
             # into _compute_slot_mappings so scatter/gather see offsets that
             # match the pool layout produced by createIndexerKCachePools.
-            use_fp4 = getattr(self.kv_cache_manager, 'use_fp4', False)
+            use_fp4 = self.kv_cache_manager.use_fp4
             index_head_dim = self.kv_cache_manager.index_head_dim
             data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
             fp8_indices, scale_indices = _compute_slot_mappings(
@@ -1303,7 +1305,7 @@ class Indexer(nn.Module):
         head_dim = kv_cache_manager.index_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         quant_block_size = kv_cache_manager.quant_block_size
-        use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
+        use_fp4 = kv_cache_manager.use_fp4
         # FP4 packs two E2M1 codes per byte; FP8 stores one byte per element.
         data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
@@ -1454,7 +1456,7 @@ class Indexer(nn.Module):
         if _need_full_kv_gathering:
             head_dim = kv_cache_manager.index_head_dim
             quant_block_size = kv_cache_manager.quant_block_size
-            use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
+            use_fp4 = kv_cache_manager.use_fp4
             data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
             cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
             scale_size = head_dim // quant_block_size * 4
