@@ -19,17 +19,12 @@
 - ``torch.ops.trtllm.fused_cat_fp4``
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
 # Import tensorrt_llm to load C++ custom operators
 import tensorrt_llm  # noqa: F401
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-from utils.util import skip_pre_blackwell  # noqa: E402
+from utils.util import skip_pre_blackwell
 
 try:
     from tensorrt_llm.deep_gemm.utils.math import per_token_cast_to_fp4

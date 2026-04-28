@@ -35,11 +35,7 @@ except ImportError:
 else:
     HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-from utils.util import skip_pre_blackwell  # noqa: E402
+from utils.util import skip_pre_blackwell
 
 
 def _fp4_quantize_sf_transpose(x: torch.Tensor):
