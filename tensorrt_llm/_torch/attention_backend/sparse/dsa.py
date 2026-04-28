@@ -1767,7 +1767,7 @@ class Indexer(nn.Module):
                 # q_decode's (batch, next_n) layout required by the new
                 # DeepGEMM paged MQA logits API.
                 context_lens = metadata.kv_lens_cuda_2d[:num_generations, :
-                                                        next_n]
+                                                        next_n].contiguous()
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
