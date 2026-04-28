@@ -351,8 +351,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default="fp8",
         description=
         "Data type used for the indexer K cache. Use `fp4` on Blackwell+ "
-        "(SM>=100) to halve the indexer K cache per-token footprint from "
-        "132 B to 68 B at index_head_dim=128. Requires index_head_dim=128.",
+        "(SM>=100) and index_head_dim=128 to halve the indexer K cache "
+        "per-token footprint from 132 B to 68 B at index_head_dim=128.",
     )
 
     @model_validator(mode="after")
