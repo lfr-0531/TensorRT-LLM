@@ -1928,7 +1928,8 @@ class Indexer(nn.Module):
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
         position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
 
         Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
