@@ -1653,9 +1653,8 @@ class Indexer(nn.Module):
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
 
-                    chunk_q_scale = q_scale[
-                        global_q_start:global_q_end,
-                        ...] if self.use_fp4 else None
+                    chunk_q_scale = q_scale[global_q_start:global_q_end,
+                                            ...] if self.use_fp4 else None
                     logits = self._call_mqa_logits(
                         q_fp8[global_q_start:global_q_end, ...],
                         chunk_k_fp8,
