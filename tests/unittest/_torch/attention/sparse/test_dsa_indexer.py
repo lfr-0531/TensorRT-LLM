@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_hopper
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -60,6 +60,7 @@ def create_dsa_cache_manager(
     tokens_per_block: int,
     max_seq_len: int,
     num_layers: int = 1,
+    indexer_k_dtype: str = "fp8",
 ):
     """Helper to create a DSACacheManager for testing."""
 
@@ -67,7 +68,8 @@ def create_dsa_cache_manager(
     class SparseAttentionConfig:
         """Minimal mock of SparseAttentionConfig for testing."""
 
-        def __init__(self, index_head_dim, index_n_heads, index_topk):
+        def __init__(self, index_head_dim, index_n_heads, index_topk,
+                     indexer_k_dtype):
             """Initialize sparse attention config with indexer parameters."""
             self.index_head_dim = index_head_dim
             self.index_n_heads = index_n_heads
@@ -75,12 +77,13 @@ def create_dsa_cache_manager(
             self.prompt_budget = 1024
             self.use_cute_dsl_topk = False
             self.enable_heuristic_topk = False
-            self.indexer_k_dtype = "fp8"
+            self.indexer_k_dtype = indexer_k_dtype
 
     sparse_attn_config = SparseAttentionConfig(
         index_head_dim=head_dim,
         index_n_heads=32,  # Default number of heads for indexer
-        index_topk=2048)
+        index_topk=2048,
+        indexer_k_dtype=indexer_k_dtype)
 
     # Create KV cache config
     kv_cache_config = KvCacheConfig(
@@ -834,6 +837,112 @@ def test_indexer_k_cache_scatter_custom_op():
         # Fail the test
         raise AssertionError(
             "CUDA kernel produced different results than Python reference")
+
+
+@skip_pre_blackwell
+def test_indexer_k_cache_scatter_custom_op_fp4():
+    """FP4 variant: CUDA kernel vs Python reference for k_cache scatter.
+
+    Under FP4 the data payload is head_dim//2 bytes (two packed E2M1 codes
+    per byte) and the scale is a single int32 per token. Verify the scatter
+    op handles the shorter per-token size correctly.
+    """
+    torch.manual_seed(456)
+
+    head_dim = 128
+    fp4_data_dim = head_dim // 2  # 64 bytes packed
+    block_size = 64
+    batch_size = 2
+    num_tokens = 64
+    max_seq_len = 512
+
+    layer_idx_cuda = 0
+    layer_idx_python = 1
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_seq_len,
+        num_layers=3,
+        indexer_k_dtype="fp4")
+
+    request_ids = list(range(batch_size))
+    tokens_per_req = [32, 32]
+    cache_manager.add_dummy_requests(request_ids,
+                                     tokens_per_req,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        kv_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_tokens,
+        num_tokens=num_tokens,
+    )
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
+    Indexer.prepare(metadata)
+
+    # FP4 packed data: [num_tokens, 64] int8; scale: [num_tokens, 1] int32
+    k_fp4 = torch.randint(-128, 127, (num_tokens, fp4_data_dim),
+                          device="cuda", dtype=torch.int8)
+    k_scale = torch.randint(0, 2**31, (num_tokens, 1),
+                            device="cuda", dtype=torch.int32)
+
+    scale_size = 4  # 1 int32 = 4 bytes
+    k_fp4_bytes = k_fp4.view(torch.uint8)
+    k_scale_bytes = k_scale.view(torch.uint8).view(num_tokens, scale_size)
+
+    flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
+    flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
+
+    # CUDA path
+    k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
+    k_cache_cuda.zero_()
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp4, k_scale, k_cache_cuda,
+                                                metadata.slot_mapping_fp8,
+                                                metadata.slot_mapping_scale,
+                                                num_tokens)
+    torch.cuda.synchronize()
+
+    # Python reference
+    k_cache_python = cache_manager.get_indexer_k_cache_buffers(layer_idx_python)
+    k_cache_python.zero_()
+
+    def _unravel_indices(flat_indices, shape):
+        d3 = shape[3]
+        i3 = flat_indices % d3
+        flat_indices = flat_indices // d3
+        d2 = shape[2]
+        i2 = flat_indices % d2
+        flat_indices = flat_indices // d2
+        d1 = shape[1]
+        i1 = flat_indices % d1
+        flat_indices = flat_indices // d1
+        i0 = flat_indices
+        return i0, i1, i2, i3
+
+    byte_offsets = torch.arange(fp4_data_dim,
+                                device=k_cache_python.device).unsqueeze(0)
+    scatter_fp4 = flat_indices_fp8.unsqueeze(1) + byte_offsets
+    scatter_fp4 = _unravel_indices(scatter_fp4, k_cache_python.shape)
+    k_cache_python[scatter_fp4] = k_fp4_bytes
+
+    byte_offsets = torch.arange(scale_size,
+                                device=k_cache_python.device).unsqueeze(0)
+    scatter_scale = flat_indices_scale.unsqueeze(1) + byte_offsets
+    scatter_scale = _unravel_indices(scatter_scale, k_cache_python.shape)
+    k_cache_python[scatter_scale] = k_scale_bytes
+
+    assert torch.equal(k_cache_cuda, k_cache_python), \
+        "FP4 scatter: CUDA kernel produced different results than Python reference"
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
