@@ -1459,7 +1459,6 @@ class Indexer(nn.Module):
             use_fp4 = kv_cache_manager.use_fp4
             data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
             cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-            scale_size = head_dim // quant_block_size * 4
             start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()

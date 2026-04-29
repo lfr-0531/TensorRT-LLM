@@ -21,10 +21,10 @@
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 # Import tensorrt_llm to load C++ custom operators
 import tensorrt_llm  # noqa: F401
-from utils.util import skip_pre_blackwell
 
 try:
     from tensorrt_llm.deep_gemm.utils.math import per_token_cast_to_fp4

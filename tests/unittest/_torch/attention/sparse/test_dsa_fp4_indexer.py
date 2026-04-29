@@ -35,9 +35,8 @@ except ImportError:
 else:
     HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
-from utils.util import skip_pre_blackwell
-
 from test_dsa_indexer import _create_mock_metadata, create_dsa_cache_manager
+from utils.util import skip_pre_blackwell
 
 
 def _fp4_quantize_sf_transpose(x: torch.Tensor):
@@ -328,14 +327,14 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
         tokens_per_block=block_size,
         max_seq_len=max_seq_len,
         num_layers=3,
-        indexer_k_dtype="fp4")
+        indexer_k_dtype="fp4",
+    )
 
     request_ids = list(range(batch_size))
     tokens_per_req = [32, 32]
-    cache_manager.add_dummy_requests(request_ids,
-                                     tokens_per_req,
-                                     is_gen=False,
-                                     prepare_resource=True)
+    cache_manager.add_dummy_requests(
+        request_ids, tokens_per_req, is_gen=False, prepare_resource=True
+    )
 
     metadata = _create_mock_metadata(
         request_ids,
@@ -351,13 +350,12 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
     )
 
     from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
+
     Indexer.prepare(metadata)
 
     # FP4 packed data: [num_tokens, 64] int8; scale: [num_tokens, 1] int32
-    k_fp4 = torch.randint(-128, 127, (num_tokens, fp4_data_dim),
-                          device="cuda", dtype=torch.int8)
-    k_scale = torch.randint(0, 2**31, (num_tokens, 1),
-                            device="cuda", dtype=torch.int32)
+    k_fp4 = torch.randint(-128, 127, (num_tokens, fp4_data_dim), device="cuda", dtype=torch.int8)
+    k_scale = torch.randint(0, 2**31, (num_tokens, 1), device="cuda", dtype=torch.int32)
 
     scale_size = 4  # 1 int32 = 4 bytes
     k_fp4_bytes = k_fp4.view(torch.uint8)
@@ -369,10 +367,14 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
     # CUDA path
     k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
     k_cache_cuda.zero_()
-    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp4, k_scale, k_cache_cuda,
-                                                metadata.slot_mapping_fp8,
-                                                metadata.slot_mapping_scale,
-                                                num_tokens)
+    torch.ops.trtllm.indexer_k_cache_scatter_op(
+        k_fp4,
+        k_scale,
+        k_cache_cuda,
+        metadata.slot_mapping_fp8,
+        metadata.slot_mapping_scale,
+        num_tokens,
+    )
     torch.cuda.synchronize()
 
     # Python reference
@@ -392,17 +394,16 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
         i0 = flat_indices
         return i0, i1, i2, i3
 
-    byte_offsets = torch.arange(fp4_data_dim,
-                                device=k_cache_python.device).unsqueeze(0)
+    byte_offsets = torch.arange(fp4_data_dim, device=k_cache_python.device).unsqueeze(0)
     scatter_fp4 = flat_indices_fp8.unsqueeze(1) + byte_offsets
     scatter_fp4 = _unravel_indices(scatter_fp4, k_cache_python.shape)
     k_cache_python[scatter_fp4] = k_fp4_bytes
 
-    byte_offsets = torch.arange(scale_size,
-                                device=k_cache_python.device).unsqueeze(0)
+    byte_offsets = torch.arange(scale_size, device=k_cache_python.device).unsqueeze(0)
     scatter_scale = flat_indices_scale.unsqueeze(1) + byte_offsets
     scatter_scale = _unravel_indices(scatter_scale, k_cache_python.shape)
     k_cache_python[scatter_scale] = k_scale_bytes
 
-    assert torch.equal(k_cache_cuda, k_cache_python), \
+    assert torch.equal(k_cache_cuda, k_cache_python), (
         "FP4 scatter: CUDA kernel produced different results than Python reference"
+    )
