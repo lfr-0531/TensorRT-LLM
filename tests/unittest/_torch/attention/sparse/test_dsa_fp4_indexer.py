@@ -33,7 +33,13 @@ except ImportError:
     # surface rather than silently turn into a test-wide skip.
     HAS_DEEP_GEMM = False
 else:
-    HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
+    HAS_DEEP_GEMM = True
+    # If deep_gemm imports but fp8_fp4_mqa_logits is absent, the installed
+    # DeepGEMM version is wrong — fail loudly instead of silently skipping.
+    assert hasattr(deep_gemm, "fp8_fp4_mqa_logits"), (
+        "deep_gemm imported but fp8_fp4_mqa_logits is missing; "
+        "check that the correct DeepGEMM version is installed"
+    )
 
 from test_dsa_indexer import _create_mock_metadata, create_dsa_cache_manager
 from utils.util import skip_pre_blackwell
