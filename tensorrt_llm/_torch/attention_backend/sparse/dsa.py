@@ -1655,7 +1655,7 @@ class Indexer(nn.Module):
 
                     chunk_q_scale = q_scale[
                         global_q_start:global_q_end,
-                        ...] if q_scale is not None else None
+                        ...] if self.use_fp4 else None
                     logits = self._call_mqa_logits(
                         q_fp8[global_q_start:global_q_end, ...],
                         chunk_k_fp8,
@@ -1709,7 +1709,7 @@ class Indexer(nn.Module):
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
                 ctx_q_scale = q_scale[:num_ctx_tokens,
-                                      ...] if q_scale is not None else None
+                                      ...] if self.use_fp4 else None
                 logits = self._call_mqa_logits(
                     q_fp8[:num_ctx_tokens, ...],
                     k_fp8[:num_ctx_tokens, ...],
@@ -1790,8 +1790,8 @@ class Indexer(nn.Module):
 
             decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens,
-                                     ...] if q_scale is not None else None
-            if decode_q_scale is not None:
+                                     ...] if self.use_fp4 else None
+            if self.use_fp4:
                 # q_decode shape is either (num_generations, next_n, n_heads,
                 # head_dim/2) [non-expanded] or (batch*next_n, 1, n_heads,
                 # head_dim/2) [expanded]. Match q_scale's batch/next_n dims.

@@ -1839,8 +1839,8 @@ class MLA(nn.Module):
     ) -> None:
         """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
 
-        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights] when the
-        indexer ran in Op 1, or [] when short-MHA handled all tokens.
+        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale]
+        when the indexer ran in Op 1, or [] when short-MHA handled all tokens.
 
         All num_tokens slicing happens here (not in Op 1) because
         num_tokens comes from batch-specific metadata and must not be
