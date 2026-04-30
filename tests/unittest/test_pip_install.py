@@ -184,22 +184,6 @@ def install_tensorrt_llm():
     subprocess.check_call(install_command, shell=True)
 
 
-def reinstall_cutlass_dsl_for_platform():
-    """Reinstall nvidia-cutlass-dsl with the [cuXX] extra matching torch.version.cuda.
-
-    On aarch64+CUDA 13, plain `pip install nvidia-cutlass-dsl==4.4.2` ships
-    an empty libs-base wheel and leaves the `cutlass` namespace unimportable.
-    Reuse the shared docker/common/install_cutlass_dsl.sh that the docker
-    build path already runs, so the wheel install path matches.
-    """
-    print("##########  Re-install cutlass-dsl with platform extras  ##########")
-    repo_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", ".."))
-    script = os.path.join(repo_root, "docker", "common",
-                          "install_cutlass_dsl.sh")
-    subprocess.check_call(["bash", script])
-
-
 def create_link_for_models():
     models_root = llm_models_root()
     if not models_root.exists():
@@ -255,7 +239,6 @@ def test_pip_install(args):
 
     download_wheel(args)
     install_tensorrt_llm()
-    reinstall_cutlass_dsl_for_platform()
 
     run_sanity_check()
 
@@ -295,7 +278,6 @@ def test_python_builds(args):
         install_cmd.extend(["-c", constraint_file])
 
     subprocess.check_call(install_cmd, cwd=repo_root, env=env)
-    reinstall_cutlass_dsl_for_platform()
     run_sanity_check(examples_path=f"{repo_root}/examples")
 
     # Clean up: uninstall editable install to leave env in clean state

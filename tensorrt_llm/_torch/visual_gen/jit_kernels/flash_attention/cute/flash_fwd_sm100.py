@@ -2472,8 +2472,8 @@ class FlashAttentionForwardSm100:
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
         cute.arch.fence_proxy(
-            "async.shared",
-            space="cta",
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
         )
 
         if const_expr(self.use_correction_warps_for_epi):
