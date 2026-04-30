@@ -483,6 +483,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # When MTP runs without the expanded-tokens path, the same forward step
+        # alternates between full-window calls (next_n == 1 + max_draft_tokens)
+        # and per-token draft calls (next_n == 1). The 2D DeepGEMM metadata
+        # API encodes next_n into the schedule, so the precomputed schedule
+        # for one shape cannot be reused for the other. Maintain a second
+        # buffer holding the schedule for the full next_n window; the draft
+        # path keeps using `scheduler_metadata_buffer`. Always allocate (a
+        # few KB) so transitions in `update_spec_dec_param` don't have to
+        # special-case its existence.
+        self.scheduler_metadata_buffer_full_next_n = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.num_sms + 1, 2),
+            cache_name="scheduler_metadata_buffer_full_next_n",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         # Pre-allocated 2D kv_lens buffer for the new DeepGEMM 2D context_lens
         # API. Shape: (max_num_sequences, 1 + max_draft_tokens). Each row
         # broadcasts the same kv_len across next_n positions; kernel reads a
@@ -1031,13 +1047,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             next_n_cap = self.kv_lens_cuda_2d.shape[1]
             self.kv_lens_cuda_2d[:self.num_generations, :next_n_cap].copy_(
                 gen_kv_lens.unsqueeze(-1).expand(-1, next_n_cap))
-            context_lens_2d = self.kv_lens_cuda_2d[:self.
-                                                   num_generations, :next_n_cap]
+            # Build the next_n=1 schedule (used by MTP draft layers and any
+            # non-MTP forward). Reshape the contiguous gen slice of
+            # kv_lens_cuda to (num_gen, 1) — slicing kv_lens_cuda_2d's first
+            # column would be non-contiguous and would fail the metadata
+            # kernel's is_contiguous assertion.
+            context_lens_next_n1 = gen_kv_lens.view(-1, 1)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                context_lens_2d, self.kv_cache_manager.tokens_per_block,
+                context_lens_next_n1, self.kv_cache_manager.tokens_per_block,
                 self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
+            # When MTP is on without the expanded-tokens path, also populate
+            # the full-next_n schedule for the main forward call. The metadata
+            # kernel reads next_n from context_lens.size(1), so we must pass
+            # the wider slice here.
+            if (self.max_draft_tokens > 0
+                    and not self.use_expanded_buffers_for_mtp):
+                context_lens_full_next_n = self.kv_lens_cuda_2d[:self.
+                                                                num_generations, :
+                                                                next_n_cap]
+                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                    context_lens_full_next_n,
+                    self.kv_cache_manager.tokens_per_block, self.num_sms)
+                self.scheduler_metadata_buffer_full_next_n.copy_(
+                    scheduler_metadata_buffer_full_next_n, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
                 num_draft_tokens = 1 + self.max_draft_tokens
                 num_tokens = self.num_generations * num_draft_tokens
@@ -1427,12 +1461,28 @@ class Indexer(nn.Module):
                 next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
                 metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                     gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap))
-                context_lens_2d = metadata.kv_lens_cuda_2d[:num_generations, :
-                                                           next_n_cap]
+                # Build the next_n=1 schedule (used by MTP draft layers).
+                # Use the contiguous 1D gen slice reshaped to (num_gen, 1);
+                # slicing kv_lens_cuda_2d's first column would be a strided
+                # view that fails the metadata kernel's contiguous assertion.
+                context_lens_next_n1 = gen_seq_lens.view(-1, 1)
                 scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                    context_lens_2d, tokens_per_block, metadata.num_sms)
+                    context_lens_next_n1, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer.copy_(
                     scheduler_metadata_buffer, non_blocking=True)
+                # MTP main forward uses next_n = 1 + max_draft_tokens; build
+                # a separate schedule because the metadata kernel reads next_n
+                # from context_lens.size(1).
+                if metadata.max_draft_tokens > 0:
+                    context_lens_full_next_n = metadata.kv_lens_cuda_2d[:
+                                                                        num_generations, :
+                                                                        next_n_cap]
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        context_lens_full_next_n, tokens_per_block,
+                        metadata.num_sms)
+                    metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n,
+                        non_blocking=True)
             else:
                 # Expand schedule metadata buffer (only generation). The new
                 # DeepGEMM API requires 2D; each expanded token becomes a (1,)
@@ -1768,7 +1818,15 @@ class Indexer(nn.Module):
                                                         next_n].contiguous()
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
-                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                # The 2D-context_lens metadata kernel encodes next_n into the
+                # schedule (via num_next_n_atoms). MTP forwards alternate
+                # between the full-window call (next_n == 1+max_draft_tokens)
+                # and per-token draft calls (next_n == 1), so we must select
+                # the buffer that was populated for this next_n.
+                if next_n == 1:
+                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                else:
+                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_full_next_n
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]
