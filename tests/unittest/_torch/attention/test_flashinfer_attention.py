@@ -28,10 +28,10 @@ class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
     def get_num_plans(self, plan_params) -> int:
         return self._num_times_planned[plan_params]
 
-    def _plan_with_params(self, plan_params):
+    def _plan_with_params(self, plan_params, flashinfer_backend: str = "fa2"):
         if self.needs_plan(plan_params):
             self._num_times_planned[plan_params] += 1
-        return super()._plan_with_params(plan_params)
+        return super()._plan_with_params(plan_params, flashinfer_backend)
 
 
 @dataclass(repr=False)
