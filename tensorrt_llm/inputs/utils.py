@@ -845,12 +845,11 @@ def _build_openai_content(
                 media_type = part.get("type", "image")
                 content_list.append({"type": media_type})
     else:
-        # Fallback: order placeholders relative to text according to the
-        # model's registered ``placeholder_placement``.  Some models (e.g.
-        # Gemma4) require media to appear BEFORE the text in the OpenAI
-        # content list so the chat template can insert the soft-token
-        # sequence in the correct position.  Default to BEFORE_TEXT if the
-        # registry has no preference.
+        # Fallback: order placeholders relative to text. Some models (e.g.
+        # Gemma4) explicitly register ``BEFORE_TEXT`` placement so the chat
+        # template can insert the soft-token sequence before the text. When
+        # the registry has no entry for ``model_type``, keep the historical
+        # default of text-first then media.
         text = conv.get("content", "")
         text_entry = {"type": "text", "text": text} if text else None
         media_entries = []
@@ -873,18 +872,15 @@ def _build_openai_content(
         except Exception:
             placement = None
 
-        # ``MultimodalPlaceholderPlacement.AFTER_TEXT`` keeps the old
-        # behaviour (text first then media); all other values place media
-        # before text.
         if (placement is not None
-                and getattr(placement, "name", None) == "AFTER_TEXT"):
+                and getattr(placement, "name", None) == "BEFORE_TEXT"):
+            content_list.extend(media_entries)
             if text_entry is not None:
                 content_list.append(text_entry)
-            content_list.extend(media_entries)
         else:
-            content_list.extend(media_entries)
             if text_entry is not None:
                 content_list.append(text_entry)
+            content_list.extend(media_entries)
 
     return content_list
 
