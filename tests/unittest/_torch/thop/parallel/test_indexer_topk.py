@@ -279,7 +279,15 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
 # ============================================================================
 
 
-def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, run_fn):
+def _run_cute_dsl_topk_test(
+    batch_size,
+    next_n,
+    index_topk,
+    num_tokens,
+    dtype,
+    run_fn,
+    compress_ratio=1,
+):
     """Common test logic for CuTE DSL top-k kernels.
 
     Args:
@@ -289,6 +297,7 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
         num_tokens: Maximum sequence length for generating seq_lens.
         dtype: Data type for the logits tensor.
         run_fn: Callable(logits, seq_lens) -> indices tensor.
+        compress_ratio: KV compression ratio for indexer decode.
     """
 
     torch.manual_seed(42)
@@ -305,7 +314,8 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
     # and the minimum (offset=0) is seq_len - next_n + 1.
     # Ensure seq_len >= next_n so effective length is at least 1.
     seq_lens = seq_lens.clamp(min=next_n)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+    row_ends = actual_kv_lens // compress_ratio
 
     logits = create_random_logits(row_starts, row_ends, dtype, 42)
 
@@ -386,7 +396,8 @@ def test_cute_dsl_topk_decode_multi_cta(
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compress_ratio):
     num_gen_tokens = batch_size * next_n
 
     def run_fn(logits, seq_lens):
@@ -397,6 +408,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
             output_indices=output_indices,
             top_k=index_topk,
             next_n=next_n,
+            compress_ratio=compress_ratio,
             num_copy_bits=256,
         )
         return output_indices
@@ -408,6 +420,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
         num_tokens,
         torch.float32,
         run_fn,
+        compress_ratio=compress_ratio,
     )
 
 

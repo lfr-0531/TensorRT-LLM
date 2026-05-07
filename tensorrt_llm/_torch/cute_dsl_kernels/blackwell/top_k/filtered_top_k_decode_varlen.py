@@ -83,10 +83,17 @@ class ComputeDynamicCTAOffsets:
     # since each thread handles one row.
     MAX_NUM_ROWS = 512
 
-    def __init__(self, next_n: int, chunk_size_per_cta: int, top_k: int):
+    def __init__(
+        self,
+        next_n: int,
+        chunk_size_per_cta: int,
+        top_k: int,
+        compress_ratio: int = 1,
+    ):
         self.next_n = next_n
         self.chunk_size_per_cta = chunk_size_per_cta
         self.top_k = top_k
+        self.compress_ratio = compress_ratio
         self.NUM_THREADS = 512
 
     @cute.kernel
@@ -112,7 +119,7 @@ class ComputeDynamicCTAOffsets:
         if tidx < num_rows:
             batch_idx = tidx // self.next_n
             next_n_off = tidx % self.next_n
-            eff_len = seq_lens[batch_idx] - self.next_n + next_n_off + 1
+            eff_len = (seq_lens[batch_idx] - self.next_n + next_n_off + 1) // self.compress_ratio
             ctas = (eff_len + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
             if ctas < 1:
                 ctas = 1
@@ -167,6 +174,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
         num_sms: int = 148,
+        compress_ratio: int = 1,
         debug: bool = False,
     ):
         super().__init__(
@@ -188,6 +196,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
         self.num_sms = num_sms
+        self.compress_ratio = compress_ratio
 
         if cutlass.const_expr(large_occupancy):
             # tuned value, could be tuned further.
@@ -266,7 +275,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         # TODO: update row_start to align with multi-cta version.
         row_start = 0
         seq_len = seqlen[task_id // self.next_n]
-        row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
+        row_end = (seq_len - self.next_n + (task_id % self.next_n) + 1) // self.compress_ratio
 
         length = row_end - row_start
 
@@ -392,7 +401,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
             if not cutlass.const_expr(self.merge_blocks):
                 seq_len = seqlen[bidx // self.next_n]
-                row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+                row_end = (seq_len - self.next_n + (bidx % self.next_n) + 1) // self.compress_ratio
                 length = row_end - row_start
 
             if cutlass.const_expr(self.enable_multi_cta):
@@ -412,7 +421,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     # Varlen merge: compute per-row valid length from seqlen.
                     _batch = bidx // self.next_n
                     _off = bidx % self.next_n
-                    _eff = seqlen[_batch] - self.next_n + _off + 1
+                    _eff = (seqlen[_batch] - self.next_n + _off + 1) // self.compress_ratio
                     _num_ctas = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
                     if _num_ctas < 1:
                         _num_ctas = 1
@@ -431,7 +440,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if cutlass.const_expr(self.enable_dynamic_multi_cta):
                 _batch_check = bidx // self.next_n
                 _off_check = bidx % self.next_n
-                _eff_check = seqlen[_batch_check] - self.next_n + _off_check + 1
+                _eff_check = (
+                    seqlen[_batch_check] - self.next_n + _off_check + 1
+                ) // self.compress_ratio
                 _needed_ctas = (_eff_check + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
                 if _needed_ctas < 1:
                     _needed_ctas = 1
@@ -486,7 +497,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if task_id < num_rows:
                 row_start = 0
                 seq_len = seqlen[task_id // self.next_n]
-                row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
+                row_end = (
+                    seq_len - self.next_n + (task_id % self.next_n) + 1
+                ) // self.compress_ratio
                 length = row_end - row_start
 
                 self.filtered_topk_kernel_per_row(
@@ -532,7 +545,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     task_id = row_id
                     row_start = 0
                     seq_len = seqlen[task_id // self.next_n]
-                    row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
+                    row_end = (
+                        seq_len - self.next_n + (task_id % self.next_n) + 1
+                    ) // self.compress_ratio
                     length = row_end - row_start
 
                     self.filtered_topk_kernel_per_row(
