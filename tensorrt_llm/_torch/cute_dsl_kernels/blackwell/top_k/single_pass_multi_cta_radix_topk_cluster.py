@@ -175,8 +175,11 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
+        compress_ratio: int = 1,
     ):
-        super().__init__(dtype, chunk_size, top_k, next_n, num_copy_bits, ctas_per_group, num_sms)
+        super().__init__(
+            dtype, chunk_size, top_k, next_n, num_copy_bits, ctas_per_group, num_sms, compress_ratio
+        )
         # Clamp to hardware max cluster size (= max SMs per GPC).
         hw_max = _query_max_cluster_size()
         self.ctas_per_group = min(self.ctas_per_group, hw_max)
@@ -363,6 +366,7 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         chunk_size = cutlass.const_expr(self.chunk_size)
         top_k = cutlass.const_expr(self.top_k)
         next_n = cutlass.const_expr(self.next_n)
+        compress_ratio = cutlass.const_expr(self.compress_ratio)
         num_threads = cutlass.const_expr(self.num_threads)
 
         if cutlass.const_expr(ctas_per_group > 1):
@@ -431,7 +435,7 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
         while row_idx < num_rows:
             # Compute effective length from seqlen
             seq_len = seqlen[row_idx // next_n]
-            length = seq_len - next_n + (row_idx % next_n) + 1
+            length = (seq_len - next_n + (row_idx % next_n) + 1) // compress_ratio
 
             # My chunk boundaries
             chunk_start = cta_in_group * chunk_size

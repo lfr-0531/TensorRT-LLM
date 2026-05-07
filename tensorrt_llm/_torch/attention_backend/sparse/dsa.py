@@ -2023,14 +2023,12 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                if (self.use_cute_dsl_topk and num_gen_tokens <= 256
-                        and (self.compress_ratio == 1 or next_n == 1)):
+                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-                        logits_decode, context_lens
-                        if self.compress_ratio > 1 else gen_kv_lens_cuda,
+                        logits_decode, gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :], self.index_topk,
-                        next_n)
+                        next_n, self.compress_ratio)
                 else:
                     torch.ops.trtllm.indexer_topk_decode(
                         logits_decode,

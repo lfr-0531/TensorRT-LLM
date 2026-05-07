@@ -179,6 +179,7 @@ class SinglePassMultiCTARadixTopKKernel:
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
+        compress_ratio: int = 1,
     ):
         self.dtype = dtype
         self.chunk_size = chunk_size
@@ -187,6 +188,7 @@ class SinglePassMultiCTARadixTopKKernel:
         self.ctas_per_group = ctas_per_group
         self.num_sms = num_sms
         self.num_copy_bits = num_copy_bits
+        self.compress_ratio = compress_ratio
 
         # Radix config
         self.radix = 256
@@ -1060,6 +1062,7 @@ class SinglePassMultiCTARadixTopKKernel:
         chunk_size = cutlass.const_expr(self.chunk_size)
         top_k = cutlass.const_expr(self.top_k)
         next_n = cutlass.const_expr(self.next_n)
+        compress_ratio = cutlass.const_expr(self.compress_ratio)
         num_threads = cutlass.const_expr(self.num_threads)
 
         group_id = bidx // ctas_per_group
@@ -1122,7 +1125,7 @@ class SinglePassMultiCTARadixTopKKernel:
         while row_idx < num_rows:
             # Compute effective length from seqlen
             seq_len = seqlen[row_idx // next_n]
-            length = seq_len - next_n + (row_idx % next_n) + 1
+            length = (seq_len - next_n + (row_idx % next_n) + 1) // compress_ratio
 
             # My chunk boundaries
             chunk_start = cta_in_group * chunk_size

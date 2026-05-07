@@ -3781,14 +3781,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         buffers = get_memory_buffers()
 
         @classmethod
-        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
-                     num_copy_bits, load_balance, large_occupancy):
+        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n,
+                     compress_ratio, return_val, num_copy_bits, load_balance,
+                     large_occupancy):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
                 bucketed_num_cols,
                 top_k,
                 next_n,
+                compress_ratio,
                 return_val,
                 num_copy_bits,
                 load_balance,
@@ -3836,6 +3838,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 bucketed_num_cols,
                 top_k,
                 next_n,
+                compress_ratio=compress_ratio,
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 large_occupancy=large_occupancy,
@@ -3869,6 +3872,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             top_k: int,
             next_n: int,
+            compress_ratio: int = 1,
             return_val: bool = False,
             num_copy_bits: int = 256,
             load_balance: bool = False,
@@ -3888,6 +3892,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 bucketed_num_cols,
                 top_k,
                 next_n,
+                compress_ratio,
                 return_val,
                 num_copy_bits,
                 load_balance,
@@ -4081,6 +4086,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      dtype,
                      top_k,
                      next_n,
+                     compress_ratio,
                      return_val,
                      num_copy_bits,
                      load_balance,
@@ -4093,6 +4099,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 dtype,
                 top_k,
                 next_n,
+                compress_ratio,
                 return_val,
                 num_copy_bits,
                 load_balance,
@@ -4143,6 +4150,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 chunk_size_per_cta,  # num_cols
                 top_k,
                 next_n,
+                compress_ratio=compress_ratio,
                 num_copy_bits=num_copy_bits,
                 return_val=True,  # first kernel must return values
                 large_occupancy=large_occupancy,
@@ -4193,6 +4201,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 merge_num_cols,  # num_cols
                 top_k,
                 next_n,
+                compress_ratio=compress_ratio,
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 large_occupancy=large_occupancy,
@@ -4224,6 +4233,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             top_k: int,
             next_n: int,
+            compress_ratio: int = 1,
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
@@ -4246,6 +4256,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 dtype,
                 top_k,
                 next_n,
+                compress_ratio,
                 return_val,
                 num_copy_bits,
                 load_balance,
@@ -4349,11 +4360,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _state_size = DISTRIBUTED_TOPK_STATE_SIZE
 
         @classmethod
-        def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
-                     ctas_per_group, num_sms, return_val):
+        def _compile(cls, dtype, chunk_size, top_k, next_n, compress_ratio,
+                     num_copy_bits, ctas_per_group, num_sms, return_val):
             """Compile and cache a single-pass multi-CTA radix top-k kernel."""
-            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
-                   ctas_per_group, num_sms, return_val)
+            key = (dtype, chunk_size, top_k, next_n, compress_ratio,
+                   num_copy_bits, ctas_per_group, num_sms, return_val)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -4399,6 +4410,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 chunk_size=chunk_size,
                 top_k=top_k,
                 next_n=next_n,
+                compress_ratio=compress_ratio,
                 num_copy_bits=num_copy_bits,
                 ctas_per_group=ctas_per_group,
                 num_sms=num_sms,
@@ -4517,6 +4529,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             top_k: int,
             next_n: int,
+            compress_ratio: int = 1,
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size: Optional[int] = None,
@@ -4542,8 +4555,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if num_groups < 1:
                 num_groups = 1
 
-            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
-                   ctas_per_group, num_sms, return_val)
+            key = (dtype, chunk_size, top_k, next_n, compress_ratio,
+                   num_copy_bits, ctas_per_group, num_sms, return_val)
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
             reserve = torch.cuda.is_current_stream_capturing()
@@ -4651,6 +4664,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             top_k: int,
             next_n: int,
+            compress_ratio: int = 1,
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size: Optional[int] = None,
@@ -4678,8 +4692,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return None, None
 
             result = super().forward(input_values, seq_lens, top_k, next_n,
-                                     return_val, num_copy_bits, chunk_size,
-                                     output_indices)
+                                     compress_ratio, return_val, num_copy_bits,
+                                     chunk_size, output_indices)
             if result[0] is None:
                 return None, None
             return result
@@ -4792,6 +4806,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,
+        compress_ratio: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
@@ -4837,6 +4852,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_indices: Pre-allocated output buffer [batch_size * next_n, top_k]
             top_k: Number of top elements to select (max 2048)
             next_n: Number of candidates per sequence (for speculative decoding)
+            compress_ratio: KV compression ratio. The effective row length is
+                ``(seq_len - next_n + offset + 1) // compress_ratio``.
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
             single_pass_multi_cta: Use single-pass multi-CTA radix top-k
@@ -4845,6 +4862,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
+        if compress_ratio <= 0:
+            raise ValueError(
+                f"compress_ratio must be positive, got {compress_ratio}")
 
         if single_pass_multi_cta:
             # --- heuristic for single-CTA vs single-pass multi-CTA ---
@@ -4901,6 +4921,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         seq_lens=seq_lens,
                         top_k=top_k,
                         next_n=next_n,
+                        compress_ratio=compress_ratio,
                         return_val=False,
                         num_copy_bits=num_copy_bits,
                         output_indices=output_indices,
@@ -4914,6 +4935,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         seq_lens=seq_lens,
                         top_k=top_k,
                         next_n=next_n,
+                        compress_ratio=compress_ratio,
                         return_val=False,
                         num_copy_bits=num_copy_bits,
                         output_indices=output_indices,
@@ -4924,6 +4946,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens=seq_lens,
                     top_k=top_k,
                     next_n=next_n,
+                    compress_ratio=compress_ratio,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
                     output_indices=output_indices,
@@ -4955,6 +4978,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens=seq_lens,
                     top_k=top_k,
                     next_n=next_n,
+                    compress_ratio=compress_ratio,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
                     chunk_size_per_cta=chunk_size_per_cta,
@@ -4967,6 +4991,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens=seq_lens,
                     top_k=top_k,
                     next_n=next_n,
+                    compress_ratio=compress_ratio,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
                     output_indices=output_indices,
@@ -4979,6 +5004,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,
+        compress_ratio: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
