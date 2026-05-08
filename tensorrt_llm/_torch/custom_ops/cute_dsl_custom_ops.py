@@ -5017,6 +5017,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        compress_ratios: Optional[List[int]] = None,
         min_seq_len_log2: int = 10,
         max_seq_len_log2: int = 18,
         single_pass_multi_cta: bool = False,
@@ -5039,6 +5040,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: Number of top elements to select.
             next_n: Number of candidates per sequence (speculative decoding).
             num_copy_bits: Vectorized memory copy width (128 or 256).
+            compress_ratios: KV compression ratios to pre-compile.
             min_seq_len_log2: Log2 of minimum bucketed_num_cols (default 10 → 1024).
             max_seq_len_log2: Log2 of maximum bucketed_num_cols (default 18 → 262144).
             single_pass_multi_cta: Use single-pass multi-CTA radix top-k
@@ -5049,6 +5051,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
         return_val = False
         chunk_size_per_cta = 16384
+        if compress_ratios is None:
+            compress_ratios = [1]
+        compress_ratios = sorted(set(compress_ratios))
+        if not compress_ratios:
+            compress_ratios = [1]
 
         # Multi-CTA vocab thresholds by dtype
         if dtype == torch.float32:
@@ -5057,19 +5064,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             multi_cta_threshold = 131072
 
         # SingleCTA: enumerate all power-of-2 bucketed_num_cols
-        for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
-            bucketed_num_cols = 1 << log2_n
-            for large_occupancy in (False, True):
-                CuteDSLTopKDecodeSingleCTARunner._compile(
-                    cutlass_dtype,
-                    bucketed_num_cols,
-                    top_k,
-                    next_n,
-                    return_val,
-                    num_copy_bits,
-                    load_balance=False,
-                    large_occupancy=large_occupancy,
-                )
+        for compress_ratio in compress_ratios:
+            for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                bucketed_num_cols = 1 << log2_n
+                for large_occupancy in (False, True):
+                    CuteDSLTopKDecodeSingleCTARunner._compile(
+                        cutlass_dtype,
+                        bucketed_num_cols,
+                        top_k,
+                        next_n,
+                        compress_ratio,
+                        return_val,
+                        num_copy_bits,
+                        load_balance=False,
+                        large_occupancy=large_occupancy,
+                    )
 
         if single_pass_multi_cta:
             # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group)
@@ -5098,10 +5107,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if cs > max_chunk:
                         cs = max_chunk
                     single_pass_multi_cta_configs.add((cs, ctas))
-            for cs, ctas in sorted(single_pass_multi_cta_configs):
-                CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
-                    cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
-                    num_sms, return_val)
+            for compress_ratio in compress_ratios:
+                for cs, ctas in sorted(single_pass_multi_cta_configs):
+                    CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
+                        cutlass_dtype, cs, top_k, next_n, compress_ratio,
+                        num_copy_bits, ctas, num_sms, return_val)
 
             # Cluster variant: enumerate configs using the cluster runner's
             # _get_chunk_config (which clamps to hw max cluster size).
@@ -5117,10 +5127,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             num_rows=nr)
                         if cfg[0] is not None:
                             cluster_configs.add((cfg[0], cfg[1]))
-                for cs, ctas in sorted(cluster_configs):
-                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
-                        cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
-                        num_sms, return_val)
+                for compress_ratio in compress_ratios:
+                    for cs, ctas in sorted(cluster_configs):
+                        CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
+                            cutlass_dtype, cs, top_k, next_n, compress_ratio,
+                            num_copy_bits, ctas, num_sms, return_val)
 
             multi_cta_info = (
                 f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs"
@@ -5132,24 +5143,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
             min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
             max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
-            for num_ctas_per_row in range(min_ctas, max_ctas + 1):
-                for large_occupancy in (False, True):
-                    CuteDSLTopKDecodeMultiCTARunner._compile(
-                        cutlass_dtype,
-                        top_k,
-                        next_n,
-                        return_val,
-                        num_copy_bits,
-                        load_balance=False,
-                        large_occupancy=large_occupancy,
-                        chunk_size_per_cta=chunk_size_per_cta,
-                        num_ctas_per_row=num_ctas_per_row,
-                        dynamic=True,
-                    )
+            for compress_ratio in compress_ratios:
+                for num_ctas_per_row in range(min_ctas, max_ctas + 1):
+                    for large_occupancy in (False, True):
+                        CuteDSLTopKDecodeMultiCTARunner._compile(
+                            cutlass_dtype,
+                            top_k,
+                            next_n,
+                            compress_ratio,
+                            return_val,
+                            num_copy_bits,
+                            load_balance=False,
+                            large_occupancy=large_occupancy,
+                            chunk_size_per_cta=chunk_size_per_cta,
+                            num_ctas_per_row=num_ctas_per_row,
+                            dynamic=True,
+                        )
             multi_cta_info = (
                 f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}]")
 
         logger.info(
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
-            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
+            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}, "
+            f"compress_ratios={compress_ratios}")

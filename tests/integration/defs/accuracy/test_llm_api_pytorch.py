@@ -56,10 +56,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
-    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SADecodingConfig, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
+    DeepSeekV4SparseAttentionConfig, Eagle3DecodingConfig, KvCacheConfig,
+    MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
+    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -3446,6 +3447,25 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("index_topk", [512, 1024])
+    def test_nvfp4_4gpus_cute_dsl_topk(self, index_topk):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+            index_topk=index_topk, use_cute_dsl_topk=True)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=True,
+                 max_batch_size=32,
+                 max_seq_len=4096,
+                 cuda_graph_config=CudaGraphConfig(),
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", [

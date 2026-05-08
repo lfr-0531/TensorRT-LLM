@@ -1302,8 +1302,15 @@ class Indexer(nn.Module):
 
             # the dtype of topk input tensor, which is float32 now.
             # Note, need to update it if the dtype of topk input tensor is changed.
+            compress_ratios = sorted({
+                _effective_compress_ratio_divisor(ratio)
+                for ratio in getattr(sparse_attention_config, "compress_ratios",
+                                     [self.compress_ratio]) if ratio in (1, 4)
+            }) or [1]
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                dtype=torch.float32, top_k=self.index_topk)
+                dtype=torch.float32,
+                top_k=self.index_topk,
+                compress_ratios=compress_ratios)
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)

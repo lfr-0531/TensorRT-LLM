@@ -894,12 +894,52 @@ def test_cute_dsl_topk_decode_multi_cta(  # noqa: F811
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):  # noqa: F811
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_cute_dsl_indexer_topk_decode(  # noqa: F811
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
     """Correctness test for CuTE DSL indexer TopK decode with in-place output."""
     num_gen_tokens = batch_size * next_n
 
     def run_fn(logits, seq_lens):
         """Run CuTE DSL indexer TopK decode and return output indices."""
+        output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=logits,
+            seq_lens=seq_lens,
+            output_indices=output_indices,
+            top_k=index_topk,
+            next_n=next_n,
+            compress_ratio=compress_ratio,
+            num_copy_bits=256,
+        )
+        return output_indices
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        torch.float32,
+        run_fn,
+        compress_ratio=compress_ratio,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 128])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [512, 1024])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_cute_dsl_indexer_topk_decode_deepseek_v4_shapes(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """Cover DeepSeek-V4 indexer TopK shapes used by CuTE DSL decode."""
+    num_gen_tokens = batch_size * next_n
+
+    def run_fn(logits, seq_lens):
         output_indices = torch.empty(num_gen_tokens, index_topk, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.cute_dsl_indexer_topk_decode(
             input_values=logits,
