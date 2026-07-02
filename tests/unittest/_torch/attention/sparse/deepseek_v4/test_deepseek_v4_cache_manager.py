@@ -177,6 +177,7 @@ def _build_deepseek_v4_cache_config_for_test(
     max_seq_len: int = 1024,
     max_num_tokens: int | None = 2048,
     max_draft_len: int = 0,
+    num_extra_kv_tokens: int = 0,
 ):
     cache_manager = object.__new__(DeepseekV4CacheManager)
     cache_manager.pp_layers = [0, 1, 2]
@@ -194,7 +195,7 @@ def _build_deepseek_v4_cache_config_for_test(
     cache_manager.max_seq_len = max_seq_len
     cache_manager.enable_stats = False
     cache_manager.enable_swa_scratch_reuse = False
-    cache_manager.num_extra_kv_tokens = 0
+    cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
 
     return cache_manager._build_cache_config(
         kv_cache_config,
@@ -231,6 +232,23 @@ def test_deepseek_v4_avg_seq_len_updates_typical_step():
     assert [kv.history_length for kv in config.typical_step.kv_caches[1:]] == [253, 253]
     assert config.constraints[0].kv_caches[0].capacity == 1024
     assert config.constraints[0].kv_caches[0].history_length == 1023
+
+
+def test_deepseek_v4_mtp_extra_tokens_are_in_context_capacity():
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=1,
+        max_seq_len=264,
+        max_num_tokens=256,
+        max_draft_len=3,
+        num_extra_kv_tokens=2,
+    )
+
+    assert config.typical_step is not None
+    assert config.typical_step.kv_caches[0].capacity == 258
+    assert config.typical_step.kv_caches[0].history_length == 0
+    assert config.constraints[1].kv_caches[0].capacity == 258
+    assert config.constraints[1].kv_caches[0].history_length == 0
 
 
 def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
