@@ -1332,6 +1332,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -1474,6 +1475,7 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            **kwargs,
         )
         fused_q = None
 
@@ -1520,6 +1522,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
 
@@ -1594,6 +1597,7 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
+            **kwargs,
         )
         fused_q = None
 
