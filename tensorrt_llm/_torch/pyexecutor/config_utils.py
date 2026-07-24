@@ -303,8 +303,8 @@ def extract_mamba_kv_cache_params(
     if layer_mask is None and spec_config is not None:
         # Imported lazily to avoid a circular dependency between
         # config_utils and tensorrt_llm._torch.speculative.
-        from ..speculative.utils import get_num_spec_layers
-        num_spec_layers = get_num_spec_layers(spec_config)
+        from ..speculative.utils import get_num_draft_kv_layers
+        num_spec_layers = get_num_draft_kv_layers(spec_config)
         if num_spec_layers > 0:
             full_attn_mask.extend([True] * num_spec_layers)
             mamba_mask.extend([False] * num_spec_layers)

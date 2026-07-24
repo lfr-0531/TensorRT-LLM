@@ -665,6 +665,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             qc.exclude_modules = remapped
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
+        if model_config.spec_config is not None and self.llm.spec_config is not None:
+            capabilities = self.llm.spec_config._draft_model_capabilities
+            model_config.spec_config._draft_model_capabilities = capabilities
+            model_config_cp.spec_config._draft_model_capabilities = capabilities
 
         # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
@@ -774,6 +778,33 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    @property
+    def epilogue(self):
+        return self.llm.epilogue
+
+    @property
+    def spec_worker(self):
+        return self.llm.spec_worker
+
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights, weight_mapper=None):
+        self.llm.load_draft_weights(weights, weight_mapper)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -1033,6 +1064,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        spec_metadata=None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_params = kwargs.get("multimodal_params", [])[: attn_metadata.num_contexts]
@@ -1081,6 +1114,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     input_ids,
                 )
 
+        spec_input_ids = input_ids
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
@@ -1089,7 +1123,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )
-        logits = self.llm.forward(
+        return self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1098,9 +1132,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             mm_token_type_ids=mm_token_type_ids,
             ple_input_ids=ple_input_ids,
             lora_params=kwargs.get("lora_params", None),
-            spec_metadata=kwargs.get("spec_metadata", None),
+            spec_metadata=spec_metadata,
+            resource_manager=resource_manager,
+            orig_input_ids=spec_input_ids,
         )
-        return logits
 
     @property
     def mm_token_ids(self) -> torch.Tensor:

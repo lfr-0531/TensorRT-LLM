@@ -702,6 +702,22 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
 
+    def test_speculative_runtime_contract_is_proxied_to_language_model(self):
+        model = self._make_model()
+
+        self.assertIs(model.model, model.llm.model)
+        self.assertIs(model.lm_head, model.llm.lm_head)
+        self.assertIs(model.epilogue, model.llm.epilogue)
+        self.assertIs(model.spec_worker, model.llm.spec_worker)
+        self.assertIs(model.draft_config, model.llm.draft_config)
+        self.assertIs(model.draft_model, model.llm.draft_model)
+
+        weights = {"draft": torch.ones(1)}
+        mapper = object()
+        with unittest.mock.patch.object(model.llm, "load_draft_weights") as loader:
+            model.load_draft_weights(weights, mapper)
+        loader.assert_called_once_with(weights, mapper)
+
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""
         model = self._make_model()
