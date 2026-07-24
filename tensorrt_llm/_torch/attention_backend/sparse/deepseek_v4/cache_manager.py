@@ -543,11 +543,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._device_layer_attn_scales = self._layer_attn_scales.to(device=device)
         self._device_scratch_pages = self._scratch_pages.to(device=device)
         self._device_valid_sliding_pool = self._device_layer_attn_pool_ids >= 0
-        self._device_block_positions = torch.arange(
-            self.max_blocks_per_seq,
-            dtype=torch.int32,
-            device=device,
-        )
 
         if self.enable_swa_scratch_reuse:
             valid_scales = self._layer_attn_scales[self._layer_attn_pool_ids >= 0]

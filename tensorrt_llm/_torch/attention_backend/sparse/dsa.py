@@ -469,8 +469,8 @@ _INDEXER_CHUNK_SIZE_HEURISTIC = (
 )
 
 
-def select_indexer_chunk_size(configured_chunk_size: int,
-                              max_k_compressed: int) -> int:
+def _select_indexer_chunk_size(configured_chunk_size: int,
+                               max_k_compressed: int) -> int:
     """Pick the indexer prefill chunk size from the batch's largest K_compressed.
 
     Only reduces ``configured_chunk_size`` (never increases it).
@@ -2103,10 +2103,10 @@ class Indexer(nn.Module):
             # Use indexer's own chunking logic to prevent L^2 complexity of indexer MQA logits computation for long sequences.
             # This is only used when MLA chunked prefill is not enabled.
             # Adapt chunk size to the batch's largest K_compressed (see
-            # select_indexer_chunk_size).
+            # _select_indexer_chunk_size).
             max_k_compressed = int(indexer_params.kv_lens[:num_contexts].max().
                                    item()) if num_contexts > 0 else 0
-            effective_chunk_size = select_indexer_chunk_size(
+            effective_chunk_size = _select_indexer_chunk_size(
                 metadata.indexer_max_chunk_size, max_k_compressed)
             chunk_groups = split_prefill_chunks(
                 seq_lens[:num_contexts],

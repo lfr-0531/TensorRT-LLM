@@ -3948,9 +3948,12 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            # Force the full dataset even when CI exports INTEGRATION_TEST=1.
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
                 score = task.evaluate(
                     llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # evaluate() checks the statistical hypothesis threshold; this
+            # deployment gate also requires the raw registered accuracy floor.
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
@@ -3994,9 +3997,12 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            # Force the full dataset even when CI exports INTEGRATION_TEST=1.
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
                 score = task.evaluate(
                     llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # evaluate() checks the statistical hypothesis threshold; this
+            # deployment gate also requires the raw registered accuracy floor.
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")

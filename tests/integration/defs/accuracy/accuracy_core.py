@@ -198,7 +198,7 @@ class AccuracyTask:
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 is_integration_test: bool = False):
+                 is_integration_test: bool = False) -> float:
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:

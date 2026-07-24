@@ -304,7 +304,7 @@ __global__ void computeSlidingBlockTablesWithScratchRowsKernel(int32_t const* __
         }
 
         int32_t const base = blockOffsets[blockOffsetsOffset + blockId];
-        output[outputOffset + blockId] = base == kBadPageIndex ? kBadPageIndex : base * scale + layerOffset;
+        output[outputOffset + blockId] = applyScaleAndOffset(base, scale, layerOffset);
     }
 }
 
