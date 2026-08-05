@@ -1247,8 +1247,6 @@ class PyTorchModelEngine(ModelEngine):
         # warmup. No-op on non-DSA models.
         self._warmup_dg_paged_mqa_logits_metadata()
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
-        self._warmup_cute_dsl_radix_topk()
-        log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -1352,28 +1350,6 @@ class PyTorchModelEngine(ModelEngine):
                     f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}); "
                     f"skipping bucket. {type(e).__name__}: {e}")
         torch.cuda.synchronize()
-
-    def _warmup_cute_dsl_radix_topk(self) -> None:
-        """Pre-compile the DSA radix-filter CuTe DSL decode top-k for every
-        cluster_size band during warmup, before serving.
-
-        Captured geometries are already compiled by the warmup-step forwards;
-        this fills in the bands the eager (non-captured) decode path can still
-        hit (mixed prefill+decode batch, or cuda_graph disabled) so they do
-        not pay a first-touch JIT stall on a live request. DSA-specific params
-        live on the metadata, so delegate to it. No-op on non-DSA models.
-        """
-        attn_meta = getattr(self, "attn_metadata", None)
-        if attn_meta is None:
-            return
-        try:
-            from ..attention_backend.sparse.dsa import \
-                DSAtrtllmAttentionMetadata
-        except ImportError:
-            return
-        if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
-            next_n = 1 + self.original_max_draft_len
-            attn_meta.warmup_cute_dsl_radix_topk(next_n)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -2531,6 +2507,23 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
+    def _prepare_sparse_attention_modules(
+            self, attn_metadata: AttentionMetadata) -> None:
+        """Prepare sparse module state before any model forward uses metadata."""
+        prepared_metadata_ids = getattr(
+            self, "_prepared_sparse_attention_metadata_ids", None)
+        if prepared_metadata_ids is None:
+            prepared_metadata_ids = set()
+            self._prepared_sparse_attention_metadata_ids = prepared_metadata_ids
+        metadata_id = id(attn_metadata)
+        if metadata_id in prepared_metadata_ids:
+            return
+        for module in self.model.modules():
+            prepare = getattr(module, "prepare_sparse_attn", None)
+            if callable(prepare):
+                prepare(attn_metadata)
+        prepared_metadata_ids.add(metadata_id)
+
     def _set_up_attn_metadata(
         self,
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
@@ -2605,7 +2598,6 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
-
         return self.attn_metadata
 
     @property
@@ -6332,6 +6324,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_resource_manager = None
             spec_metadata = None
+
+        self._prepare_sparse_attention_modules(attn_metadata)
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
