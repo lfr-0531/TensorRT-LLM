@@ -40,7 +40,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
-    indexers: tuple[Indexer, ...] = ()
+    indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
@@ -640,7 +640,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_contexts: int = 0,
     ):
         """Update speculative decoding parameters and create expanded buffers."""
-        previous_max_draft_tokens = self.max_draft_tokens
         super().update_spec_dec_param(
             batch_size,
             is_spec_decoding_enabled,
@@ -667,8 +666,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
             # elements").
             self._create_radix_aux_buffers(capture_graph=capture_graph)
-        if self.max_draft_tokens != previous_max_draft_tokens:
-            Indexer.prepare(metadata=self)
 
     def _get_pool_block_indices(self) -> torch.Tensor:
         """Extract memory pool block indices from host_kv_cache_block_offsets.
