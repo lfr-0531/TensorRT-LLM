@@ -1185,6 +1185,8 @@ class PyTorchModelEngine(ModelEngine):
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
         log_mem_snapshot("warmup/before_warmup")
+        self._warmup_sparse_top_k()
+        log_mem_snapshot("warmup/after_sparse_top_k")
         if not is_enc_dec:
             self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -1254,6 +1256,13 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
+
+    def _warmup_sparse_top_k(self) -> None:
+        """Warm up DSA Top-K kernels before any model forward or graph capture."""
+        from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
+
+        if isinstance(self.attn_metadata, DSAtrtllmAttentionMetadata):
+            self.attn_metadata.warmup_top_k(1 + self.original_max_draft_len)
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
