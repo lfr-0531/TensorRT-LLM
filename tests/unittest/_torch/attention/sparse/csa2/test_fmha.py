@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.fmha import run_flash_mla
+from tensorrt_llm._torch.attention.backends.sparse.csa2.fmha import run_flash_mla
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

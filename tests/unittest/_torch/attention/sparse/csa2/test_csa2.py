@@ -7,20 +7,20 @@ from collections import Counter
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.backend import (
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
     CSA2Batch,
     CSA2Cache,
     CSA2GlobalPages,
     CSA2Routing,
     DeepseekV41SparseAttention,
 )
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.params import CSA2Layout, CSA2Mode
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.quantization import (
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Mode
+from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     pack_rows,
     row_bytes,
     unpack_rows,
 )
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.selection import (
+from tensorrt_llm._torch.attention.backends.sparse.csa2.selection import (
     index_scores,
     select_candidate_positions,
     select_topk_positions,

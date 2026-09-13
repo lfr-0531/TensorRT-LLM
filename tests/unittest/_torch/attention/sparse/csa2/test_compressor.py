@@ -135,7 +135,7 @@ def test_ratio2_native_cuda_graph_changed_partial_state():
 
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_compressor_module_pre_rope_latent(ratio):
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.compressor import (
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import (
         CSA2CompressionBatch,
         CSA2Compressor,
     )

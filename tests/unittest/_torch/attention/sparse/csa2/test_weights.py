@@ -6,9 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.weights import (
-    load_attention_weights,
-)
+from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import load_attention_weights
 
 
 def _parameters():

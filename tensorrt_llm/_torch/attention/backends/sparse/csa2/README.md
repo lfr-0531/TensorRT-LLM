@@ -1,7 +1,7 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# DeepSeek-V4.1 CSA2 attention components
+# Compressed Sparse Attention 2 (CSA2)
 
 This package contains the CSA2 attention component implementation. It is not
 registered as a complete `DeepseekV41ForCausalLM` model. Executor metadata and
@@ -69,7 +69,7 @@ available for component/reference testing.
 
 ## Validation boundaries
 
-Tests in `tests/unittest/_torch/attention/sparse/deepseek_v41/` cover ownership,
+Tests in `tests/unittest/_torch/attention/sparse/csa2/` cover ownership,
 quantized layouts, candidate selection, all three reuse modes, weight loading,
 native ratio-2 compression, ratio-4/128 regression and FlashMLA/graph numerics.
 A synthetic ratio-two Full-module regression covers incomplete/completed

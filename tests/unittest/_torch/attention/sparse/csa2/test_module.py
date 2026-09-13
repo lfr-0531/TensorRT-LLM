@@ -33,20 +33,16 @@ def test_ratio2_module_partial_groups(monkeypatch):
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.backend import (
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
         CSA2Batch,
         CSA2Cache,
         CSA2GlobalPages,
         CSA2Routing,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.compressor import (
-        CSA2CompressionBatch,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.module import (
-        DeepseekV41Attention,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.params import CSA2Layout
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v41.quantization import (
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2CompressionBatch
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         pack_rows,
         unpack_rows,
     )
