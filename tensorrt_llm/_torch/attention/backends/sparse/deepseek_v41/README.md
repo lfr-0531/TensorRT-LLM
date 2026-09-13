@@ -72,8 +72,11 @@ available for component/reference testing.
 Tests in `tests/unittest/_torch/attention/sparse/deepseek_v41/` cover ownership,
 quantized layouts, candidate selection, all three reuse modes, weight loading,
 native ratio-2 compression, ratio-4/128 regression and FlashMLA/graph numerics.
-They do not establish complete model inference, end-to-end attention-module
-forward, distributed execution, prefix-cache scheduling or performance parity.
+A synthetic ratio-two Full-module regression covers incomplete/completed
+compression groups, cache preservation and projected output against an unfused
+reference. These tests do not establish released-checkpoint parity, complete
+model inference, distributed execution, prefix-cache scheduling or performance
+parity.
 
 Numerical definitions follow the official
 [reference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)

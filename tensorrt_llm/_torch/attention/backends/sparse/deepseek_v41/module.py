@@ -197,6 +197,10 @@ class DeepseekV41Attention(nn.Module):
         )
 
     def _rope(self, x: torch.Tensor, positions: torch.Tensor, heads: int) -> torch.Tensor:
+        # Incomplete compression groups publish no rows; the native RoPE
+        # launcher requires a nonzero token grid.
+        if x.shape[0] == 0:
+            return x
         torch.ops.trtllm.mla_rope_inplace(
             x,
             positions.reshape(-1),
@@ -223,7 +227,8 @@ class DeepseekV41Attention(nn.Module):
     ) -> torch.Tensor:
         """Return [tokens, hidden_size]; all packed rows must retain source order.
 
-        ``compressed_positions`` contains the first token position of each
+        ``positions`` and ``compressed_positions`` are contiguous CUDA int32
+        tensors. ``compressed_positions`` contains the first token position of each
         completed group. ``global_hidden_states`` is the encoder output when
         decoder global KV is prepared from more rows than its SWA replay.
         """
