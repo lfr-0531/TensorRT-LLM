@@ -6,6 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
@@ -313,3 +315,38 @@ def test_prepared_cpu_reference():
     )
     expected = _reference_select_topk_positions(scores, positions, lengths, 4)
     torch.testing.assert_close(actual, expected)
+
+
+def test_csa2_specializes_shared_indexer():
+    layout = CSA2Layout(
+        (1, 1),
+        (0,),
+        (0, 1),
+        candidate_source_layer_id=0,
+        candidate_topk_blocks=2,
+        candidate_block_size=4,
+        index_topk=4,
+    )
+    for layer in (0, 1):
+        indexer = CSA2Indexer(layout, layer, 8, 128)
+        assert isinstance(indexer, Indexer)
+        assert CSA2Indexer.forward_prepared is Indexer.forward_prepared
+        assert CSA2Indexer.select_prepared_scores is Indexer.select_prepared_scores
+        assert list(indexer.parameters()) == []
+        assert isinstance(indexer.top_k, TopK)
+    indexer = CSA2Indexer(layout, 0, 8, 128)
+    scores = torch.tensor(
+        [
+            [99.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.1],
+            [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
+        ]
+    )
+    visible = torch.tensor([9, 0], dtype=torch.int32)
+    scores[1].fill_(-torch.inf)
+    results = {}
+    indexer._publish_candidates(scores[:1], visible[:1], results, 0, 2)
+    indexer._publish_candidates(scores[1:], visible[1:], results, 1, 2)
+    expected = _reference_select_candidate_positions(scores, visible, 2, 4)
+    torch.testing.assert_close(results[0].sort(-1).values, expected.sort(-1).values)
+    with pytest.raises(ValueError, match="full-query shape"):
+        indexer._publish_candidates(scores[1:], visible[1:], {}, 1, 2)

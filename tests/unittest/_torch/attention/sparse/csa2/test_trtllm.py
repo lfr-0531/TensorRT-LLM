@@ -240,11 +240,7 @@ def test_standard_backend_multiple_tiles_and_reuse():
         CSA2CacheManager,
         CSA2CacheRole,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
-        CSA2Batch,
-        CSA2Routing,
-        CSA2TrtllmMetadata,
-    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
         CSA2BackendForwardArgs,
         CSA2ForwardState,
@@ -285,28 +281,33 @@ def test_standard_backend_multiple_tiles_and_reuse():
         index_q = torch.randn(count, 2, 128, device="cuda", dtype=torch.bfloat16)
         weights = torch.ones(count, 2, device="cuda", dtype=torch.bfloat16)
         sink = torch.randn(heads, device="cuda")
-        routing = CSA2Routing()
+        runtime.reset_routing()
         global_base = manager.get_cache_indices(100, 0, CSA2CacheRole.GLOBAL)[0] * 128
         global_slots = global_base + torch.arange(6, device="cuda")
+        runtime.csa2_token_requests = torch.zeros(count, dtype=torch.int64, device="cuda")
+        runtime.csa2_global_page_tables = {
+            0: torch.tensor([[global_base // 128]], dtype=torch.int32, device="cuda")
+        }
+        runtime.csa2_global_page_sizes = {0: 128}
+        runtime.csa2_global_max_positions = {0: 6}
+        runtime.csa2_main_write_slots = {0: global_slots}
+        runtime.csa2_kv_sources = {0: 0, 1: 0, 2: 0}
+        runtime.csa2_swa_indices = {}
+        runtime.csa2_swa_write_slots = {}
+        runtime.csa2_visible_lengths = {}
         for layer in range(3):
             swa_base = manager.get_cache_indices(100, layer, CSA2CacheRole.SWA)[0] * 128
             local = positions[:, None] - torch.arange(4, device="cuda")[None, :]
             swa_slots = torch.where(local >= 0, local + swa_base, -1)
-            batch = CSA2Batch(
-                swa_slots,
-                positions + swa_base,
-                global_slots.expand(count, -1),
-                positions.remainder(6) + 1,
-                global_slots,
-            )
+            runtime.csa2_swa_indices[layer] = swa_slots
+            runtime.csa2_swa_write_slots[layer] = positions + swa_base
+            runtime.csa2_visible_lengths[layer] = positions.remainder(6) + 1
             args_dict = {}
             if layer != 1:
                 args_dict.update(index_q=index_q * (-1 if layer else 1), index_weights=weights)
             if layer == 0:
                 args_dict.update(main_kv=main, index_k=index_k)
-            state = CSA2ForwardState(
-                cache_manager=manager, batch=batch, routing=routing, swa_kv=swa, **args_dict
-            )
+            state = CSA2ForwardState(metadata=runtime, swa_kv=swa, **args_dict)
             backend = _backend(heads, layer, layout)
             outputs = []
             for start in range(0, count, 16):
@@ -323,8 +324,8 @@ def test_standard_backend_multiple_tiles_and_reuse():
                     )
                 )
             actual = torch.cat(outputs)
-            logical = routing.indices[0 if layer == 1 else layer]
-            slots = batch.global_slot_tile(0, count, logical)
+            logical = runtime.csa2_indices[0 if layer == 1 else layer]
+            slots = runtime.global_slot_tile(layer, 0, count, logical)
             swa_values = gather_rows(manager.get_swa_buffer(layer), swa_slots, 512, "swa")
             main_values = gather_rows(manager.get_main_buffer(0), slots, 512, "main")
             expected = _reference(q, swa_values, main_values, swa_slots >= 0, slots >= 0, sink)

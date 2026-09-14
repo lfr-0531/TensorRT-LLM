@@ -19,7 +19,8 @@ forward and sparse prediction contract:
 | SM90 | `CSA2FlashMLAAttention` | FlashMLA sparse BF16 |
 
 The inherited forward owns output allocation, prediction-hook dispatch and
-FMHA selection. `prediction.py` prepares native sparse inputs.
+FMHA selection. Its sparse hook coordinates cache publication and native
+sparse inputs; metadata owns the selected-row staging buffers.
 `attention/backends/fmha/csa2.py` supplies the FlashInfer/FlashMLA compute
 libraries. There is no separate attention controller or alternate backend
 forward API.
@@ -38,7 +39,7 @@ projected-Q head normalization. Index K is derived from the compressed main
 latent before main-KV RoPE and quantization. Ratio two reuses the native V4
 non-overlap compressor with FP32 state and zero APE; ratio one has no gate.
 
-Prediction uses the existing DSA `Indexer` class in projection-free mode.
+`CSA2Indexer` subclasses the existing DSA `Indexer` in projection-free mode.
 Its shared prepared-input QK-to-TopK flow is also used by DSA's existing prefill
 paths. Native MQA dispatch, exact TopK and output handling belong to that class.
 CSA2 adds its block-max candidate/latest-block rule, logical-position mapping
@@ -74,9 +75,12 @@ or writes outside the cache manager.
 ## Runtime metadata
 
 `CSA2TrtllmMetadata.prepare()` resolves scheduler request IDs, cached lengths
-and V2 page converters into layer-specific `CSA2Batch` and compression inputs.
-`CSA2Routing` belongs to one packed forward and cannot be recycled across eager
-forwards. Source and consumer queries retain the same packed order.
+and V2 page converters into its own layer-specific SWA/visibility tensors,
+owner-specific global page tables/write slots and compression inputs. Routing
+indices and candidates are direct metadata fields, reset for each packed
+forward. Source and consumer queries retain the same packed order. The
+`global_slot_tile()` method resolves owner pages without an additional carrier
+object or a persistent tokens-by-context mapping.
 
 Encoder source rows can be supplied independently of decoder query rows with
 `set_source_batch()` before prepare. Compression output capacity follows source
@@ -88,6 +92,9 @@ Runtime metadata owns fixed-shape compute views shared by serialized layers.
 Different query counts use independent native workspaces. Warm each view with
 the standard forward before capture and set `is_cuda_graph` for captured calls.
 Prepare refreshes persistent device metadata outside capture before replay.
+Graph metadata follows the framework's shallow-clone convention: routing resets
+create independent Python dictionaries, while same-geometry staging/device
+buffers can be shared. Calls and replays must remain serialized.
 
 ## Scope and validation
 

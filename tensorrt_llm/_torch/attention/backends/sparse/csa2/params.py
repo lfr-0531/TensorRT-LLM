@@ -13,8 +13,7 @@ import torch
 from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
 
 if TYPE_CHECKING:
-    from .cache_manager import CSA2CacheManager
-    from .metadata import CSA2Batch, CSA2Routing
+    from .metadata import CSA2TrtllmMetadata
 
 
 class CSA2Mode(Enum):
@@ -192,9 +191,7 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
 class CSA2ForwardState:
     """Projected module inputs and per-forward state consumed by sparse prediction."""
 
-    cache_manager: CSA2CacheManager
-    batch: CSA2Batch
-    routing: CSA2Routing
+    metadata: CSA2TrtllmMetadata
     swa_kv: torch.Tensor
     index_q: torch.Tensor | None = None
     index_weights: torch.Tensor | None = None

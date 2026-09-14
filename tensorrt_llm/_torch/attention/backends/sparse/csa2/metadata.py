@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 
-from .params import CSA2Layer
+from .params import CSA2BackendForwardArgs, CSA2Layer
 
 _SWA_TILE = 128
 _HEAD_DIM = 512
@@ -27,6 +25,21 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     by its indices, so the same DSV4 generation kernel serves all model phases.
     These are compute staging pools, not persistent request-owned KV caches.
     """
+
+    # Request metadata is held directly on this object. Main/index physical
+    # tables and write slots are owner-keyed; SWA and visibility are layer-keyed.
+    csa2_indices: dict[int, torch.Tensor]
+    csa2_candidates: dict[int, torch.Tensor]
+    _csa2_last_layer: int
+    csa2_swa_indices: dict[int, torch.Tensor]
+    csa2_swa_write_slots: dict[int, torch.Tensor]
+    csa2_visible_lengths: dict[int, torch.Tensor]
+    csa2_main_write_slots: dict[int, torch.Tensor]
+    csa2_global_page_tables: dict[int, torch.Tensor]
+    csa2_token_requests: torch.Tensor
+    csa2_global_page_sizes: dict[int, int]
+    csa2_global_max_positions: dict[int, int]
+    csa2_kv_sources: dict[int, int | None]
 
     @property
     def tokens_per_block(self) -> int:
@@ -143,6 +156,86 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             metadata.is_cuda_graph = torch.cuda.is_current_stream_capturing()
         return metadata
 
+    def stage_selected(self, inputs: CSA2BackendForwardArgs) -> None:
+        """Refresh bounded BF16 pools and indices for one selected query tile.
+
+        This prepares compute buffers only; the backend publishes native ABI
+        arguments and performs attention after staging completes.
+        """
+        from .quantization import gather_rows
+
+        count = self.num_tokens
+        if inputs.swa_pool is None or inputs.swa_indices is None:
+            raise ValueError("CSA2 requires selected SWA pool inputs")
+        if inputs.swa_pool.device != self.swa_pool.device:
+            raise ValueError("CSA2 Q, packed pools and metadata must be on the same CUDA device")
+        if (
+            inputs.swa_indices.ndim != 2
+            or inputs.swa_indices.shape[0] != count
+            or inputs.swa_indices.shape[1] > _SWA_TILE
+        ):
+            raise ValueError("CSA2 SWA indices must match the query count and window <=128")
+        swa = gather_rows(inputs.swa_pool, inputs.swa_indices, _HEAD_DIM, "swa")
+        swa_valid = inputs.swa_indices >= 0
+        extra = extra_valid = None
+        if inputs.topk_indices is not None:
+            if inputs.main_pool is None or inputs.main_pool.device != self.swa_pool.device:
+                raise ValueError(
+                    "CSA2 selected main indices require a main pool on the query device"
+                )
+            if (
+                inputs.topk_indices.ndim != 2
+                or inputs.topk_indices.shape[0] != count
+                or inputs.topk_indices.shape[1] > self.num_sparse_topk - _SWA_TILE
+            ):
+                raise ValueError("CSA2 selected main indices exceed metadata geometry")
+            extra = gather_rows(inputs.main_pool, inputs.topk_indices, _HEAD_DIM, "main")
+            extra_valid = inputs.topk_indices >= 0
+        self.prepared_counter.zero_()
+        if extra is not None:
+            if extra_valid is None:
+                raise ValueError("Extra KV rows require a validity mask")
+            rows = torch.cat((swa, extra), dim=1)
+            valid = torch.cat((swa_valid, extra_valid), dim=1)
+        else:
+            rows, valid = swa, swa_valid
+        # TG uses a dense valid prefix, split at slot 128 between its pools.
+        # Compact the selected union before staging: -1 slots inside the
+        # supplied extent can contribute zero logits in BF16 generation.
+        # Physical source ownership no longer matters after dequantization.
+        width = rows.shape[1]
+        positions = torch.arange(width, device=swa.device).expand(count, -1)
+        order = torch.where(valid, positions, width).argsort(dim=1, stable=True)
+        packed = rows.gather(1, order[..., None].expand(-1, -1, _HEAD_DIM))
+        lengths = valid.sum(1, dtype=torch.int32)
+        packed = torch.where((positions < lengths[:, None])[..., None], packed, 0)
+        # Zero selected rows reduce to the sink's zero value. Give TG one
+        # zero KV row so it always launches a defined (nonempty) reduction.
+        lengths = lengths.clamp_min(1)
+        self.prepared_lens[:count].copy_(lengths)
+        self.swa_pool[:count].zero_()
+        self.extra_pool[:count].zero_()
+        swa_count = min(width, _SWA_TILE)
+        self.swa_pool[:count, :swa_count].copy_(packed[:, :swa_count])
+        if width > _SWA_TILE:
+            self.extra_pool[:count, : width - _SWA_TILE].copy_(packed[:, _SWA_TILE:])
+        indices = self.prepared_indices[:count]
+        offsets = torch.arange(count, device=swa.device)[:, None]
+        swa_positions = torch.arange(_SWA_TILE, device=swa.device)[None, :]
+        indices[:, :_SWA_TILE].copy_(
+            torch.where(swa_positions < lengths[:, None], offsets * _SWA_TILE + swa_positions, -1)
+        )
+        extra_capacity = self.num_sparse_topk - _SWA_TILE
+        if extra_capacity:
+            extra_positions = torch.arange(extra_capacity, device=swa.device)[None, :]
+            indices[:, _SWA_TILE:].copy_(
+                torch.where(
+                    extra_positions + _SWA_TILE < lengths[:, None],
+                    offsets * extra_capacity + extra_positions,
+                    -1,
+                )
+            )
+
     def set_source_batch(self, seq_lengths: list[int], start_positions: list[int]) -> None:
         """Set encoder source rows independently of decoder query rows.
 
@@ -213,8 +306,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self.csa2_positions = copy(
             "positions", torch.tensor(positions, dtype=torch.int32, device="cpu")
         )
-        self.csa2_routing = CSA2Routing()
-        self._csa2_batches = {}
+        self.reset_routing()
+        self.csa2_swa_indices = {}
+        self.csa2_swa_write_slots = {}
+        self.csa2_visible_lengths = {}
+        self.csa2_main_write_slots = {}
+        self.csa2_global_page_tables = {}
+        self.csa2_global_page_sizes = {}
+        self.csa2_global_max_positions = {}
+        self.csa2_kv_sources = {}
         self._csa2_compression = {}
         self._csa2_compressed_positions = {}
         block = manager.tokens_per_block
@@ -236,13 +336,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             page = int(pages[request, position // page_size])
             return -1 if page < 0 else page * page_size + position % page_size
 
-        owner_pages = {}
-        owner_writes = {}
         capacity = sum(source_lengths)
         for owner in manager.layout.kv_source_layer_ids:
             ratio = manager.layout.compress_ratios[owner]
             pages = table(owner, CSA2CacheRole.GLOBAL)
-            owner_pages[owner] = copy(f"global_pages/{owner}", pages)
+            self.csa2_global_page_tables[owner] = copy(f"global_pages/{owner}", pages)
+            self.csa2_global_page_sizes[owner] = block // ratio
+            self.csa2_global_max_positions[owner] = manager.max_seq_len // ratio
             groups = [
                 [g for g in range(s // ratio, e // ratio)] for s, e in zip(source_starts, ends)
             ]
@@ -254,7 +354,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 raise ValueError("CSA2 source output has no allocated GLOBAL page")
             compressed_positions = [g * ratio for gs in groups for g in gs]
             padding = capacity - len(write_slots)
-            owner_writes[owner] = copy(
+            self.csa2_main_write_slots[owner] = copy(
                 f"writes/{owner}",
                 torch.tensor(write_slots + [-1] * padding, dtype=torch.int64, device="cpu"),
             )
@@ -305,7 +405,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 )
         requests_host = torch.tensor(token_requests, dtype=torch.int64, device="cpu")
         positions_host = torch.tensor(positions, dtype=torch.int64, device="cpu")
-        requests_device = copy("token_requests", requests_host)
+        self.csa2_token_requests = copy("token_requests", requests_host)
         window = manager.layout.window_size
         logical_swa = positions_host[:, None] - window + 1 + torch.arange(window, device="cpu")
         logical_pages = logical_swa.clamp_min(0) // block
@@ -319,137 +419,61 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             writes = reads[:, -1]
             if torch.any(writes < 0):
                 raise ValueError("CSA2 query output has no allocated SWA page")
-            swa_reads = copy(f"swa_reads/{layer_idx}", reads)
-            swa_writes = copy(f"swa_writes/{layer_idx}", writes)
-            if layer.kv_source is None:
-                global_pages = copy(
-                    f"empty_global/{layer_idx}",
-                    torch.empty((len(positions), 0), dtype=torch.int64, device="cpu"),
-                )
-                visible = torch.zeros(len(positions), dtype=torch.int64, device="cpu")
-                main_writes = copy(
-                    f"empty_writes/{layer_idx}", torch.empty(0, dtype=torch.int64, device="cpu")
-                )
-            else:
-                ratio = layer.compress_ratio
-                global_pages = CSA2GlobalPages(
-                    owner_pages[layer.kv_source],
-                    requests_device,
-                    block // ratio,
-                    manager.max_seq_len // ratio,
-                )
-                visible = (positions_host + 1) // ratio
-                main_writes = owner_writes[layer.kv_source]
-            self._csa2_batches[layer_idx] = CSA2Batch(
-                swa_reads,
-                swa_writes,
-                global_pages,
-                copy(f"visible/{layer_idx}", visible),
-                main_writes,
+            self.csa2_swa_indices[layer_idx] = copy(f"swa_reads/{layer_idx}", reads)
+            self.csa2_swa_write_slots[layer_idx] = copy(f"swa_writes/{layer_idx}", writes)
+            self.csa2_kv_sources[layer_idx] = layer.kv_source
+            visible = (
+                torch.zeros(len(positions), dtype=torch.int64, device="cpu")
+                if layer.kv_source is None
+                else (positions_host + 1) // layer.compress_ratio
             )
+            self.csa2_visible_lengths[layer_idx] = copy(f"visible/{layer_idx}", visible)
 
-    def get_layer_batch(self, layer_idx: int):
-        return self._csa2_batches[layer_idx]
+    def reset_routing(self) -> None:
+        """Begin one packed forward; graph replay recomputes captured producers."""
+        self.csa2_indices = {}
+        self.csa2_candidates = {}
+        self._csa2_last_layer = -1
+
+    def enter_layer(self, layer: CSA2Layer) -> None:
+        if layer.layer_idx <= self._csa2_last_layer:
+            raise ValueError("CSA2 routing cannot be reused across forwards or reordered layers")
+        self._csa2_last_layer = layer.layer_idx
+
+    def global_slot_tile(
+        self, layer_idx: int, start: int, end: int, logical: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Resolve one query tile through its owner's current physical pages.
+
+        Page tables stay request-by-page; no persistent token-by-context mapping
+        is allocated. Invalid logical entries, request rows and absent pages
+        resolve to -1. A SWA-only layer has no global entries.
+        """
+        requests = self.csa2_token_requests[start:end].long()
+        owner = self.csa2_kv_sources[layer_idx]
+        if owner is None:
+            return torch.empty((requests.shape[0], 0), dtype=torch.int64, device=requests.device)
+        table = self.csa2_global_page_tables[owner]
+        page_size = self.csa2_global_page_sizes[owner]
+        max_positions = self.csa2_global_max_positions[owner]
+        if logical is None:
+            logical = torch.arange(max_positions, device=table.device)
+            logical = logical.expand(requests.shape[0], -1)
+        logical = logical.long()
+        if table.shape[0] == 0 or table.shape[1] == 0:
+            return torch.full_like(logical, -1)
+        pages = logical.clamp_min(0) // page_size
+        valid = (logical >= 0) & (logical < max_positions) & (pages < table.shape[1])
+        valid &= ((requests >= 0) & (requests < table.shape[0]))[:, None]
+        physical = table[
+            requests.clamp(0, table.shape[0] - 1)[:, None],
+            pages.clamp(max=table.shape[1] - 1),
+        ]
+        slots = physical.long() * page_size + logical % page_size
+        return torch.where(valid & (physical >= 0), slots, -1)
 
     def get_compression_batch(self, owner: int):
         return self._csa2_compression.get(owner)
 
     def get_compressed_positions(self, owner: int) -> torch.Tensor:
         return self._csa2_compressed_positions[owner]
-
-
-@dataclass
-class CSA2Routing:
-    """Per-forward logical indices; construct afresh for each packed batch.
-
-    CUDA Graph capture records producers and consumers on the same stream.
-    Each replay recomputes the captured tensors; Python dictionaries are only
-    traversed during capture. Eager forwards must not recycle this object.
-    """
-
-    indices: dict[int, torch.Tensor] = field(default_factory=dict)
-    candidates: dict[int, torch.Tensor] = field(default_factory=dict)
-    _last_layer: int = -1
-
-    def enter(self, layer: CSA2Layer) -> None:
-        if layer.layer_idx <= self._last_layer:
-            raise ValueError("CSA2 routing cannot be reused across forwards or reordered layers")
-        self._last_layer = layer.layer_idx
-
-
-@dataclass(frozen=True)
-class CSA2GlobalPages:
-    """Source pool page table without a tokens-by-context mapping allocation.
-
-    page_table is [requests, logical_pages], request_ids is [query_tokens].
-    Page IDs are relative to this owner's pool; -1 denotes an absent page.
-    ``tokens_per_page`` counts global entries, after ratio-two compression.
-    """
-
-    page_table: torch.Tensor
-    request_ids: torch.Tensor
-    tokens_per_page: int
-    max_positions: int
-
-    def __post_init__(self) -> None:
-        if self.page_table.ndim != 2 or self.request_ids.ndim != 1:
-            raise ValueError("CSA2 page table/request IDs have invalid ranks")
-        if self.tokens_per_page <= 0 or self.max_positions < 0:
-            raise ValueError("CSA2 page capacity must be positive and context bound nonnegative")
-
-    def resolve(self, start: int, end: int, logical: torch.Tensor | None = None) -> torch.Tensor:
-        requests = self.request_ids[start:end].long()
-        if logical is None:
-            logical = torch.arange(self.max_positions, device=self.page_table.device)
-            logical = logical.expand(requests.shape[0], -1)
-        logical = logical.long()
-        if self.page_table.shape[0] == 0 or self.page_table.shape[1] == 0:
-            return torch.full_like(logical, -1)
-        pages = logical.clamp_min(0) // self.tokens_per_page
-        valid = (logical >= 0) & (logical < self.max_positions) & (pages < self.page_table.shape[1])
-        valid &= ((requests >= 0) & (requests < self.page_table.shape[0]))[:, None]
-        physical = self.page_table[
-            requests.clamp(0, self.page_table.shape[0] - 1)[:, None],
-            pages.clamp(max=self.page_table.shape[1] - 1),
-        ]
-        slots = physical.long() * self.tokens_per_page + logical % self.tokens_per_page
-        return torch.where(valid & (physical >= 0), slots, -1)
-
-
-@dataclass(frozen=True)
-class CSA2Batch:
-    """Device metadata for one packed layer execution.
-
-    swa_indices: [tokens, window] pool-relative row indices, -1 for padding.
-    swa_write_slots: [tokens], distinct valid pool rows (including dummy rows).
-    global_slots: [tokens, max_global_positions], maps logical global positions
-        to the owner's pool rows. Missing entries are -1.
-    visible_lengths: [tokens], floor((absolute_position + 1) / ratio).
-    main_write_slots: [new_latents], distinct valid rows for completed groups.
-
-    A consumer resolves its logical routing against its own view of the source
-    pool. Prefix reuse and request reordering therefore cannot reuse stale
-    physical indices. Main/index pools use the same physical slot numbering.
-    """
-
-    swa_indices: torch.Tensor
-    swa_write_slots: torch.Tensor
-    global_slots: torch.Tensor | CSA2GlobalPages
-    visible_lengths: torch.Tensor
-    main_write_slots: torch.Tensor
-
-    def global_slot_tile(
-        self, start: int, end: int, logical: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        if isinstance(self.global_slots, CSA2GlobalPages):
-            return self.global_slots.resolve(start, end, logical)
-        slots = self.global_slots[start:end]
-        return slots if logical is None else _resolve_slots(slots, logical)
-
-
-def _resolve_slots(global_slots: torch.Tensor, logical: torch.Tensor) -> torch.Tensor:
-    if global_slots.shape[1] == 0:
-        return torch.full_like(logical, -1, dtype=torch.int64)
-    valid = (logical >= 0) & (logical < global_slots.shape[1])
-    slots = global_slots.gather(1, logical.long().clamp(0, global_slots.shape[1] - 1))
-    return torch.where(valid, slots, -1).long()

@@ -239,9 +239,6 @@ class DeepseekV41Attention(nn.Module):
         completed group. ``global_hidden_states`` is the encoder output when
         decoder global KV is prepared from more rows than its SWA replay.
         """
-        manager = attn_metadata.kv_cache_manager
-        batch = attn_metadata.get_layer_batch(self.layer.layer_idx)
-        routing = attn_metadata.csa2_routing
         compression = attn_metadata.get_compression_batch(self.layer.layer_idx)
         compressed_positions = (
             attn_metadata.get_compressed_positions(self.layer.layer_idx)
@@ -282,9 +279,7 @@ class DeepseekV41Attention(nn.Module):
         )
 
         state = CSA2ForwardState(
-            cache_manager=manager,
-            batch=batch,
-            routing=routing,
+            metadata=attn_metadata,
             swa_kv=swa,
             index_q=index_q,
             index_weights=index_weights,
