@@ -321,7 +321,6 @@ def test_csa2_specializes_shared_indexer():
     for layer in (0, 1):
         indexer = CSA2Indexer(layout, layer, 8, 128)
         assert isinstance(indexer, Indexer)
-        assert CSA2Indexer._run_query_chunks is Indexer._run_query_chunks
         assert CSA2Indexer._call_mqa_logits is Indexer._call_mqa_logits
         assert CSA2Indexer._call_paged_mqa_logits is Indexer._call_paged_mqa_logits
         assert list(indexer.parameters()) == []

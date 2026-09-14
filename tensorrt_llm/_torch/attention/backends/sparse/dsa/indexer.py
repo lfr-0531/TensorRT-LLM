@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -500,31 +499,21 @@ class IndexerPrefillChunkMetadata:
     k_token_end: int  # K token end index in batch
 
 
-@dataclass
-class IndexerChunkInputs:
-    """Shared K matrix and query-row bounds for one indexer chunk/tile."""
-
-    k_data: torch.Tensor
-    k_scale: torch.Tensor
-    row_starts: torch.Tensor
-    row_ends: torch.Tensor
-    logical_positions: Optional[torch.Tensor] = None
-    visible_lengths: Optional[torch.Tensor] = None
-
-
-@dataclass
-class IndexerQueryChunk:
-    """Lazy K preparation, after request-level TP splitting for candidate K."""
-
-    token_start: int
-    token_end: int
-    k_token_count: int
-    load: Optional[Callable[[], IndexerChunkInputs]] = None
-    allow_query_split: bool = True
-    load_tile: Optional[Callable[[int, int], IndexerChunkInputs]] = None
-    keys_per_query: int = 0
-    max_query_tokens: Optional[int] = None
-    is_prefill: bool = True
+def _split_prefill_queries(
+    count: int, mapping: Optional[Mapping], threshold: int
+) -> Tuple[int, int, Optional[List[int]]]:
+    """Return local query bounds and optional sizes for a TP prefill gather."""
+    if (
+        threshold < 0
+        or count < threshold
+        or mapping is None
+        or mapping.enable_attention_dp
+        or mapping.tp_size <= 1
+    ):
+        return 0, count, None
+    size, rank = mapping.tp_size, mapping.tp_rank
+    sizes = [(r + 1) * count // size - r * count // size for r in range(size)]
+    return count * rank // size, count * (rank + 1) // size, sizes
 
 
 @maybe_compile(dynamic=True)
@@ -1456,38 +1445,6 @@ class Indexer(nn.Module):
             row_ends=row_ends,
         )
 
-    def _forward_indexer_tile(
-        self,
-        inputs: IndexerChunkInputs,
-        q_data: torch.Tensor,
-        weights: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
-        output: torch.Tensor,
-        *,
-        is_prefill: bool = True,
-        score_hook: Optional[Callable[[torch.Tensor], None]] = None,
-        radix_aux_indices: Optional[torch.Tensor] = None,
-        radix_aux_logits: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Template for a query tile; specialized indexers own mapping/hooks."""
-        if (
-            not is_prefill
-            or inputs.logical_positions is not None
-            or inputs.visible_lengths is not None
-            or score_hook is not None
-        ):
-            raise NotImplementedError("Mapped/decode tiles require a specialized indexer")
-        return self.forward_prepared(
-            q_data,
-            inputs.k_data,
-            inputs.k_scale,
-            weights,
-            inputs.row_starts,
-            inputs.row_ends,
-            output,
-            q_scale,
-        )
-
     @staticmethod
     def _decode_mxfp4(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """Decode existing FP4 index inputs without introducing FP8 rounding."""
@@ -1614,125 +1571,6 @@ class Indexer(nn.Module):
             max_seq_len,
         )
 
-    def _run_query_chunks(
-        self,
-        chunks: List[IndexerQueryChunk],
-        q_data: torch.Tensor,
-        weights: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
-        output: torch.Tensor,
-        mapping: Optional[Mapping],
-        q_split_threshold: int,
-        score_hook: Optional[Callable[[torch.Tensor, int, int], None]] = None,
-        auxiliary_outputs: Tuple[torch.Tensor, ...] = (),
-        radix_aux_indices: Optional[torch.Tensor] = None,
-        radix_aux_logits: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Shared request chunking, TP Q-splitting and bounded MQA execution."""
-        split_eligible = (
-            q_split_threshold >= 0
-            and mapping is not None
-            and not mapping.enable_attention_dp
-            and mapping.tp_size > 1
-        )
-        for chunk in chunks:
-            count = chunk.token_end - chunk.token_start
-            if count < 0 or chunk.token_start < 0 or chunk.token_end > q_data.shape[0]:
-                raise ValueError("Indexer chunk query bounds are outside the projected batch")
-            if count == 0 or chunk.k_token_count <= 0:
-                output[chunk.token_start : chunk.token_end].fill_(-1)
-                for auxiliary in auxiliary_outputs:
-                    auxiliary[chunk.token_start : chunk.token_end].fill_(-1)
-                continue
-            if (chunk.load is None) == (chunk.load_tile is None):
-                raise ValueError("Indexer chunks require exactly one shared or tiled K loader")
-            split = (
-                split_eligible
-                and chunk.is_prefill
-                and chunk.allow_query_split
-                and count >= q_split_threshold
-            )
-            local_start = count * mapping.tp_rank // mapping.tp_size if split else 0
-            local_end = count * (mapping.tp_rank + 1) // mapping.tp_size if split else count
-            shared = chunk.load() if chunk.load is not None else None
-            budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
-            if self.use_fp4 and (
-                self.head_dim != 128 or not q_data.is_cuda or get_sm_version() < 100
-            ):
-                # The decoded fallback also materializes per-head dot products.
-                budget = max(1, budget // self.n_heads)
-            if chunk.load_tile is not None:
-                if chunk.keys_per_query <= 0:
-                    raise ValueError("Tiled candidate K loaders require a per-query key bound")
-                tile_size = max(1, math.isqrt(budget // chunk.keys_per_query))
-            else:
-                tile_size = max(1, budget // max(1, chunk.k_token_count))
-            if chunk.max_query_tokens is not None:
-                if chunk.max_query_tokens <= 0:
-                    raise ValueError("Indexer query tile capacity must be positive")
-                tile_size = min(tile_size, chunk.max_query_tokens)
-            for offset in range(local_start, local_end, tile_size):
-                stop = min(offset + tile_size, local_end)
-                first, last = chunk.token_start + offset, chunk.token_start + stop
-                if shared is None:
-                    inputs = chunk.load_tile(first, last)
-                    row_slice = slice(None)
-                else:
-                    inputs = shared
-                    row_slice = slice(offset, stop)
-                logical = (
-                    inputs.logical_positions[row_slice]
-                    if inputs.logical_positions is not None
-                    else None
-                )
-                visible = (
-                    inputs.visible_lengths[row_slice]
-                    if inputs.visible_lengths is not None
-                    else None
-                )
-                hook = None
-                if score_hook is not None:
-
-                    def hook(scores, first=first, last=last):
-                        score_hook(scores, first, last)
-
-                tile_inputs = IndexerChunkInputs(
-                    inputs.k_data,
-                    inputs.k_scale,
-                    inputs.row_starts[row_slice],
-                    inputs.row_ends[row_slice],
-                    logical,
-                    visible,
-                )
-                self._forward_indexer_tile(
-                    tile_inputs,
-                    q_data[first:last],
-                    weights[first:last],
-                    q_scale[first:last] if q_scale is not None else None,
-                    output[first:last],
-                    is_prefill=chunk.is_prefill,
-                    score_hook=hook,
-                    radix_aux_indices=radix_aux_indices[first:last]
-                    if radix_aux_indices is not None
-                    else None,
-                    radix_aux_logits=radix_aux_logits[first:last]
-                    if radix_aux_logits is not None
-                    else None,
-                )
-            if split:
-                sizes = [
-                    (r + 1) * count // mapping.tp_size - r * count // mapping.tp_size
-                    for r in range(mapping.tp_size)
-                ]
-                first, last = chunk.token_start + local_start, chunk.token_start + local_end
-                for tensor in (output, *auxiliary_outputs):
-                    tensor[chunk.token_start : chunk.token_end] = allgather(
-                        tensor[first:last],
-                        mapping,
-                        dim=0,
-                        sizes=sizes,
-                    )
-
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1750,9 +1588,6 @@ class Indexer(nn.Module):
         batch. Otherwise they contain only the selected context or generation
         phase. ``q_scale`` is only consumed by the FP4 dispatch.
 
-        The shared chunk driver handles query tiling and TP splitting; model
-        specializations can override its tile template without changing DSA's
-        phase, cache, MTP or GVR contracts.
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
@@ -1812,44 +1647,78 @@ class Indexer(nn.Module):
                     else 8192
                 )
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
+                # FP4 packs two codes per byte so the gathered row holds half
+                # as many bytes as in the FP8 path. The scale (4 bytes) is the
+                # same in both modes because FP4 packs four UE8M0 exponents
+                # into one int32 to match FP8's float32 scale width.
                 gather_head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
-                chunks = []
-                for chunk in metadata.indexer_prefill_chunks:
-                    num_k_tokens = chunk.k_token_end - chunk.k_token_start
 
-                    def load(chunk=chunk, num_k_tokens=num_k_tokens):
-                        chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-                            k_cache_4d,
-                            metadata.slot_mapping_fp8_fullkv,
-                            metadata.slot_mapping_scale_fullkv,
-                            chunk.k_token_start,
-                            num_k_tokens,
-                            gather_head_dim,
-                        )
-                        return IndexerChunkInputs(
+                for chunk in metadata.indexer_prefill_chunks:
+                    # Skip chunks with no compressed KV tokens (e.g., warmup
+                    # sequences shorter than compress_ratio produce zero KV).
+                    if chunk.k_token_start >= chunk.k_token_end:
+                        topk_indices_buffer[chunk.token_start : chunk.token_end, :].fill_(-1)
+                        continue
+                    num_k_tokens = chunk.k_token_end - chunk.k_token_start
+                    chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
+                        k_cache_4d,
+                        metadata.slot_mapping_fp8_fullkv,
+                        metadata.slot_mapping_scale_fullkv,
+                        chunk.k_token_start,
+                        num_k_tokens,
+                        gather_head_dim,
+                    )
+
+                    chunk_num_token = chunk.token_end - chunk.token_start
+                    chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
+                        chunk_num_token, metadata.mapping, q_split_threshold
+                    )
+
+                    global_q_start = chunk.token_start + chunk_q_start
+                    global_q_end = chunk.token_start + chunk_q_end
+
+                    # Tile the query dimension so each fp8_mqa_logits call
+                    # allocates at most [q_tile x num_k_tokens] instead of the
+                    # full [local_q x num_k_tokens] (which can reach tens of GB
+                    # on a long context and stall cuMemCreate under
+                    # expandable_segments -> engine hang; see
+                    # _INDEXER_MQA_LOGITS_ELEM_BUDGET). Results are identical:
+                    # each query row's logits/top-k are independent and the KV
+                    # (chunk_k_fp8) is unchanged across tiles, so the per-call
+                    # allocation is the same size and the caching allocator
+                    # reuses one block (peak ~= one tile, no extra sync).
+                    local_q_len = chunk_q_end - chunk_q_start
+                    budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
+                    if self.use_fp4 and (
+                        self.head_dim != 128 or not q_fp8.is_cuda or get_sm_version() < 100
+                    ):
+                        # Decoded MQA also materializes per-head dot products.
+                        budget = max(1, budget // self.n_heads)
+                    q_tile = max(1, min(local_q_len, budget // max(1, num_k_tokens)))
+                    for tile_off in range(0, local_q_len, q_tile):
+                        c0 = chunk_q_start + tile_off
+                        c1 = min(c0 + q_tile, chunk_q_end)
+                        g0 = chunk.token_start + c0
+                        g1 = chunk.token_start + c1
+                        tile_q_scale = q_scale[g0:g1, ...] if self.use_fp4 else None
+                        self.forward_prepared(
+                            q_fp8[g0:g1, ...],
                             chunk_k_fp8,
                             chunk_k_scale,
-                            chunk.cu_seqlen_ks,
-                            chunk.cu_seqlen_ke,
+                            weights[g0:g1, ...],
+                            chunk.cu_seqlen_ks[c0:c1],
+                            chunk.cu_seqlen_ke[c0:c1],
+                            topk_indices_buffer[g0:g1, :],
+                            tile_q_scale,
                         )
 
-                    chunks.append(
-                        IndexerQueryChunk(
-                            chunk.token_start,
-                            chunk.token_end,
-                            num_k_tokens,
-                            load=load,
+                    if q_sizes is not None:
+                        topk_indices_buffer[chunk.token_start : chunk.token_end, :] = allgather(
+                            topk_indices_buffer[global_q_start:global_q_end, :],
+                            metadata.mapping,
+                            dim=0,
+                            sizes=q_sizes,
                         )
-                    )
-                self._run_query_chunks(
-                    chunks,
-                    q_fp8,
-                    weights,
-                    q_scale,
-                    topk_indices_buffer,
-                    metadata.mapping,
-                    q_split_threshold,
-                )
             elif metadata.num_ctx_kv_tokens == 0:
                 # No compressed KV tokens — fill with -1 (no valid indices)
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)

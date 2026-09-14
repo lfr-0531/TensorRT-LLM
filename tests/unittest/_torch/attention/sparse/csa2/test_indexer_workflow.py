@@ -1,19 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared orchestration, strided owner pages, and real paged indexer replay."""
+"""CSA2 scheduling, strided owner pages, and real paged indexer replay."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
+from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+    CSA2Indexer,
+    _ChunkInputs,
+    _QueryChunk,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2ForwardState, CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
-from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
-    IndexerChunkInputs,
-    IndexerQueryChunk,
-)
 from tensorrt_llm._torch.modules.top_k import TopK
 from tensorrt_llm.mapping import Mapping
 
@@ -91,7 +91,7 @@ def test_cached_prefix_chunks_gather_once_and_preserve_offsets(monkeypatch):
     def load(begin, end, width):
         loads.append((begin, end, width))
         starts = torch.zeros(end - begin, device="cuda", dtype=torch.int32)
-        return IndexerChunkInputs(
+        return _ChunkInputs(
             keys[:width, :64].contiguous().view(torch.int8),
             keys[:width, 64:].contiguous(),
             starts,
@@ -101,11 +101,11 @@ def test_cached_prefix_chunks_gather_once_and_preserve_offsets(monkeypatch):
         )
 
     chunks = [
-        IndexerQueryChunk(0, 3, 35, load=lambda: load(0, 3, 35), max_query_tokens=1),
-        IndexerQueryChunk(3, 5, 67, load=lambda: load(3, 5, 67), max_query_tokens=1),
+        _QueryChunk(0, 3, 35, load=lambda: load(0, 3, 35), max_query_tokens=1),
+        _QueryChunk(3, 5, 67, load=lambda: load(3, 5, 67), max_query_tokens=1),
     ]
     out = torch.empty(5, 32, dtype=torch.int32, device="cuda")
-    indexer._run_query_chunks(
+    indexer._run_csa2_chunks(
         chunks,
         packed[..., :64].contiguous().view(torch.int8),
         weights,

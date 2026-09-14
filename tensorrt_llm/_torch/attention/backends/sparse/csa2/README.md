@@ -43,8 +43,10 @@ non-overlap compressor with FP32 state and zero APE; ratio one has no gate.
 Its `sparse_attn_indexer()` override adapts the model's cache and phase
 semantics once per complete layer batch, before attention tiles consume the
 results. CSA2 logical mapping and paged staging stay in this subclass and its
-metadata; the DSA dispatcher has no CSA2-specific prepared-input branch. DSA, V4 and CSA2 share the prefill chunk
-runner, query TP partitioning, bounded logits tiling and the shared
+metadata. DSA keeps its own prefill flow; CSA2 owns candidate loading, logits
+workspace limits and candidate-output synchronization. Both use the same
+pure TP query-partition calculation, existing allgather operation, inherited
+MQA kernels and the shared
 `modules/top_k.py::TopK` module. Final index selection uses the inherited
 `Indexer.top_k`; hierarchical block selection reuses a `TopK` instance with
 the candidate block count. Prefill and decode select the corresponding module
@@ -56,7 +58,7 @@ both selected indices and candidate-source outputs are gathered across ranks.
 Unrestricted decode uses the shared native paged MQA path on SM100 with 32 or
 64 index heads. Metadata stages exact index bytes into the native page-footer
 format and masks missing pages before selection. SM90/SM120/121, other head
-counts and restricted candidates use the shared bounded gathered path; decode
+counts and restricted candidates use CSA2 bounded gathering with inherited MQA; decode
 still uses decode TopK semantics. CSA2 supplies block-max/latest-block selection
 and logical-position mapping. Reuse layers consume prior logical selections
 without running the indexer and resolve physical pages afresh.

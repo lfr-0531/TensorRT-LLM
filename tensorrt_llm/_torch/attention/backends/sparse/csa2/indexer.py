@@ -4,28 +4,58 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 
-from ..dsa.indexer import Indexer, IndexerChunkInputs, IndexerQueryChunk
+from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET, Indexer, _split_prefill_queries
 from ..dsa.params import DSAParams
 from .metadata import CSA2TrtllmMetadata
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode
 from .quantization import pack_rows
 
 
+@dataclass
+class _ChunkInputs:
+    """Packed owner keys and logical bounds for one CSA2 query tile."""
+
+    k_data: torch.Tensor
+    k_scale: torch.Tensor
+    row_starts: torch.Tensor
+    row_ends: torch.Tensor
+    logical_positions: Optional[torch.Tensor] = None
+    visible_lengths: Optional[torch.Tensor] = None
+
+
+@dataclass
+class _QueryChunk:
+    """Lazy K preparation, after request-level TP splitting for candidate K."""
+
+    token_start: int
+    token_end: int
+    k_token_count: int
+    load: Optional[Callable[[], _ChunkInputs]] = None
+    load_tile: Optional[Callable[[int, int], _ChunkInputs]] = None
+    keys_per_query: int = 0
+    max_query_tokens: Optional[int] = None
+    is_prefill: bool = True
+
+
 class CSA2Indexer(Indexer):
     """Prepare owner-cache candidates and publish CSA2 logical selections.
 
-    The inherited Indexer owns quantized MQA dispatch and the shared chunk,
-    query-splitting and collective workflow. This subclass adapts owner caches,
-    logical selection and hierarchical block candidates using the shared TopK
-    module. Cache writes and layer ordering belong to the backend.
+    This subclass owns chunk loading, candidate workspace limits and routing
+    publication. It reuses the base indexer's MQA dispatch, TP query partition
+    calculation and TopK module. Cache writes and layer ordering belong to the
+    backend.
     """
 
     def __init__(self, layout: CSA2Layout, layer_idx: int, heads: int, head_dim: int) -> None:
@@ -236,35 +266,106 @@ class CSA2Indexer(Indexer):
         output_indices.copy_(torch.where(selected == sentinel, -1, selected).to(torch.int32))
         return output_indices
 
-    def _forward_indexer_tile(
+    def _run_csa2_chunks(
         self,
-        inputs: IndexerChunkInputs,
+        chunks: list[_QueryChunk],
         q_data: torch.Tensor,
         weights: torch.Tensor,
-        q_scale: torch.Tensor | None,
+        q_scale: Optional[torch.Tensor],
         output: torch.Tensor,
-        *,
-        is_prefill: bool = True,
-        score_hook: Callable[[torch.Tensor], None] | None = None,
-        radix_aux_indices: torch.Tensor | None = None,
-        radix_aux_logits: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.forward_prepared(
-            q_data,
-            inputs.k_data,
-            inputs.k_scale,
-            weights,
-            inputs.row_starts,
-            inputs.row_ends,
-            output,
-            q_scale,
-            logical_positions=inputs.logical_positions,
-            visible_lengths=inputs.visible_lengths,
-            score_hook=score_hook,
-            is_prefill=is_prefill,
-            radix_aux_indices=radix_aux_indices,
-            radix_aux_logits=radix_aux_logits,
-        )
+        mapping: Optional[Mapping],
+        q_split_threshold: int,
+        score_hook: Optional[Callable[[torch.Tensor, int, int], None]] = None,
+        auxiliary_outputs: tuple[torch.Tensor, ...] = (),
+        radix_aux_indices: Optional[torch.Tensor] = None,
+        radix_aux_logits: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Execute CSA2 owner-prefix or candidate chunks and publish all routing outputs."""
+        for chunk in chunks:
+            count = chunk.token_end - chunk.token_start
+            if count < 0 or chunk.token_start < 0 or chunk.token_end > q_data.shape[0]:
+                raise ValueError("Indexer chunk query bounds are outside the projected batch")
+            if count == 0 or chunk.k_token_count <= 0:
+                output[chunk.token_start : chunk.token_end].fill_(-1)
+                for auxiliary in auxiliary_outputs:
+                    auxiliary[chunk.token_start : chunk.token_end].fill_(-1)
+                continue
+            if (chunk.load is None) == (chunk.load_tile is None):
+                raise ValueError("Indexer chunks require exactly one shared or tiled K loader")
+            local_start, local_end, sizes = _split_prefill_queries(
+                count, mapping, q_split_threshold if chunk.is_prefill else -1
+            )
+            shared = chunk.load() if chunk.load is not None else None
+            budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
+            if self.use_fp4 and (
+                self.head_dim != 128 or not q_data.is_cuda or get_sm_version() < 100
+            ):
+                # The decoded fallback also materializes per-head dot products.
+                budget = max(1, budget // self.n_heads)
+            if chunk.load_tile is not None:
+                if chunk.keys_per_query <= 0:
+                    raise ValueError("Tiled candidate K loaders require a per-query key bound")
+                tile_size = max(1, math.isqrt(budget // chunk.keys_per_query))
+            else:
+                tile_size = max(1, budget // max(1, chunk.k_token_count))
+            if chunk.max_query_tokens is not None:
+                if chunk.max_query_tokens <= 0:
+                    raise ValueError("Indexer query tile capacity must be positive")
+                tile_size = min(tile_size, chunk.max_query_tokens)
+            for offset in range(local_start, local_end, tile_size):
+                stop = min(offset + tile_size, local_end)
+                first, last = chunk.token_start + offset, chunk.token_start + stop
+                if shared is None:
+                    inputs = chunk.load_tile(first, last)
+                    row_slice = slice(None)
+                else:
+                    inputs = shared
+                    row_slice = slice(offset, stop)
+                logical = (
+                    inputs.logical_positions[row_slice]
+                    if inputs.logical_positions is not None
+                    else None
+                )
+                visible = (
+                    inputs.visible_lengths[row_slice]
+                    if inputs.visible_lengths is not None
+                    else None
+                )
+                hook = None
+                if score_hook is not None:
+
+                    def hook(scores, first=first, last=last):
+                        score_hook(scores, first, last)
+
+                self.forward_prepared(
+                    q_data[first:last],
+                    inputs.k_data,
+                    inputs.k_scale,
+                    weights[first:last],
+                    inputs.row_starts[row_slice],
+                    inputs.row_ends[row_slice],
+                    output[first:last],
+                    q_scale[first:last] if q_scale is not None else None,
+                    logical_positions=logical,
+                    visible_lengths=visible,
+                    is_prefill=chunk.is_prefill,
+                    score_hook=hook,
+                    radix_aux_indices=radix_aux_indices[first:last]
+                    if radix_aux_indices is not None
+                    else None,
+                    radix_aux_logits=radix_aux_logits[first:last]
+                    if radix_aux_logits is not None
+                    else None,
+                )
+            if sizes is not None:
+                first, last = chunk.token_start + local_start, chunk.token_start + local_end
+                for tensor in (output, *auxiliary_outputs):
+                    tensor[chunk.token_start : chunk.token_end] = allgather(
+                        tensor[first:last],
+                        mapping,
+                        dim=0,
+                        sizes=sizes,
+                    )
 
     def _publish_tile(
         self,
@@ -360,7 +461,7 @@ class CSA2Indexer(Indexer):
         q_scale: torch.Tensor | None = None,
         is_generation: bool | None = None,
     ) -> torch.Tensor:
-        """Adapt CSA2 phases to the shared chunk executor and native kernels.
+        """Schedule CSA2 phases using inherited native kernels and shared TP partitioning.
 
         Inputs span the complete model batch. K is read from the owner cache;
         the base signature is retained for the backend's indexer contract.
@@ -408,13 +509,13 @@ class CSA2Indexer(Indexer):
                     candidate_width,
                 )
 
-        def candidate_tile(start: int, end: int) -> IndexerChunkInputs:
+        def candidate_tile(start: int, end: int) -> _ChunkInputs:
             positions = candidates[start:end]
             slots = metadata.global_slot_tile(self.layer_idx, start, end, positions)
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots.flatten())
             width = positions.shape[1]
             starts = torch.arange(end - start, dtype=torch.int32, device=q_fp8.device) * width
-            return IndexerChunkInputs(
+            return _ChunkInputs(
                 keys,
                 scales,
                 starts,
@@ -423,7 +524,7 @@ class CSA2Indexer(Indexer):
                 visible[start:end],
             )
 
-        def shared_keys(start: int, end: int, width: int) -> IndexerChunkInputs:
+        def shared_keys(start: int, end: int, width: int) -> _ChunkInputs:
             # A request's compressed prefix is gathered once and shared by all
             # query tiles. Cached and newly published keys have the same owner.
             positions = torch.arange(width, device=q_fp8.device)
@@ -433,7 +534,7 @@ class CSA2Indexer(Indexer):
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots)
             starts = torch.zeros(end - start, dtype=torch.int32, device=q_fp8.device)
             logical_positions = torch.where(slots >= 0, positions, -1).expand(end - start, -1)
-            return IndexerChunkInputs(
+            return _ChunkInputs(
                 keys,
                 scales,
                 starts,
@@ -461,9 +562,9 @@ class CSA2Indexer(Indexer):
                 continue
             if candidates is not None:
                 # Split across ranks before gathering candidate rows. The
-                # shared driver then bounds the Q-by-(Q*candidates) transient.
+                # CSA2 runner then bounds the Q-by-(Q*candidates) transient.
                 chunks.append(
-                    IndexerQueryChunk(
+                    _QueryChunk(
                         begin,
                         end,
                         candidates.shape[1],
@@ -489,7 +590,7 @@ class CSA2Indexer(Indexer):
                     )
                 )
                 chunks.append(
-                    IndexerQueryChunk(
+                    _QueryChunk(
                         start,
                         stop,
                         width,
@@ -507,7 +608,7 @@ class CSA2Indexer(Indexer):
                 (count, 10, self.index_topk), dtype=torch.int32, device=q_fp8.device
             )
             radix_logits = torch.empty_like(radix_indices, dtype=torch.float32)
-        self._run_query_chunks(
+        self._run_csa2_chunks(
             chunks,
             q_fp8,
             weights,
