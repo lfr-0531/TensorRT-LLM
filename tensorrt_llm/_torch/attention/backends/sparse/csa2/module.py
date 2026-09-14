@@ -53,6 +53,7 @@ class DeepseekV41Attention(nn.Module):
         index_head_dim: int = 128,
         eps: float = 1e-20,
         mapping: Mapping | None = None,
+        compute_backend: str = "auto",
     ) -> None:
         super().__init__()
         if num_heads % num_groups or head_dim <= rope_head_dim:
@@ -67,7 +68,9 @@ class DeepseekV41Attention(nn.Module):
         self.mapping = mapping
         self.num_groups = num_groups
         self.layer = layout.layer(layer_idx)
-        self.backend = DeepseekV41SparseAttention(layout, layer_idx, use_flash_mla=head_dim == 512)
+        self.backend = DeepseekV41SparseAttention(
+            layout, layer_idx, compute_backend=compute_backend
+        )
         self.num_heads_tp = num_heads // mapping.tp_size
         self.qk_head_dim = self.v_head_dim = head_dim
         self.qk_rope_head_dim = rope_head_dim

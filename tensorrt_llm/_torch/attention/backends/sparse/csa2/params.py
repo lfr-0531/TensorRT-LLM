@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
+
+from ..params import SparseParams
 
 
 class CSA2Mode(Enum):
@@ -110,3 +113,27 @@ class CSA2Layout:
             index_source,
             candidate if candidate is not None and layer_idx >= candidate else None,
         )
+
+
+@dataclass(frozen=True)
+class CSA2Params(SparseParams):
+    """Lowered parameters for the prepared CSA2 TRTLLM attention backend."""
+
+    algorithm: Literal["csa2"] = field(init=False, default="csa2")
+    indices_block_size: int = field(init=False, default=1)
+    max_query_tokens: int = 16
+
+    def __post_init__(self) -> None:
+        if self.max_query_tokens <= 0:
+            raise ValueError("CSA2 query workspace capacity must be positive")
+
+
+def select_csa2_backend(sm_version: int) -> str:
+    """Match the DSV4 hardware families without confusing SM120 with SM100."""
+    if sm_version == 90:
+        return "flash_mla"
+    if 100 <= sm_version < 110:
+        return "trtllm"
+    if sm_version in (120, 121):
+        return "flashinfer"
+    raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")

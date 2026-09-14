@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .params import CSA2Layer, CSA2Layout, CSA2Mode
+from .params import CSA2Layer, CSA2Layout, CSA2Mode, CSA2Params, select_csa2_backend
 from .quantization import CacheFormat, pack_rows, row_bytes, unpack_rows
 from .selection import index_scores, select_candidate_positions, select_topk_positions
 
@@ -220,19 +220,58 @@ class DeepseekV41SparseAttention:
     """
 
     def __init__(
-        self, layout: CSA2Layout, layer_idx: int, query_tile: int = 16, use_flash_mla: bool = False
+        self,
+        layout: CSA2Layout,
+        layer_idx: int,
+        query_tile: int = 16,
+        compute_backend: str = "torch",
     ) -> None:
         if query_tile <= 0:
             raise ValueError("CSA2 query tile must be positive")
         self.layout = layout
         self.layer = layout.layer(layer_idx)
         self.query_tile = query_tile
-        if use_flash_mla:
+        if compute_backend == "auto":
+            from tensorrt_llm._utils import get_sm_version
+
+            compute_backend = select_csa2_backend(get_sm_version())
+        self.compute_backend = compute_backend
+        self.trtllm_backend = None
+        if compute_backend == "trtllm":
+            self.attention = None
+        elif compute_backend == "flash_mla":
             from .fmha import run_flash_mla
 
             self.attention = run_flash_mla
-        else:
+        elif compute_backend == "flashinfer":
+            from .flashinfer import FlashInferCSA2
+
+            self.attention = FlashInferCSA2()
+        elif compute_backend == "torch":
             self.attention = sparse_attention
+        else:
+            raise ValueError(f"Unknown CSA2 compute backend: {compute_backend}")
+
+    def _get_trtllm_backend(self, q: torch.Tensor):
+        if self.trtllm_backend is None:
+            from tensorrt_llm._torch.attention.backends.utils import create_attention
+
+            self.trtllm_backend = create_attention(
+                "TRTLLM",
+                layer_idx=self.layer.layer_idx,
+                num_heads=q.shape[1],
+                head_dim=q.shape[2],
+                num_kv_heads=1,
+                is_mla_enable=True,
+                q_lora_rank=1280,
+                kv_lora_rank=448,
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                v_head_dim=512,
+                rope_append=False,
+                sparse_params=CSA2Params(max_query_tokens=self.query_tile),
+            )
+        return self.trtllm_backend
 
     def forward(
         self,
@@ -322,16 +361,26 @@ class DeepseekV41SparseAttention:
             swa_slots = batch.swa_indices[start:end]
             selected = _gather_rows(cache.swa[layer.layer_idx], swa_slots, q.shape[-1], "swa")
             valid = swa_slots >= 0
+            global_kv = global_valid = None
             if indices is not None:
                 logical = indices[start:end]
                 slots = batch.global_slot_tile(start, end, logical)
                 global_kv = _gather_rows(cache.main[layer.kv_source], slots, q.shape[-1], "main")
-                selected = torch.cat((selected, global_kv), dim=1)
-                valid = torch.cat(
-                    (valid, (slots >= 0) & (logical < batch.visible_lengths[start:end, None])),
-                    dim=1,
+                global_valid = (slots >= 0) & (logical < batch.visible_lengths[start:end, None])
+            if self.compute_backend == "trtllm":
+                output[start:end] = self._get_trtllm_backend(q).forward_selected(
+                    q[start:end],
+                    selected,
+                    global_kv,
+                    valid,
+                    global_valid,
+                    sink,
                 )
-            output[start:end] = self.attention(
-                q[start:end], selected, valid, sink, q.shape[-1] ** -0.5
-            )
+            else:
+                if global_kv is not None:
+                    selected = torch.cat((selected, global_kv), dim=1)
+                    valid = torch.cat((valid, global_valid), dim=1)
+                output[start:end] = self.attention(
+                    q[start:end], selected, valid, sink, q.shape[-1] ** -0.5
+                )
         return output
