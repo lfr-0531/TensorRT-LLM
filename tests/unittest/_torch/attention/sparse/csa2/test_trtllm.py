@@ -229,7 +229,7 @@ def test_trtllm_graph_replay_resets_sparse_state():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_standard_backend_multiple_tiles_and_reuse():
+def test_standard_backend_multiple_tiles_and_reuse(monkeypatch):
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.interface import (
@@ -240,6 +240,7 @@ def test_standard_backend_multiple_tiles_and_reuse():
         CSA2CacheManager,
         CSA2CacheRole,
     )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
         CSA2BackendForwardArgs,
@@ -251,6 +252,14 @@ def test_standard_backend_multiple_tiles_and_reuse():
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
+    predictions = []
+    original_predict = CSA2Indexer.sparse_attn_indexer
+
+    def predict(indexer, metadata, hidden_states, *args, **kwargs):
+        predictions.append((indexer.layer_idx, hidden_states.shape[0]))
+        return original_predict(indexer, metadata, hidden_states, *args, **kwargs)
+
+    monkeypatch.setattr(CSA2Indexer, "sparse_attn_indexer", predict)
     torch.manual_seed(419)
     layout = CSA2Layout((1, 1, 1), (0,), (0, 2), index_topk=4, window_size=4)
     count, heads = 19, 8
@@ -285,6 +294,9 @@ def test_standard_backend_multiple_tiles_and_reuse():
         global_base = manager.get_cache_indices(100, 0, CSA2CacheRole.GLOBAL)[0] * 128
         global_slots = global_base + torch.arange(6, device="cuda")
         runtime.csa2_token_requests = torch.zeros(count, dtype=torch.int64, device="cuda")
+        runtime.csa2_request_query_ranges = ((0, count),)
+        runtime.csa2_request_start_positions = (0,)
+        runtime.csa2_num_context_requests = 1
         runtime.csa2_global_page_tables = {
             0: torch.tensor([[global_base // 128]], dtype=torch.int32, device="cuda")
         }
@@ -332,6 +344,7 @@ def test_standard_backend_multiple_tiles_and_reuse():
             torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
             frame = runtime.get_query_tile_metadata(q[-3:], 4)
             assert frame.host_total_kv_lens.tolist() == [0, 3 * 256]
+        assert predictions == [(0, count), (2, count)]
     finally:
         for request_id in list(manager.kv_cache_map):
             manager.free_resources(SimpleNamespace(py_request_id=request_id))

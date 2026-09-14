@@ -26,6 +26,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     These are compute staging pools, not persistent request-owned KV caches.
     """
 
+    indexer_max_chunk_size: int = 8192
+    indexer_q_split_threshold: int = 8192
+
     # Request metadata is held directly on this object. Main/index physical
     # tables and write slots are owner-keyed; SWA and visibility are layer-keyed.
     csa2_indices: dict[int, torch.Tensor]
@@ -300,6 +303,19 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             raise ValueError("CSA2 source rows exceed the manager context capacity")
         if any(s < 0 or n < 0 or s + n > manager.max_seq_len for s, n in zip(starts, lengths)):
             raise ValueError("CSA2 query positions exceed the manager context capacity")
+        self.csa2_request_start_positions = tuple(starts)
+        self.csa2_request_lengths = tuple(lengths)
+        self.csa2_num_context_requests = self.num_contexts
+        packed_start = 0
+        query_ranges = []
+        for length in lengths:
+            query_ranges.append((packed_start, packed_start + length))
+            packed_start += length
+        self.csa2_request_query_ranges = tuple(query_ranges)
+        self.csa2_request_last_query_indices = self._copy_csa2_tensor(
+            "request_last_queries",
+            torch.tensor([end - 1 for _, end in query_ranges], dtype=torch.int64, device="cpu"),
+        )
         positions = [s + j for s, n in zip(starts, lengths) for j in range(n)]
         token_requests = [r for r, n in enumerate(lengths) for _ in range(n)]
         copy = self._copy_csa2_tensor
@@ -471,6 +487,171 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         ]
         slots = physical.long() * page_size + logical % page_size
         return torch.where(valid & (physical >= 0), slots, -1)
+
+    def prepare_indexer(self, layer_idx: int) -> CSA2TrtllmMetadata | None:
+        """Refresh native paged FP4 inputs for the real generation queries.
+
+        Invoke after owner cache publication. Repacking and scheduler updates
+        execute on every replay. Eager scratch covers currently visible pages;
+        graph scratch reserves each admitted request's maximum context so its
+        pointers remain stable as request lengths and page mappings change.
+        Identical geometry shares staging across serialized owners and layers.
+        """
+        from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+        manager = self.kv_cache_manager
+        if manager is None:
+            raise ValueError("CSA2 paged indexer requires a cache manager")
+        if torch.cuda.is_current_stream_capturing() and not self.is_cuda_graph:
+            raise RuntimeError("Set is_cuda_graph before warming CSA2 paged indexer metadata")
+        owner = self.csa2_kv_sources[layer_idx]
+        if owner is None:
+            raise ValueError("SWA-only layers have no indexer cache")
+        context_requests = self.csa2_num_context_requests
+        generation_ranges = self.csa2_request_query_ranges[context_requests:]
+        if not generation_ranges:
+            return None
+        if any(start == end for start, end in generation_ranges):
+            raise ValueError("CSA2 paged indexer requires nonempty generation requests")
+        decode_start = generation_ranges[0][0]
+        decode_end = generation_ranges[-1][1]
+        count = decode_end - decode_start
+        request_count = len(generation_ranges)
+        ratio = manager.layout.compress_ratios[owner]
+        if self.is_cuda_graph:
+            max_positions = max(1, self.csa2_global_max_positions[owner])
+        else:
+            max_positions = max(
+                1,
+                max(
+                    (start + length) // ratio
+                    for start, length in zip(
+                        self.csa2_request_start_positions[context_requests:],
+                        self.csa2_request_lengths[context_requests:],
+                    )
+                ),
+            )
+        native_page_size = 64
+        required_pages = (max_positions + native_page_size - 1) // native_page_size
+        if self.is_cuda_graph:
+            # Reserve the largest owner geometry during warmup so another
+            # serialized owner cannot replace a buffer captured by this graph.
+            required_pages = max(
+                1,
+                (max(self.csa2_global_max_positions.values()) + native_page_size - 1)
+                // native_page_size,
+            )
+        else:
+            # Grow geometrically, replacing the old eager arena rather than
+            # retaining one allocation for every context length seen so far.
+            required_pages = 1 << (required_pages - 1).bit_length()
+        source_page_size = self.csa2_global_page_sizes[owner]
+        if source_page_size % native_page_size:
+            raise ValueError("CSA2 native index pages require source page sizes divisible by 64")
+        table = self.csa2_global_page_tables[owner][context_requests:]
+        device = table.device
+        key = (device, request_count, count, manager.layout.index_topk, self.is_cuda_graph)
+        if not hasattr(self, "_csa2_indexer_workspaces"):
+            self._csa2_indexer_workspaces = {}
+        if not self.is_cuda_graph:
+            # Runtime metadata survives many batch geometries. Retain just
+            # the latest eager arena per device; active descriptors still own
+            # their tensors, and serialized stream work preserves their use.
+            # Graph clones may share this dictionary, so never evict graph keys.
+            for previous_key in tuple(self._csa2_indexer_workspaces):
+                if previous_key[0] == device and not previous_key[-1] and previous_key != key:
+                    del self._csa2_indexer_workspaces[previous_key]
+        scratch = self._csa2_indexer_workspaces.get(key)
+        if scratch is None or scratch["page_capacity"] < required_pages:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up CSA2 paged indexer metadata before graph capture")
+            page_capacity = required_pages
+            pages = 1 + request_count * page_capacity
+            scratch = {
+                "page_capacity": page_capacity,
+                "cache": torch.empty(
+                    (pages, native_page_size, 1, 68), dtype=torch.uint8, device=device
+                ),
+                "row_starts": torch.empty(pages, dtype=torch.int64, device=device),
+                "block_table": torch.empty(
+                    (count, page_capacity), dtype=torch.int32, device=device
+                ),
+                "context_lengths": torch.empty((count, 1), dtype=torch.int32, device=device),
+                "logical_positions": torch.empty(
+                    (count, page_capacity * native_page_size), dtype=torch.int32, device=device
+                ),
+                "visible_lengths": torch.empty(count, dtype=torch.int32, device=device),
+                "radix_indices": torch.empty(
+                    (count, 10, manager.layout.index_topk), dtype=torch.int32, device=device
+                ),
+                "radix_logits": torch.empty(
+                    (count, 10, manager.layout.index_topk), dtype=torch.float32, device=device
+                ),
+            }
+            self._csa2_indexer_workspaces[key] = scratch
+        page_capacity = scratch["page_capacity"]
+        logical_page_starts = torch.arange(page_capacity, device=device) * native_page_size
+        source_columns = logical_page_starts // source_page_size
+        if not hasattr(self, "csa2_request_last_query_indices"):
+            # Synthetic/prepared callers may supply the host ranges directly.
+            # Normal prepare updates this persistent device buffer each step.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Prepare CSA2 request boundaries before graph capture")
+            self.csa2_request_last_query_indices = torch.tensor(
+                [end - 1 for _, end in self.csa2_request_query_ranges],
+                dtype=torch.int64,
+                device=device,
+            )
+        last_queries = self.csa2_request_last_query_indices[context_requests:]
+        request_visible = self.csa2_visible_lengths[layer_idx][last_queries]
+        if table.shape[1] == 0:
+            source_pages = torch.full(
+                (request_count, page_capacity), -1, dtype=torch.int64, device=device
+            )
+        else:
+            source_pages = table[:, source_columns.clamp(max=table.shape[1] - 1)].long()
+        valid_pages = (source_pages >= 0) & (source_columns[None, :] < table.shape[1])
+        valid_pages &= logical_page_starts[None, :] < request_visible[:, None]
+        physical_starts = source_pages * source_page_size + logical_page_starts % source_page_size
+        scratch["row_starts"][0].fill_(-1)
+        scratch["row_starts"][1:].copy_(torch.where(valid_pages, physical_starts, -1).flatten())
+        manager.gather_indexer_pages(owner, scratch["row_starts"], scratch["cache"])
+        # Missing native pages read the reserved zero page, then are removed
+        # from logical output mapping so their zero logits cannot win Top-K.
+        page_ids = torch.arange(
+            1, 1 + request_count * page_capacity, dtype=torch.int32, device=device
+        ).view(request_count, page_capacity)
+        page_ids = torch.where(valid_pages, page_ids, 0)
+        requests = self.csa2_token_requests[decode_start:decode_end] - context_requests
+        valid_requests = (requests >= 0) & (requests < request_count)
+        requests = requests.clamp(0, request_count - 1).long()
+        scratch["block_table"].copy_(torch.where(valid_requests[:, None], page_ids[requests], 0))
+        visible = self.csa2_visible_lengths[layer_idx][decode_start:decode_end].int()
+        scratch["visible_lengths"].copy_(torch.where(valid_requests, visible, 0))
+        scratch["context_lengths"].copy_(scratch["visible_lengths"].clamp_min(1)[:, None])
+        logical = torch.arange(max_positions, dtype=torch.int32, device=device)
+        valid = valid_pages[requests[:, None], (logical // native_page_size).long()]
+        valid &= valid_requests[:, None] & (logical[None, :] < visible[:, None])
+        logical_positions = scratch["logical_positions"][:, :max_positions]
+        logical_positions.copy_(torch.where(valid, logical[None, :], -1))
+        schedule = get_paged_mqa_logits_metadata(
+            scratch["context_lengths"],
+            64,
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+        if "schedule" not in scratch:
+            scratch["schedule"] = torch.empty_like(schedule)
+        scratch["schedule"].copy_(schedule)
+        self.csa2_indexer_k_cache = scratch["cache"]
+        self.csa2_indexer_block_table = scratch["block_table"]
+        self.csa2_indexer_context_lengths = scratch["context_lengths"]
+        self.csa2_indexer_scheduler_metadata = scratch["schedule"]
+        self.csa2_indexer_max_seq_len = max_positions
+        self.csa2_indexer_radix_aux_indices = scratch["radix_indices"]
+        self.csa2_indexer_radix_aux_logits = scratch["radix_logits"]
+        self.csa2_indexer_logical_positions = logical_positions
+        self.csa2_indexer_visible_lengths = scratch["visible_lengths"]
+        return self
 
     def get_compression_batch(self, owner: int):
         return self._csa2_compression.get(owner)

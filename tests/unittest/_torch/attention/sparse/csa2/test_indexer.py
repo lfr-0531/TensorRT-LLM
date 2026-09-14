@@ -10,7 +10,6 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Index
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.modules.top_k import TopK
 
 
@@ -96,15 +95,7 @@ def _reference_index_scores(
 def _indexer(heads=32, topk=32):
     if not torch.cuda.is_available():
         pytest.skip("Shared prepared indexer tests require CUDA")
-    return Indexer(
-        None,
-        None,
-        None,
-        False,
-        DSAParams(index_n_heads=heads, index_head_dim=128, index_topk=topk, indexer_k_dtype="fp4"),
-        torch.bfloat16,
-        projection_free=True,
-    )
+    return CSA2Indexer(CSA2Layout((1,), (0,), (0,), index_topk=topk), 0, heads, 128)
 
 
 def _prepared(indexer, q, keys, weights, lengths, positions, hook=None):
@@ -294,7 +285,7 @@ def test_prepared_default_row_local(use_fp4):
     starts = torch.tensor([0, 129], dtype=torch.int32, device="cuda")
     ends = starts + 129
     out = torch.empty((2, 32), dtype=torch.int32, device="cuda")
-    indexer.forward_prepared(qd, kd, ks, weights, starts, ends, out, qs)
+    Indexer.forward_prepared(indexer, qd, kd, ks, weights, starts, ends, out, qs)
     scores = _reference_index_scores(q, k, weights)
     expected = torch.stack((scores[0, :129].topk(32).indices, scores[1, 129:].topk(32).indices))
     torch.testing.assert_close(out.long().sort(-1).values, expected.sort(-1).values)
@@ -330,8 +321,9 @@ def test_csa2_specializes_shared_indexer():
     for layer in (0, 1):
         indexer = CSA2Indexer(layout, layer, 8, 128)
         assert isinstance(indexer, Indexer)
-        assert CSA2Indexer.forward_prepared is Indexer.forward_prepared
-        assert CSA2Indexer.select_prepared_scores is Indexer.select_prepared_scores
+        assert CSA2Indexer._run_query_chunks is Indexer._run_query_chunks
+        assert CSA2Indexer._call_mqa_logits is Indexer._call_mqa_logits
+        assert CSA2Indexer._call_paged_mqa_logits is Indexer._call_paged_mqa_logits
         assert list(indexer.parameters()) == []
         assert isinstance(indexer.top_k, TopK)
     indexer = CSA2Indexer(layout, 0, 8, 128)

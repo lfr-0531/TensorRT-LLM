@@ -36,6 +36,10 @@ def _test_pools(swa, main, index):
         get_swa_buffer=lambda layer: swa[layer],
         get_main_buffer=lambda owner: main[owner],
         get_index_buffer=lambda owner: index[owner],
+        gather_indexer_keys=lambda owner, slots: (
+            index[owner][slots.clamp_min(0), :64].contiguous().view(torch.int8),
+            index[owner][slots.clamp_min(0), 64:].contiguous().view(torch.int32),
+        ),
         write_swa=lambda layer, slots, values: store_rows(swa[layer], slots, values, "swa"),
         write_global=write_global,
         indexers={},
@@ -83,6 +87,16 @@ def _model_metadata(
         i: layout.layer(i).kv_source for i in range(len(layout.compress_ratios))
     }
     meta.csa2_main_write_slots = {0: main_writes}
+    # These prediction fixtures allow arbitrary visibility per query. Treat
+    # each row as a context chunk; real packed request phases are tested with
+    # the manager-backed runtime metadata.
+    meta.csa2_request_query_ranges = tuple((i, i + 1) for i in range(len(requests)))
+    meta.csa2_request_start_positions = tuple(
+        max_positions * layout.compress_ratios[0] - 1 for _ in requests
+    )
+    meta.csa2_num_context_requests = len(requests)
+    meta.mapping = None
+    meta.is_cuda_graph = False
     return meta
 
 

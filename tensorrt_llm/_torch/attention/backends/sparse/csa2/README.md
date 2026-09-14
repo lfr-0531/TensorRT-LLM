@@ -40,11 +40,26 @@ latent before main-KV RoPE and quantization. Ratio two reuses the native V4
 non-overlap compressor with FP32 state and zero APE; ratio one has no gate.
 
 `CSA2Indexer` subclasses the existing DSA `Indexer` in projection-free mode.
-Its shared prepared-input QK-to-TopK flow is also used by DSA's existing prefill
-paths. Native MQA dispatch, exact TopK and output handling belong to that class.
-CSA2 adds its block-max candidate/latest-block rule, logical-position mapping
-and Full/Reindex/Reuse decisions. Shared layers consume logical selections and
-resolve physical pages afresh for their request view.
+Its `sparse_attn_indexer()` override adapts the model's cache and phase
+semantics once per complete layer batch, before attention tiles consume the
+results. CSA2 logical mapping and paged staging stay in this subclass and its
+metadata; the DSA dispatcher has no CSA2-specific prepared-input branch. DSA, V4 and CSA2 share the prefill chunk
+runner, query TP partitioning, bounded logits tiling and the shared
+`modules/top_k.py::TopK` module. Final index selection uses the inherited
+`Indexer.top_k`; hierarchical block selection reuses a `TopK` instance with
+the candidate block count. Prefill and decode select the corresponding module
+entry path; temporal GVR state is not enabled. Full
+prefill gathers each request prefix once per chunk, including cached keys.
+Candidate-restricted layers gather bounded query tiles after TP partitioning;
+both selected indices and candidate-source outputs are gathered across ranks.
+
+Unrestricted decode uses the shared native paged MQA path on SM100 with 32 or
+64 index heads. Metadata stages exact index bytes into the native page-footer
+format and masks missing pages before selection. SM90/SM120/121, other head
+counts and restricted candidates use the shared bounded gathered path; decode
+still uses decode TopK semantics. CSA2 supplies block-max/latest-block selection
+and logical-position mapping. Reuse layers consume prior logical selections
+without running the indexer and resolve physical pages afresh.
 
 The selected main/SWA values are decoded into bounded BF16 compute pools.
 Native trtllm-gen does not consume CSA2 FP4 bytes directly. FlashInfer FA2 also
@@ -92,6 +107,13 @@ Runtime metadata owns fixed-shape compute views shared by serialized layers.
 Different query counts use independent native workspaces. Warm each view with
 the standard forward before capture and set `is_cuda_graph` for captured calls.
 Prepare refreshes persistent device metadata outside capture before replay.
+For native indexer decode, set the source metadata's `is_cuda_graph` before
+warmup as well as capture. This reserves the admitted context bound. Eager
+paged staging grows geometrically and replaces its previous arena; graph
+arenas retain stable storage. Every captured forward repacks the current owner
+pages and refreshes the paged schedule. Gathered decode also uses a fixed scan
+bound so replay can expose new keys through updated device visibility.
+
 Graph metadata follows the framework's shallow-clone convention: routing resets
 create independent Python dictionaries, while same-geometry staging/device
 buffers can be shared. Calls and replays must remain serialized.
@@ -110,8 +132,10 @@ Disaggregation role mappings preserve byte layout, but do not establish full
 model disaggregation, CED scheduling or DSpark inference support. Whole-model
 checkpoint parity and performance remain separate validation work. Before
 whole-model serving, verify that profiling exercises every Full layer at the
-maximum query tile and configured global width: gathered index rows and dense
-logits workspace scale with those bounds.
+maximum request count and admitted global width: native index staging, logical
+masks and gathered logits workspace require coverage in memory profiling.
+Indexer query TP splitting does not enable PP/CP, GVR temporal state or
+speculative compressor rewind.
 
 Numerical definitions follow the official
 [reference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)

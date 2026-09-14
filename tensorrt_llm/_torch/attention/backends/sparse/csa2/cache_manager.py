@@ -221,6 +221,50 @@ class CSA2CacheManager(KVCacheManagerV2):
     def get_index_buffer(self, layer_idx: int) -> torch.Tensor:
         return self._get_global_buffer(layer_idx)[:, 288:]
 
+    def gather_indexer_keys(
+        self, layer_idx: int, slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather exact FP4 bytes with the shared native strided-cache kernel.
+
+        Logical coordinates address the 68-byte index view; the gather kernel
+        applies its actual 356-byte record stride. Its scale offset is per row,
+        unlike DSA's native page-footer cache layout.
+        """
+        if slots.ndim != 1 or slots.dtype != torch.int64 or not slots.is_cuda:
+            raise ValueError("CSA2 index gathering requires one-dimensional CUDA int64 slots")
+        pool = self.get_index_buffer(layer_idx)
+        owner = self.layout.layer(layer_idx).kv_source
+        page_size = self.tokens_per_block // self.layout.compress_ratios[owner]
+        cache = pool.view(-1, page_size, 1, 68)
+        valid = (slots >= 0) & (slots < pool.shape[0])
+        offsets = slots.clamp(0, pool.shape[0] - 1) * 68
+        data, scales = torch.ops.trtllm.indexer_k_cache_gather_op(
+            cache, offsets.contiguous(), (offsets + 64).contiguous(), 0, slots.numel(), 64
+        )
+        data = torch.where(valid[:, None], data.view(torch.int8), 0)
+        scales = torch.where(valid[:, None], scales.view(torch.int32), 0)
+        return data, scales
+
+    def gather_indexer_pages(
+        self, layer_idx: int, row_starts: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        """Refresh caller-owned native FP4 footer pages without requantization.
+
+        row_starts names the first physical source row of each 64-entry native
+        page. Negative starts denote padding (including the reserved zero page).
+        The scratch allocation is bounded by referenced requests, not pool size.
+        """
+        if output.dtype != torch.uint8 or output.shape != (row_starts.numel(), 64, 1, 68):
+            raise ValueError("CSA2 native index scratch must be uint8 [pages,64,1,68]")
+        if not output.is_contiguous() or output.device != row_starts.device:
+            raise ValueError("CSA2 native index scratch must be contiguous on the slots device")
+        rows = row_starts[:, None] + torch.arange(64, device=row_starts.device)
+        rows = torch.where(row_starts[:, None] >= 0, rows, -1).flatten()
+        data, scales = self.gather_indexer_keys(layer_idx, rows)
+        flat = output.view(row_starts.numel(), 64 * 68)
+        flat[:, : 64 * 64].copy_(data.view(torch.uint8).reshape(-1, 64 * 64))
+        flat[:, 64 * 64 :].copy_(scales.view(torch.uint8).reshape(-1, 64 * 4))
+
     def write_swa(self, layer_idx, slots, values) -> None:
         store_rows(self.get_swa_buffer(layer_idx), slots, values, "swa")
 

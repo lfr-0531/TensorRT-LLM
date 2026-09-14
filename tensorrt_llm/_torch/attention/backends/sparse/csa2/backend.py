@@ -144,7 +144,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
                     self.indexer = CSA2Indexer(
                         layout, self.layer_idx, state.index_q.shape[1], state.index_q.shape[-1]
                     )
-                logical = self.indexer(state, start, count)
+                # Indexer phases and TP query splitting use the complete model
+                # batch. FMHA query tiles only consume the published selections.
+                if start == 0:
+                    self.indexer(state, 0, state.swa_kv.shape[0])
+                logical = source.csa2_indices[self.layer_idx][start:end]
             elif layer.mode == CSA2Mode.REUSE:
                 if layer.index_source not in source.csa2_indices:
                     raise ValueError("CSA2 index source did not run in this forward")
