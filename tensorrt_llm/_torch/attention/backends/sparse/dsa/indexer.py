@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -596,6 +596,8 @@ class IndexerParams:
 class Indexer(nn.Module):
     """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
+    projection_free: bool = False
+
     def __init__(
         self,
         quant_config: Optional[QuantConfig],
@@ -607,66 +609,78 @@ class Indexer(nn.Module):
         compress_ratio: int = 1,
         layer_idx: int = 0,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        projection_free: bool = False,
     ):
         """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
-        self.hidden_size = mla_params.hidden_size
-        self.q_lora_rank = mla_params.q_lora_rank
-        self.rope_dim = mla_params.qk_rope_head_dim
+        self.projection_free = projection_free
+        sm_version = get_sm_version() if torch.cuda.is_available() else 0
+        if not projection_free and (mla_params is None or pos_embd_params is None):
+            raise ValueError("Projecting indexers require MLA and positional parameters")
+        if projection_free and sparse_params.enable_heuristic_topk:
+            raise ValueError("Prepared indexers require exact Top-K selection")
+        self.hidden_size = mla_params.hidden_size if mla_params is not None else None
+        self.q_lora_rank = mla_params.q_lora_rank if mla_params is not None else None
+        self.rope_dim = mla_params.qk_rope_head_dim if mla_params is not None else 0
         self.n_heads = sparse_params.index_n_heads  # 64
         self.head_dim = sparse_params.index_head_dim  # 128
         self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
         self.compress_ratio = compress_ratio
 
-        self.wq_b = Linear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-        # When TRTLLM_DSA_INDEXER_BF16=1, run the fused wk + weights_proj
-        # projection in the model dtype instead of fp32. The fp32 path has no
-        # native GEMM on recent architectures (it falls back to a TF32 tensor-
-        # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
-        # path runs a single native GEMM with no casts. The default stays fp32
-        # because the indexer top-k selection is precision sensitive.
-        self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
-        _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
-        self.wk = Linear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            dtype=_wk_wp_dtype,
-            quant_config=None,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-        self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
-        self.weights_proj = Linear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            dtype=_wk_wp_dtype,
-            quant_config=None,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-
-        # Fused wk + weights_proj weight for a single F.linear GEMM. fp32 by
-        # default (TF32 tensor cores on Ampere+); model dtype when
-        # TRTLLM_DSA_INDEXER_BF16 is enabled.
+        self.wq_b = self.wk = self.k_norm = self.weights_proj = self.rotary_emb = None
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+        self._indexer_bf16 = False
+        if not projection_free:
+            self.wq_b = Linear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                dtype=dtype,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+            # When TRTLLM_DSA_INDEXER_BF16=1, run the fused wk + weights_proj
+            # projection in the model dtype instead of fp32. The fp32 path has no
+            # native GEMM on recent architectures (it falls back to a TF32 tensor-
+            # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
+            # path runs a single native GEMM with no casts. The default stays fp32
+            # because the indexer top-k selection is precision sensitive.
+            self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
+            _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
+            self.wk = Linear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                dtype=_wk_wp_dtype,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+            self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
+            self.weights_proj = Linear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                dtype=_wk_wp_dtype,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
 
-        indexer_rope_interleave = sparse_params.indexer_rope_interleave
-        self.rotary_emb = RotaryEmbedding(
-            pos_embd_params.rope,
-            head_dim=self.rope_dim,
-            is_neox=not indexer_rope_interleave,
-        )
+            # Fused wk + weights_proj weight for a single F.linear GEMM. fp32 by
+            # default (TF32 tensor cores on Ampere+); model dtype when
+            # TRTLLM_DSA_INDEXER_BF16 is enabled.
+            self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+
+            indexer_rope_interleave = sparse_params.indexer_rope_interleave
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.rope_dim,
+                is_neox=not indexer_rope_interleave,
+            )
 
         self.softmax_scale = self.head_dim**-0.5
         # TODO: make it configurable from hf config
@@ -677,9 +691,11 @@ class Indexer(nn.Module):
         # kernel asserts SM100 + head_dim=128 at launch time under FP4.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = [] if projection_free else [torch.cuda.Event(), torch.cuda.Event()]
         # Fork/join events for the aux-stream prev_topk write-back.
-        self.prev_topk_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.prev_topk_copy_events = (
+            [] if projection_free else [torch.cuda.Event(), torch.cuda.Event()]
+        )
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         self.use_cute_dsl_paged_mqa_logits = (
@@ -687,9 +703,7 @@ class Indexer(nn.Module):
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = (
-            sparse_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
+        self._enable_heuristic_topk = sparse_params.enable_heuristic_topk and sm_version >= 100
         # Two-level GVR dispatch: enable_heuristic_topk selects the GVR
         # family over the exact radix path; use_self_sampling_topk (default
         # True) selects the hint-free self-sampling engine over the
@@ -704,7 +718,7 @@ class Indexer(nn.Module):
             index_topk=sparse_params.index_topk,
             compress_ratio=compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
-            sm_version=get_sm_version(),
+            sm_version=sm_version,
         )
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
             logger.warning_once(
@@ -723,7 +737,7 @@ class Indexer(nn.Module):
                 "use_self_sampling_topk=True but the self-sampling GVR "
                 "prerequisites are not met "
                 f"(cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
-                f"sm={get_sm_version()}, "
+                f"sm={sm_version}, "
                 f"index_topk={sparse_params.index_topk}, "
                 f"compress_ratio={compress_ratio}); falling back to the "
                 "temporal GVR path (exact radix when the DSL engine is "
@@ -737,7 +751,7 @@ class Indexer(nn.Module):
             and IS_CUTLASS_DSL_AVAILABLE
             # datacenter Blackwell only; consumer Blackwell (sm_120/121)
             # lacks the thread-block clusters both GVR engines use
-            and get_sm_version() in (100, 103)
+            and sm_version in (100, 103)
         ):
             decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         else:
@@ -771,6 +785,7 @@ class Indexer(nn.Module):
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,
         )
+        self._prepared_topk: dict[tuple[int, bool], TopK] = {}
         # Emission block-skip is a temporal-hint (V1) optimization: the FP4
         # indexer epilogue emits per-block max logits the GVR Top-K consumes to
         # skip whole blocks (see gvr_emission / gvr_routing; state lives on the
@@ -790,6 +805,8 @@ class Indexer(nn.Module):
 
     def cache_derived_state(self) -> None:
         """Fuse wk and weights_proj for F.linear with TF32 tensor cores on Ampere+."""
+        if self.projection_free:
+            return
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
@@ -1371,6 +1388,145 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
+    def select_prepared_scores(
+        self,
+        scores: torch.Tensor,
+        output_indices: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write row-local Top-K offsets through the shared selection module.
+
+        Auxiliary selection widths support hierarchical indexers; they use
+        exact radix selection and never participate in temporal GVR state.
+        """
+        if scores.shape[0] == 0 or scores.shape[1] == 0:
+            return output_indices.fill_(-1)
+        topk = output_indices.shape[1]
+        if scores.is_cuda and topk == self.index_topk:
+            selector = self.top_k
+        else:
+            key = (topk, scores.is_cuda)
+            if key not in self._prepared_topk:
+                self._prepared_topk[key] = TopK(
+                    topk,
+                    prefill_implementation=(
+                        TopKImplementation.CUDA_RADIX
+                        if scores.is_cuda
+                        else TopKImplementation.TORCH
+                    ),
+                )
+            selector = self._prepared_topk[key]
+        return selector(
+            scores, output_indices, is_prefill=True, row_starts=row_starts, row_ends=row_ends
+        )
+
+    def forward_prepared(
+        self,
+        q_data: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        output_indices: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+        *,
+        logical_positions: Optional[torch.Tensor] = None,
+        visible_lengths: Optional[torch.Tensor] = None,
+        score_hook: Optional[Callable[[torch.Tensor], None]] = None,
+    ) -> torch.Tensor:
+        """Shared dense QK-to-TopK workflow for prequantized inputs.
+
+        Q is [queries, heads, data_dim], K is [keys, data_dim]. FP4 data
+        contains packed E2M1 bytes; Q/K scales contain one int32 word of
+        four UE8M0 bytes per 128D vector. FP8 retains the ordinary DSA
+        scale contract. Row bounds are int32 [queries] in the shared K axis.
+        Output is caller-owned int32 [queries, top_k].
+
+        Without a logical map the output preserves DSA's row-local, unsorted
+        offsets and its no-clean logits fast path. With a [queries, candidates]
+        logical map, each map starts at its row's K start. Invalid/future
+        candidates are masked before the optional hook. The output contains
+        sorted logical positions followed by -1 padding. The hook can publish
+        hierarchical candidate information, but cannot change request/cache
+        ownership or bypass this instance's QK/TopK dispatch.
+        """
+        count = q_data.shape[0]
+        if output_indices.shape != (count, self.index_topk):
+            raise ValueError("Prepared indexer output must match query rows and configured Top-K")
+        if score_hook is not None and logical_positions is None:
+            raise ValueError("A score hook requires explicit logical candidate positions")
+        if logical_positions is not None:
+            if logical_positions.ndim != 2 or logical_positions.shape[0] != count:
+                raise ValueError("Logical candidates must have one row per query")
+            if visible_lengths is None or visible_lengths.shape != (count,):
+                raise ValueError("Logical candidates require per-query visibility lengths")
+        if count == 0 or k_data.shape[0] == 0:
+            if score_hook is not None:
+                score_hook(
+                    torch.full(
+                        logical_positions.shape,
+                        -torch.inf,
+                        dtype=torch.float32,
+                        device=q_data.device,
+                    )
+                )
+            return output_indices.fill_(-1)
+        logits = self._call_mqa_logits(
+            q_data,
+            k_data,
+            k_scale,
+            weights,
+            row_starts,
+            row_ends,
+            q_scale,
+            clean_logits=logical_positions is not None,
+        )
+        if logical_positions is None:
+            return self.select_prepared_scores(logits, output_indices, row_starts, row_ends)
+        width = logical_positions.shape[1]
+        offsets = torch.arange(width, device=q_data.device)
+        columns = row_starts.long()[:, None] + offsets
+        in_bounds = (columns >= 0) & (columns < row_ends[:, None]) & (columns < logits.shape[1])
+        scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
+        valid = in_bounds & (logical_positions >= 0)
+        valid &= logical_positions < visible_lengths[:, None]
+        scores = scores.masked_fill(~valid, -torch.inf)
+        if score_hook is not None:
+            score_hook(scores)
+        local_starts = torch.zeros_like(row_starts)
+        local_ends = torch.full_like(row_ends, width)
+        self.select_prepared_scores(scores, output_indices, local_starts, local_ends)
+        if width == 0:
+            return output_indices
+        selected_offsets = output_indices.long()
+        safe_offsets = selected_offsets.clamp(0, width - 1)
+        selected_valid = (selected_offsets >= 0) & (selected_offsets < width)
+        selected_valid &= scores.gather(1, safe_offsets) > -torch.inf
+        selected = logical_positions.gather(1, safe_offsets).long()
+        sentinel = torch.iinfo(torch.int64).max
+        selected = torch.where(selected_valid, selected, sentinel).sort(-1).values
+        output_indices.copy_(torch.where(selected == sentinel, -1, selected).to(torch.int32))
+        return output_indices
+
+    @staticmethod
+    def _decode_mxfp4(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Decode existing FP4 index inputs without introducing FP8 rounding."""
+        data = data.contiguous().view(torch.uint8)
+        codes = torch.stack((data & 15, data >> 4), dim=-1).flatten(-2).long()
+        magnitudes = torch.arange(8, device=data.device)
+        levels = torch.where(
+            magnitudes < 4,
+            magnitudes.float() * 0.5,
+            torch.exp2(((magnitudes - 2) // 2).float()) * (1 + 0.5 * (magnitudes % 2)),
+        )
+        values = levels[codes & 7] * torch.where((codes & 8) != 0, -1.0, 1.0)
+        groups = values.shape[-1] // 32
+        scale_bytes = scales.contiguous().view(torch.uint8).reshape(*values.shape[:-1], groups)
+        decoded = values.reshape(*values.shape[:-1], groups, 32)
+        return (decoded * torch.exp2(scale_bytes.float() - 127)[..., None]).flatten(-2)
+
     def _call_mqa_logits(
         self,
         q_fp8: torch.Tensor,
@@ -1397,10 +1553,40 @@ class Indexer(nn.Module):
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
-            k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
-            # q_scale arrives as (chunk_tokens, n_heads, 1); the FP4 kernel
-            # asserts q_sf is 2D so collapse the trailing unit axis.
-            q_scale_2d = q_scale.reshape(-1, self.n_heads)
+            if q_scale is None:
+                raise ValueError("FP4 indexer queries require packed per-32 scale bytes")
+            if self.head_dim != 128 or not q_fp8.is_cuda or get_sm_version() < 100:
+                q = self._decode_mxfp4(q_fp8, q_scale)
+                k = self._decode_mxfp4(k_fp4_bytes, k_scale)
+                if q.is_cuda:
+                    from tensorrt_llm._torch.custom_ops import bmm_out
+
+                    q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
+                    dots = torch.empty(
+                        (q.shape[0], q.shape[1], k.shape[0]), dtype=q.dtype, device=q.device
+                    )
+                    bmm_out(q, k.T.unsqueeze(0).expand(q.shape[0], -1, -1), dots)
+                    logits = (dots.relu() * weights.to(q.dtype).unsqueeze(-1)).sum(1).float()
+                else:
+                    logits = (torch.matmul(q, k.T).relu() * weights.unsqueeze(-1)).sum(1)
+                columns = torch.arange(k.shape[0], device=q.device)[None, :]
+                return logits.masked_fill(
+                    (columns < cu_seqlen_ks[:, None]) | (columns >= cu_seqlen_ke[:, None]),
+                    -torch.inf,
+                )
+            k_scale_int32 = k_scale.contiguous().view(torch.int32).reshape(-1)
+            q_scale_2d = q_scale.contiguous().view(torch.int32).reshape(q_fp8.shape[:2])
+            q_fp8 = q_fp8.view(torch.int8)
+            heads = q_fp8.shape[1]
+            if not 1 <= heads <= 64:
+                raise ValueError("FP4 MQA requires between 1 and 64 index heads")
+            # Consumer Blackwell lacks the 8-head FP4 MQA specialization.
+            supported_heads = (16, 32, 64) if get_sm_version() in (120, 121) else (8, 16, 32, 64)
+            padded_heads = next(size for size in supported_heads if size >= heads)
+            if padded_heads != heads:
+                q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
+                q_scale_2d = F.pad(q_scale_2d, (0, padded_heads - heads))
+                weights = F.pad(weights, (0, padded_heads - heads))
             return fp8_fp4_mqa_logits(
                 (q_fp8, q_scale_2d),
                 (k_fp4_bytes, k_scale_int32),
@@ -1590,22 +1776,15 @@ class Indexer(nn.Module):
                         g0 = chunk.token_start + c0
                         g1 = chunk.token_start + c1
                         tile_q_scale = q_scale[g0:g1, ...] if self.use_fp4 else None
-                        logits = self._call_mqa_logits(
+                        self.forward_prepared(
                             q_fp8[g0:g1, ...],
                             chunk_k_fp8,
                             chunk_k_scale,
                             weights[g0:g1, ...],
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
-                            tile_q_scale,
-                            clean_logits=False,
-                        )
-                        self.top_k(
-                            logits,
                             topk_indices_buffer[g0:g1, :],
-                            is_prefill=True,
-                            row_starts=chunk.cu_seqlen_ks[c0:c1],
-                            row_ends=chunk.cu_seqlen_ke[c0:c1],
+                            tile_q_scale,
                         )
 
                     if apply_q_split:
@@ -1629,22 +1808,15 @@ class Indexer(nn.Module):
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
                 ctx_q_scale = q_scale[:num_ctx_tokens, ...] if self.use_fp4 else None
-                logits = self._call_mqa_logits(
+                self.forward_prepared(
                     q_fp8[:num_ctx_tokens, ...],
                     k_fp8[:num_ctx_kv_tokens, ...],
                     k_scale[:num_ctx_kv_tokens, ...],
                     weights[:num_ctx_tokens, ...],
                     cu_seqlen_ks,
                     cu_seqlen_ke,
-                    ctx_q_scale,
-                    clean_logits=False,
-                )
-                self.top_k(
-                    logits,
                     topk_indices_buffer[:num_ctx_tokens, :],
-                    is_prefill=True,
-                    row_starts=cu_seqlen_ks,
-                    row_ends=cu_seqlen_ke,
+                    ctx_q_scale,
                 )
         elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
@@ -2012,6 +2184,8 @@ class Indexer(nn.Module):
         ignores it. It is returned unconditionally so the two-op CUDA graph
         split in dsa.module.forward_dsa_proj sees a stable signature.
         """
+        if self.projection_free:
+            raise RuntimeError("Projection-free Indexer requires forward_prepared()")
         assert self._fused_wk_wp_weight is not None, (
             "cache_derived_state() must be called before forward()"
         )

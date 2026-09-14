@@ -61,6 +61,8 @@ class FallbackFmha(Fmha):
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
+        if sparse_algorithm == "csa2":
+            return attn.compute_backend == "trtllm"
         if sparse_algorithm in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
                 return False

@@ -1624,6 +1624,7 @@
     },
     {
       "allowed_values": [
+        "csa2",
         "dsa",
         "deepseek_v4",
         "minimax_m3",
@@ -1631,7 +1632,7 @@
         "rocket",
         "skip_softmax"
       ],
-      "annotation": "Literal['dsa']",
+      "annotation": "Literal['csa2']",
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.algorithm"

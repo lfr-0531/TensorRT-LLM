@@ -27,30 +27,70 @@ def _norm(x, weight, eps):
     return F.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
+@pytest.fixture
+def module_cache():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings import DataType, SamplingConfig
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    manager = CSA2CacheManager(
+        KvCacheConfig(
+            enable_block_reuse=False, max_gpu_total_bytes=128 << 20, enable_swa_scratch_reuse=True
+        ),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        tokens_per_block=128,
+        max_seq_len=128,
+        max_batch_size=1,
+        max_input_len=4,
+        max_num_tokens=8,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        vocab_size=128,
+        layout=CSA2Layout((2,), (0,), (0,), index_topk=2, window_size=4),
+    )
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 3, 4],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, request.context_chunk_size)
+    manager._stream.synchronize()
+    yield manager, request
+    manager.free_resources(request)
+    manager.shutdown()
+
+
 @torch.inference_mode()
-def test_ratio2_module_partial_groups(monkeypatch):
+def test_ratio2_module_partial_groups(monkeypatch, module_cache):
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
-        CSA2Batch,
-        CSA2Cache,
-        CSA2GlobalPages,
-        CSA2Routing,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2CompressionBatch
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         pack_rows,
         unpack_rows,
     )
+    from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm.functional import PositionEmbeddingType
 
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(818)
-    layout = CSA2Layout((2,), (0,), (0,), index_topk=2, window_size=4)
+    manager, request = module_cache
+    layout = manager.layout
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [4]
     with torch.device("cuda"):
         model = DeepseekV41Attention(
             layout,
@@ -74,16 +114,12 @@ def test_ratio2_module_partial_groups(monkeypatch):
             else:
                 parameter.normal_(std=0.1)
         hidden = torch.randn(4, 32, dtype=torch.bfloat16)
-        cache = CSA2Cache.allocate(layout, 4, {0: 2}, torch.device("cuda"))
-        for pool in (*cache.swa.values(), *cache.main.values(), *cache.index.values()):
+        for pool in (
+            manager.get_swa_buffer(0),
+            manager.get_main_buffer(0),
+            manager.get_index_buffer(0),
+        ):
             pool.zero_()
-        state = torch.zeros(1, 32, 512)
-        gate_state = torch.zeros_like(state)
-        table = torch.zeros(1, 1, dtype=torch.int32)
-        page_map = CSA2GlobalPages(
-            torch.tensor([[0, 1]], dtype=torch.int32), torch.tensor([0], dtype=torch.int32), 1, 2
-        )
-        cu_seq = torch.tensor([0, 1], dtype=torch.int32)
 
     native_rope = torch.ops.trtllm.mla_rope_inplace
     rope_rows = []
@@ -100,48 +136,31 @@ def test_ratio2_module_partial_groups(monkeypatch):
         rope_rows.clear()
         completed = (token + 1) // 2
         new_rows = (token + 1) % 2 == 0
-        positions = torch.tensor([token], device="cuda", dtype=torch.int32)
-        compressed_positions = torch.tensor(
-            [token - 1] if new_rows else [], device="cuda", dtype=torch.int32
-        )
-        batch = CSA2Batch(
-            torch.arange(token + 1, device="cuda").unsqueeze(0),
-            positions,
-            page_map,
-            torch.tensor([completed], device="cuda", dtype=torch.int32),
-            torch.tensor([completed - 1] if new_rows else [], device="cuda", dtype=torch.int32),
-        )
-        compression = CSA2CompressionBatch(
-            state,
-            gate_state,
-            table,
-            table,
-            torch.tensor([token + 1], device="cuda", dtype=torch.int32),
-            positions,
-            cu_seq,
-            torch.tensor([0, int(new_rows)], device="cuda", dtype=torch.int32),
+        metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
+        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[token])
+        metadata.prepare()
+        positions = metadata.csa2_positions
+        assert metadata.get_compression_batch(0).cu_compressed_lengths.tolist() == [
+            0,
             int(new_rows),
-            32,
-            1,
-        )
-        old_main, old_index = cache.main[0].clone(), cache.index[0].clone()
-        actual = model(
-            hidden[token : token + 1],
-            positions,
-            cache,
-            batch,
-            CSA2Routing(),
-            compression=compression,
-            compressed_positions=compressed_positions,
-        )
+        ]
+        assert metadata.get_compression_batch(0).output_rows == 1
+        old_main = manager.get_main_buffer(0).clone()
+        old_index = manager.get_index_buffer(0).clone()
+        # Fixed-capacity runtime padding does not generate an empty latent,
+        # so exercise the zero-grid guard explicitly while recording native calls.
+        empty = hidden.new_empty((0, 1, 512))
+        assert model._rope(empty, positions[:0], 1) is empty
+        assert not rope_rows
+        actual = model(hidden[token : token + 1], positions, metadata)
         torch.cuda.synchronize()
         # Numerics alone can miss an empty native dispatch if a runtime/kernel
         # handles it as a no-op or clears its launch error in a later call.
         assert all(rows > 0 for rows in rope_rows), "Empty rows reached native RoPE"
         assert torch.isfinite(actual).all()
         if not new_rows:
-            torch.testing.assert_close(cache.main[0], old_main, atol=0, rtol=0)
-            torch.testing.assert_close(cache.index[0], old_index, atol=0, rtol=0)
+            torch.testing.assert_close(manager.get_main_buffer(0), old_main, atol=0, rtol=0)
+            torch.testing.assert_close(manager.get_index_buffer(0), old_index, atol=0, rtol=0)
 
         prefix_positions = torch.arange(token + 1, device="cuda", dtype=torch.int32)
         qr = _norm(

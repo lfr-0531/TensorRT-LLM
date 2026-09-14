@@ -46,21 +46,19 @@ def _reference(q, swa, extra, swa_valid, extra_valid, sink):
     return torch.einsum("qhk,qkd->qhd", probs, kv.float()).to(q.dtype)
 
 
-def _backend(heads):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.trtllm import CSA2TrtllmAttention
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
-        DeepseekV4TrtllmAttention,
-    )
+def _backend(heads, layer_idx=20, layout=None, compute_backend="auto"):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import get_csa2_backend
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
     from tensorrt_llm._utils import is_sm_100f
 
-    if not is_sm_100f():
+    if compute_backend in ("auto", "trtllm") and not is_sm_100f():
         pytest.skip("TRTLLM dynamic sparse MLA requires SM100-family")
-    params = CSA2Params(max_query_tokens=16)
-    assert get_attention_backend("TRTLLM", params) is CSA2TrtllmAttention
+    params = CSA2Params(max_query_tokens=16, layout=layout, compute_backend=compute_backend)
+    assert get_attention_backend("TRTLLM", params) is get_csa2_backend(params)
     attn = create_attention(
         "TRTLLM",
-        20,
+        layer_idx,
         heads,
         512,
         num_kv_heads=1,
@@ -73,8 +71,50 @@ def _backend(heads):
         rope_append=False,
         sparse_params=params,
     )
-    assert isinstance(attn, DeepseekV4TrtllmAttention)
+    assert isinstance(attn, TrtllmAttention)
+    assert type(attn).forward is TrtllmAttention.forward
+    assert "forward_selected" not in type(attn).__dict__
     return attn
+
+
+def _inputs(q, swa, extra, swa_valid, extra_valid, sink):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
+
+    swa_ids = torch.arange(swa.shape[0] * swa.shape[1], device=q.device).reshape_as(swa_valid)
+    main_ids = (
+        None
+        if extra is None
+        else torch.arange(extra.shape[0] * extra.shape[1], device=q.device).reshape_as(extra_valid)
+    )
+    inputs = CSA2BackendForwardArgs(
+        swa_pool=pack_rows(swa.flatten(0, 1), "swa"),
+        swa_indices=torch.where(swa_valid, swa_ids, -1),
+        main_pool=None if extra is None else pack_rows(extra.flatten(0, 1), "main"),
+        topk_indices=None if extra is None else torch.where(extra_valid, main_ids, -1),
+    )
+    return AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        attention_sinks=sink,
+        sparse_backend_args=inputs,
+    )
+
+
+def _decoded_reference(q, args, swa_valid, extra_valid, sink):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
+
+    inputs = args.sparse_backend_args
+    swa = unpack_rows(inputs.swa_pool, 512, "swa").reshape(q.shape[0], -1, 512)
+    main = (
+        None
+        if inputs.main_pool is None
+        else unpack_rows(inputs.main_pool, 512, "main").reshape(q.shape[0], -1, 512)
+    )
+    return _reference(q, swa, main, swa_valid, extra_valid, sink)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -111,11 +151,15 @@ def test_native_dual_pool(heads, extra_width, monkeypatch):
         extra_valid[0, 1::2] = False  # holes before later valid entries
         extra_valid[1] = False
     sink = torch.randn(heads, device="cuda")
-    out = attn.forward_selected(q, swa, extra, swa_valid, extra_valid, sink)
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, extra_width)
+    args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    out = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
     torch.cuda.synchronize()
-    assert calls and set(calls) == {"csa2"}
+    assert calls == ["csa2"]
     torch.testing.assert_close(
-        out, _reference(q, swa, extra, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
+        out, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
     )
 
 
@@ -130,26 +174,36 @@ def test_trtllm_graph_replay_resets_sparse_state():
     extra_valid = torch.ones(2, 17, device="cuda", dtype=torch.bool)
     sink = torch.zeros(64, device="cuda")
 
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
+
+    frame = CSA2TrtllmMetadata.for_query_tile(q, 17)
+
     def run():
-        return attn.forward_selected(q, swa, extra, swa_valid, extra_valid, sink)
+        frame.is_cuda_graph = torch.cuda.is_current_stream_capturing()
+        args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+        return attn.forward(q.flatten(1), None, None, frame, forward_args=args).view_as(q)
 
     for _ in range(3):
         run()
-    frame = attn._prepared[128]
     pointers = frame.pool_pointers.clone()
     workspace_ptr = frame.workspace.data_ptr()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run()
-    # An eager larger batch after capture must not invalidate captured storage.
-    attn.forward_selected(
-        q.repeat(8, 1, 1),
+    # Larger eager queries use independent caller-owned metadata. No recursive
+    # warmup or backend-private frame allocation is needed.
+    large_q = q.repeat(8, 1, 1)
+    large_frame = CSA2TrtllmMetadata.for_query_tile(large_q, 17)
+    large_args = _inputs(
+        large_q,
         swa.repeat(8, 1, 1),
         extra.repeat(8, 1, 1),
         swa_valid.repeat(8, 1),
         extra_valid.repeat(8, 1),
         sink,
     )
+    attn.forward(large_q.flatten(1), None, None, large_frame, forward_args=large_args)
     for width in (17, 0, 3, 17):
         extra_valid.zero_()
         extra_valid[:, :width] = True
@@ -157,64 +211,245 @@ def test_trtllm_graph_replay_resets_sparse_state():
         q.mul_(-1)
         extra.mul_(-1)
         graph.replay()
+        # Quantize/dequantize independently of the prediction hook's gathering.
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
+
+        swa_ref = unpack_rows(pack_rows(swa, "swa"), 512, "swa")
+        extra_ref = unpack_rows(pack_rows(extra, "main"), 512, "main")
         torch.testing.assert_close(
-            output, _reference(q, swa, extra, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
+            output,
+            _reference(q, swa_ref, extra_ref, swa_valid, extra_valid, sink),
+            atol=0.03,
+            rtol=0.03,
         )
         torch.testing.assert_close(frame.pool_pointers, pointers, atol=0, rtol=0)
         assert frame.workspace.data_ptr() == workspace_ptr
+        assert large_frame.workspace.data_ptr() != workspace_ptr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_controller_multiple_tiles_and_reuse():
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
-        CSA2Batch,
-        CSA2Cache,
-        CSA2Routing,
-        DeepseekV41SparseAttention,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
-    from tensorrt_llm._utils import is_sm_100f
+def test_standard_backend_multiple_tiles_and_reuse():
+    from types import SimpleNamespace
 
-    if not is_sm_100f():
-        pytest.skip("TRTLLM dynamic sparse MLA requires SM100-family")
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
+        CSA2CacheManager,
+        CSA2CacheRole,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
+        CSA2Batch,
+        CSA2Routing,
+        CSA2TrtllmMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+        CSA2BackendForwardArgs,
+        CSA2ForwardState,
+        CSA2Layout,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
     torch.manual_seed(419)
     layout = CSA2Layout((1, 1, 1), (0,), (0, 2), index_topk=4, window_size=4)
-    count, heads = 19, 8  # one full tile followed by a partial tile
-    cache = CSA2Cache.allocate(layout, count, {0: 6}, torch.device("cuda"))
-    reference_cache = CSA2Cache.allocate(layout, count, {0: 6}, torch.device("cuda"))
-    positions = torch.arange(count, device="cuda")
-    swa_indices = positions[:, None] - torch.arange(4, device="cuda")[None, :]
-    batch = CSA2Batch(
-        swa_indices.clamp_min(-1),
-        positions,
-        torch.arange(6, device="cuda").expand(count, -1),
-        positions.remainder(6) + 1,
-        torch.arange(6, device="cuda"),
+    count, heads = 19, 8
+    manager = CSA2CacheManager(
+        KvCacheConfig(max_gpu_total_bytes=64 << 20, host_cache_size=0),
+        CacheType.SELFKONLY,
+        num_layers=3,
+        tokens_per_block=128,
+        max_seq_len=64,
+        max_batch_size=1,
+        max_num_tokens=count,
+        mapping=Mapping(),
+        vocab_size=8192,
+        layout=layout,
     )
-    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
-    swa = torch.randn(count, 512, device="cuda", dtype=torch.bfloat16)
-    main = torch.randn(6, 512, device="cuda", dtype=torch.bfloat16)
-    index_k = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16)
-    index_q = torch.randn(count, 2, 128, device="cuda", dtype=torch.bfloat16)
-    index_weights = torch.ones(count, 2, device="cuda", dtype=torch.bfloat16)
-    sink = torch.randn(heads, device="cuda")
-    routing, reference_routing = CSA2Routing(), CSA2Routing()
-    for layer in range(3):
-        kwargs = {}
-        if layer != 1:
-            kwargs.update(index_q=index_q * (-1 if layer else 1), index_weights=index_weights)
-        if layer == 0:
-            kwargs.update(main_kv=main, index_k=index_k)
-        actual = DeepseekV41SparseAttention(layout, layer, compute_backend="auto")
-        expected = DeepseekV41SparseAttention(layout, layer, compute_backend="torch")
-        assert actual.compute_backend == "trtllm"
-        output = actual.forward(q, swa, sink, cache, batch, routing, **kwargs)
-        reference = expected.forward(
-            q, swa, sink, reference_cache, batch, reference_routing, **kwargs
+    try:
+        request = manager._create_kv_cache(100, None, [])
+        assert manager._resume_and_restore(100, request)
+        assert request.resize(count)
+        runtime = CSA2TrtllmMetadata(
+            max_num_requests=1, max_num_tokens=count, kv_cache_manager=manager
         )
-        torch.testing.assert_close(output, reference, atol=0.03, rtol=0.03)
-        frame = actual.trtllm_backend._prepared[128]
-        assert frame.host_total_kv_lens.tolist() == [0, 3 * 256]
-        assert frame.warmed_query_counts == {16, 3}
-    torch.testing.assert_close(routing.indices[2], reference_routing.indices[2])
+        positions = torch.arange(count, device="cuda")
+        q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+        swa = torch.randn(count, 512, device="cuda", dtype=torch.bfloat16)
+        main = torch.randn(6, 512, device="cuda", dtype=torch.bfloat16)
+        index_k = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16)
+        index_q = torch.randn(count, 2, 128, device="cuda", dtype=torch.bfloat16)
+        weights = torch.ones(count, 2, device="cuda", dtype=torch.bfloat16)
+        sink = torch.randn(heads, device="cuda")
+        routing = CSA2Routing()
+        global_base = manager.get_cache_indices(100, 0, CSA2CacheRole.GLOBAL)[0] * 128
+        global_slots = global_base + torch.arange(6, device="cuda")
+        for layer in range(3):
+            swa_base = manager.get_cache_indices(100, layer, CSA2CacheRole.SWA)[0] * 128
+            local = positions[:, None] - torch.arange(4, device="cuda")[None, :]
+            swa_slots = torch.where(local >= 0, local + swa_base, -1)
+            batch = CSA2Batch(
+                swa_slots,
+                positions + swa_base,
+                global_slots.expand(count, -1),
+                positions.remainder(6) + 1,
+                global_slots,
+            )
+            args_dict = {}
+            if layer != 1:
+                args_dict.update(index_q=index_q * (-1 if layer else 1), index_weights=weights)
+            if layer == 0:
+                args_dict.update(main_kv=main, index_k=index_k)
+            state = CSA2ForwardState(
+                cache_manager=manager, batch=batch, routing=routing, swa_kv=swa, **args_dict
+            )
+            backend = _backend(heads, layer, layout)
+            outputs = []
+            for start in range(0, count, 16):
+                tile = q[start : start + 16]
+                frame = runtime.get_query_tile_metadata(tile, layout.index_topk)
+                args = AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.generation_only,
+                    attention_sinks=sink,
+                    sparse_backend_args=CSA2BackendForwardArgs(state=state, query_start=start),
+                )
+                outputs.append(
+                    backend.forward(tile.flatten(1), None, None, frame, forward_args=args).view_as(
+                        tile
+                    )
+                )
+            actual = torch.cat(outputs)
+            logical = routing.indices[0 if layer == 1 else layer]
+            slots = batch.global_slot_tile(0, count, logical)
+            swa_values = gather_rows(manager.get_swa_buffer(layer), swa_slots, 512, "swa")
+            main_values = gather_rows(manager.get_main_buffer(0), slots, 512, "main")
+            expected = _reference(q, swa_values, main_values, swa_slots >= 0, slots >= 0, sink)
+            torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+            frame = runtime.get_query_tile_metadata(q[-3:], 4)
+            assert frame.host_total_kv_lens.tolist() == [0, 3 * 256]
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_shared_metadata_resets_global_to_swa_inputs():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    q = torch.randn(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(2, 4, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(2, 17, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(2, 4, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(2, 17, device="cuda", dtype=torch.bool)
+    sink = torch.zeros(8, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17)
+    first, second = _backend(8, 20), _backend(8, 21)
+    args = _inputs(q, swa, main, swa_valid, main_valid, sink)
+    first.forward(q.flatten(1), None, None, metadata, forward_args=args)
+    assert args.sparse_runtime_params.aux_kv_cache_pool_ptr is not None
+    # Reuse the runtime carrier and metadata across distinct layers, but remove
+    # main selection. No stale main pointer or sparse length may survive.
+    args.sparse_backend_args = _inputs(q, -swa, None, swa_valid, None, sink).sparse_backend_args
+    args.output = None
+    output = second.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+    assert args.sparse_runtime_params.aux_kv_cache_pool_ptr is None
+    torch.testing.assert_close(metadata.prepared_lens, torch.full_like(metadata.prepared_lens, 4))
+    torch.testing.assert_close(
+        output, _decoded_reference(q, args, swa_valid, None, sink), atol=0.03, rtol=0.03
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_cold_metadata_rejects_capture():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    attn = _backend(8)
+    q = torch.zeros(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.zeros(2, 1, 512, device="cuda", dtype=torch.bfloat16)
+    valid = torch.ones(2, 1, device="cuda", dtype=torch.bool)
+    sink = torch.zeros(8, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
+    args = _inputs(q, swa, None, valid, None, sink)
+    metadata.is_cuda_graph = True
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="Warm up CSA2 metadata"):
+        with torch.cuda.graph(graph):
+            attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
+@torch.inference_mode()
+def test_alternative_backend_standard_forward(implementation, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    def unexpected_fallback(*args, **kwargs):
+        raise AssertionError("Selected CSA2 implementation fell through to native fallback")
+
+    monkeypatch.setattr(FallbackFmha, "forward", unexpected_fallback)
+    attn = _backend(8, compute_backend=implementation)
+    q = torch.randn(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(2, 4, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(2, 17, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(2, 4, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(2, 17, device="cuda", dtype=torch.bool)
+    main_valid[0, ::2] = False
+    swa_valid[1] = False
+    main_valid[1] = False
+    sink = torch.linspace(-2, 2, 8, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17)
+    args = _inputs(q, swa, main, swa_valid, main_valid, sink)
+    actual = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+    torch.testing.assert_close(
+        actual, _decoded_reference(q, args, swa_valid, main_valid, sink), atol=0.03, rtol=0.03
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("option", ["custom_mask", "out_scale", "output_sf"])
+@torch.inference_mode()
+def test_alternative_backend_rejects_unsupported_options(option):
+    from tensorrt_llm._torch.attention.backends.interface import CustomAttentionMask
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    attn = _backend(8, compute_backend="flashinfer")
+    q = torch.zeros(1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+    valid = torch.ones(1, 1, device="cuda", dtype=torch.bool)
+    args = _inputs(q, swa, None, valid, None, torch.zeros(8, device="cuda"))
+    if option == "custom_mask":
+        args.attention_mask = CustomAttentionMask.CUSTOM
+    elif option == "out_scale":
+        args.out_scale = torch.ones(1, device="cuda")
+    else:
+        args.output = torch.empty_like(q).flatten(1)
+        args.output_sf = torch.empty(1, device="cuda", dtype=torch.uint8)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
+    with pytest.raises(RuntimeError, match="No TRT-LLM attention FMHA library supports"):
+        attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_alternative_backend_cache_hit_rejects_output_scale():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    attn = _backend(8, compute_backend="flashinfer")
+    q = torch.zeros(1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+    valid = torch.ones(1, 1, device="cuda", dtype=torch.bool)
+    args = _inputs(q, swa, None, valid, None, torch.zeros(8, device="cuda"))
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
+    attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+    torch.cuda.synchronize()
+    args.out_scale = torch.ones(1, device="cuda")
+    with pytest.raises(RuntimeError, match="do not support.*mask/output format"):
+        attn.forward(q.flatten(1), None, None, metadata, forward_args=args)

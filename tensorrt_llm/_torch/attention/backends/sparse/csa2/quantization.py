@@ -93,3 +93,29 @@ def unpack_rows(
         values = levels[codes & 7] * torch.where(codes & 8 != 0, -1, 1)
     values = values.reshape(*rows.shape[:-1], head_dim // group, group)
     return (values * scales.unsqueeze(-1)).reshape(*rows.shape[:-1], head_dim).to(dtype)
+
+
+def gather_rows(
+    pool: torch.Tensor, slots: torch.Tensor, dim: int, cache_format: CacheFormat
+) -> torch.Tensor:
+    # Every pool includes at least one allocated padding row. Mask invalid
+    # values after gathering so uninitialized padding never enters a matmul.
+    rows = pool[slots.clamp_min(0).long()]
+    values = unpack_rows(rows, dim, cache_format)
+    return torch.where((slots >= 0).unsqueeze(-1), values, 0)
+
+
+def store_rows(
+    pool: torch.Tensor, slots: torch.Tensor, values: torch.Tensor, cache_format: CacheFormat
+) -> None:
+    """Publish quantized rows into a packed, possibly strided cache view."""
+    packed = pack_rows(values, cache_format)
+    if slots.numel() != packed.shape[0] or pool.shape[1] != packed.shape[1]:
+        raise ValueError("CSA2 publication requires one slot per packed row")
+    if slots.is_cuda:
+        from .kernels import scatter_packed_rows
+
+        scatter_packed_rows(pool, slots, packed)
+    else:
+        valid = (slots >= 0) & (slots < pool.shape[0])
+        pool.index_copy_(0, slots[valid].long(), packed[valid])

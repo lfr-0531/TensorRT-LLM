@@ -2674,13 +2674,17 @@ def _create_kv_cache_manager(
             **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
-    elif is_mla(config):
+    elif (getattr(sparse_attention_config, "algorithm", None) == "csa2"
+          or is_mla(config)):
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(getattr(config, "head_dim", 512)
+                      if sparse_attention_config is not None
+                      and sparse_attention_config.algorithm == "csa2" else
+                      config.kv_lora_rank + config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,

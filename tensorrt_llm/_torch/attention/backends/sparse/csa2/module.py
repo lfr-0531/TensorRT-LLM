@@ -15,9 +15,9 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..deepseek_v4.module import project_sparse_attn_output
-from .backend import CSA2Batch, CSA2Cache, CSA2Routing, DeepseekV41SparseAttention
-from .compressor import CSA2CompressionBatch, CSA2Compressor
-from .params import CSA2Layout, CSA2Mode
+from .compressor import CSA2Compressor
+from .metadata import CSA2TrtllmMetadata
+from .params import CSA2BackendForwardArgs, CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -68,9 +68,6 @@ class DeepseekV41Attention(nn.Module):
         self.mapping = mapping
         self.num_groups = num_groups
         self.layer = layout.layer(layer_idx)
-        self.backend = DeepseekV41SparseAttention(
-            layout, layer_idx, compute_backend=compute_backend
-        )
         self.num_heads_tp = num_heads // mapping.tp_size
         self.qk_head_dim = self.v_head_dim = head_dim
         self.qk_rope_head_dim = rope_head_dim
@@ -78,6 +75,17 @@ class DeepseekV41Attention(nn.Module):
         self.n_local_groups = num_groups // mapping.tp_size
         self.o_lora_rank = o_lora_rank
         self.eps = eps
+        from tensorrt_llm._torch.attention.backends.utils import create_attention
+
+        self.layout = layout
+        self.backend = create_attention(
+            "TRTLLM",
+            layer_idx,
+            self.num_heads_tp,
+            head_dim,
+            num_kv_heads=1,
+            sparse_params=CSA2Params(layout=layout, compute_backend=compute_backend),
+        )
         self.index_heads = index_heads
         self.index_head_dim = index_head_dim
         self.wq_a = nn.Linear(hidden_size, q_lora_rank, bias=False, dtype=torch.bfloat16)
@@ -220,12 +228,8 @@ class DeepseekV41Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        cache: CSA2Cache,
-        batch: CSA2Batch,
-        routing: CSA2Routing,
+        attn_metadata: CSA2TrtllmMetadata,
         *,
-        compression: CSA2CompressionBatch | None = None,
-        compressed_positions: torch.Tensor | None = None,
         global_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return [tokens, hidden_size]; all packed rows must retain source order.
@@ -235,6 +239,15 @@ class DeepseekV41Attention(nn.Module):
         completed group. ``global_hidden_states`` is the encoder output when
         decoder global KV is prepared from more rows than its SWA replay.
         """
+        manager = attn_metadata.kv_cache_manager
+        batch = attn_metadata.get_layer_batch(self.layer.layer_idx)
+        routing = attn_metadata.csa2_routing
+        compression = attn_metadata.get_compression_batch(self.layer.layer_idx)
+        compressed_positions = (
+            attn_metadata.get_compressed_positions(self.layer.layer_idx)
+            if self.layer.mode == CSA2Mode.FULL
+            else None
+        )
         qr = _rms_norm(self.wq_a(hidden_states), self.q_norm_weight, self.eps)
         # Unlike V4, CSA2 does not normalize individual projected Q heads.
         q = self._rope(
@@ -263,16 +276,34 @@ class DeepseekV41Attention(nn.Module):
             index_weights = self.index_weights_proj(hidden_states) * (
                 self.index_head_dim**-0.5 * self.index_heads**-0.5
             )
-        output = self.backend.forward(
-            q,
-            swa,
-            self.attn_sink,
-            cache,
-            batch,
-            routing,
+        from tensorrt_llm._torch.attention.backends.interface import (
+            AttentionForwardArgs,
+            AttentionInputType,
+        )
+
+        state = CSA2ForwardState(
+            cache_manager=manager,
+            batch=batch,
+            routing=routing,
+            swa_kv=swa,
             index_q=index_q,
             index_weights=index_weights,
             main_kv=main_kv,
             index_k=index_k,
         )
+        output = torch.empty_like(q)
+        tile_size = self.backend.sparse_params.max_query_tokens
+        for start in range(0, q.shape[0], tile_size):
+            tile = q[start : start + tile_size]
+            metadata = attn_metadata.get_query_tile_metadata(
+                tile, 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
+            )
+            args = AttentionForwardArgs(
+                attention_input_type=AttentionInputType.generation_only,
+                attention_sinks=self.attn_sink,
+                sparse_backend_args=CSA2BackendForwardArgs(state=state, query_start=start),
+            )
+            output[start : start + tile_size] = self.backend.forward(
+                tile.flatten(1), None, None, metadata, forward_args=args
+            ).view_as(tile)
         return project_sparse_attn_output(self, [output.flatten(1)], positions)

@@ -6,9 +6,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from ..params import SparseParams
+import torch
+
+from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
+
+if TYPE_CHECKING:
+    from .cache_manager import CSA2CacheManager
+    from .metadata import CSA2Batch, CSA2Routing
 
 
 class CSA2Mode(Enum):
@@ -53,6 +59,31 @@ class CSA2Layout:
     candidate_block_size: int = 8
     index_topk: int = 512
     window_size: int = 128
+
+    @classmethod
+    def from_hf_config(cls, config: object) -> CSA2Layout:
+        """Read CSA2 geometry from either the wrapper or text checkpoint config."""
+        if config is None:
+            raise ValueError("CSA2 requires a checkpoint text configuration")
+        text = (
+            config.get("text_config", config)
+            if isinstance(config, dict)
+            else getattr(config, "text_config", config)
+        )
+
+        def value(name: str):
+            return text[name] if isinstance(text, dict) else getattr(text, name)
+
+        return cls(
+            tuple(value("compress_ratios")),
+            tuple(value("kv_source_layer_ids")),
+            tuple(value("index_source_layer_ids")),
+            value("candidate_source_layer_id"),
+            value("candidate_topk_blocks"),
+            value("candidate_block_size"),
+            value("index_topk"),
+            value("sliding_window"),
+        )
 
     def __post_init__(self) -> None:
         if not self.compress_ratios or any(r not in (0, 1, 2) for r in self.compress_ratios):
@@ -122,6 +153,8 @@ class CSA2Params(SparseParams):
     algorithm: Literal["csa2"] = field(init=False, default="csa2")
     indices_block_size: int = field(init=False, default=1)
     max_query_tokens: int = 16
+    layout: CSA2Layout | None = None
+    compute_backend: str = "auto"
 
     def __post_init__(self) -> None:
         if self.max_query_tokens <= 0:
@@ -137,3 +170,40 @@ def select_csa2_backend(sm_version: int) -> str:
     if sm_version in (120, 121):
         return "flashinfer"
     raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
+
+
+@dataclass(kw_only=True, slots=True)
+class CSA2BackendForwardArgs(SparseBackendForwardArgs):
+    """Selected packed-pool inputs for the standard sparse prediction hook.
+
+    SWA uses CSA2 FP8 rows, main uses CSA2 FP4 rows, both uint8 [pool_rows, bytes].
+    swa_indices and inherited topk_indices are [queries, selected] pool-relative
+    row indices; -1 denotes padding. topk_indices addresses main_pool.
+    """
+
+    swa_pool: torch.Tensor | None = None
+    swa_indices: torch.Tensor | None = None
+    main_pool: torch.Tensor | None = None
+    state: CSA2ForwardState | None = None
+    query_start: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
+class CSA2ForwardState:
+    """Projected module inputs and per-forward state consumed by sparse prediction."""
+
+    cache_manager: CSA2CacheManager
+    batch: CSA2Batch
+    routing: CSA2Routing
+    swa_kv: torch.Tensor
+    index_q: torch.Tensor | None = None
+    index_weights: torch.Tensor | None = None
+    main_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class CSA2MetadataParams(SparseMetadataParams):
+    """Checkpoint layout shared by runtime metadata and cache ownership."""
+
+    layout: CSA2Layout

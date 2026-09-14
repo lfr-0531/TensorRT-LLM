@@ -38,7 +38,8 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig, MoeLoadBalancerConfig,
                                           MultimodalConfig)
@@ -322,6 +323,10 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if (self.sparse_attention_config is None
+                and getattr(self.pretrained_config, "model_type",
+                            None) in ("deepseek_v41", "deepseek_v41_text")):
+            self.sparse_attention_config = CSA2SparseAttentionConfig()
         if self.pretrained_config and self.sparse_attention_config:
             # Sparse geometry can come from the checkpoint. Resolve it once so
             # cache allocation, CUDA-graph routing, and model layers all read

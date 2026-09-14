@@ -5,10 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.flashinfer import (
-    FlashInferCSA2,
-    pack_query_masks,
-)
+from tensorrt_llm._torch.attention.backends.fmha.csa2 import FlashInferCSA2, pack_query_masks
 
 
 def test_segmented_mask_packing():
@@ -51,3 +48,27 @@ def test_flashinfer_bf16_and_graph(heads, width):
         kv.mul_(-1)
         graph.replay()
         torch.testing.assert_close(output, reference(), atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_fixed_plan_ignores_dirty_workspace_padding(monkeypatch):
+    """A one-query no-split plan must not launch uninitialized padded CTAs."""
+    q = torch.zeros(1, 8, 512, dtype=torch.bfloat16, device="cuda")
+    kv = torch.zeros(1, 128, 512, dtype=torch.bfloat16, device="cuda")
+    valid = torch.zeros(1, 128, dtype=torch.bool, device="cuda")
+    valid[:, 0] = True
+    sink = torch.zeros(8, device="cuda")
+    original_empty = torch.empty
+
+    def dirty_workspace(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_cuda and tensor.dtype == torch.uint8 and tensor.numel() >= 1024 * 1024:
+            tensor.fill_(127)
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", dirty_workspace)
+    attn = FlashInferCSA2()
+    result = attn(q, kv, valid, sink, 512**-0.5)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result, torch.zeros_like(q), atol=0, rtol=0)

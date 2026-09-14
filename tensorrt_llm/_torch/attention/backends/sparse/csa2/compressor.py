@@ -74,7 +74,7 @@ class CSA2Compressor(nn.Module):
             values = self.wkv(x.float())
             gates = self.wgate(x.float())
             kv_score = torch.cat((values, gates), dim=-1)
-            latent = torch.empty((batch.output_rows, self.head_dim), device=x.device, dtype=x.dtype)
+            latent = torch.zeros((batch.output_rows, self.head_dim), device=x.device, dtype=x.dtype)
             torch.ops.trtllm.compressor_prefill_reduction(
                 kv_score,
                 self.zero_ape,

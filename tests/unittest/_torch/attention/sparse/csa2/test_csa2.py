@@ -3,28 +3,78 @@
 """CSA2 ownership, quantized cache and hierarchical selection contracts."""
 
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import (
     CSA2Batch,
-    CSA2Cache,
     CSA2GlobalPages,
     CSA2Routing,
-    DeepseekV41SparseAttention,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Mode
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+    CSA2BackendForwardArgs,
+    CSA2ForwardState,
+    CSA2Layout,
+    CSA2Mode,
+)
+from tensorrt_llm._torch.attention.backends.sparse.csa2.prediction import (
+    create_indexer,
+    predict_csa2_inputs,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+    gather_rows,
     pack_rows,
     row_bytes,
+    store_rows,
     unpack_rows,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.selection import (
-    index_scores,
-    select_candidate_positions,
-    select_topk_positions,
-)
+
+
+def _test_pools(swa, main, index):
+    """Synthetic byte pools for pure prediction tests; lifecycle has real-manager tests."""
+
+    def write_global(owner, slots, values, keys):
+        store_rows(main[owner], slots, values, "main")
+        store_rows(index[owner], slots, keys, "index")
+
+    return SimpleNamespace(
+        get_swa_buffer=lambda layer: swa[layer],
+        get_main_buffer=lambda owner: main[owner],
+        get_index_buffer=lambda owner: index[owner],
+        write_swa=lambda layer, slots, values: store_rows(swa[layer], slots, values, "swa"),
+        write_global=write_global,
+        indexers={},
+    )
+
+
+def _attention_reference(q, kv, valid, sink):
+    scores = torch.einsum("qhd,qkd->qhk", q.float(), kv.float()) * q.shape[-1] ** -0.5
+    scores.masked_fill_(~valid[:, None, :], -torch.inf)
+    scores = torch.cat((scores, sink[None, :, None].expand(q.shape[0], -1, -1)), -1)
+    return torch.einsum("qhk,qkd->qhd", scores.softmax(-1)[..., :-1], kv.float()).to(q.dtype)
+
+
+def _prediction_reference(layout, layer, q, swa, sink, cache, batch, routing, **kwargs):
+    state = CSA2ForwardState(
+        cache_manager=cache, batch=batch, routing=routing, swa_kv=swa, **kwargs
+    )
+    if state.index_q is not None and layer not in cache.indexers:
+        cache.indexers[layer] = create_indexer(
+            state.index_q.shape[1], state.index_q.shape[-1], layout.index_topk
+        )
+    selected = predict_csa2_inputs(
+        layout, layer, CSA2BackendForwardArgs(state=state), q.shape[0], cache.indexers.get(layer)
+    )
+    kv = gather_rows(selected.swa_pool, selected.swa_indices, q.shape[-1], "swa")
+    valid = selected.swa_indices >= 0
+    if selected.topk_indices is not None:
+        kv = torch.cat(
+            (kv, gather_rows(selected.main_pool, selected.topk_indices, q.shape[-1], "main")), dim=1
+        )
+        valid = torch.cat((valid, selected.topk_indices >= 0), dim=1)
+    return _attention_reference(q, kv, valid, sink)
 
 
 def test_release_layout():
@@ -40,12 +90,13 @@ def test_release_layout():
         CSA2Mode.REINDEX: 4,
         CSA2Mode.REUSE: 30,
     }
-    assert CSA2Cache.global_bytes_per_token(layout) == 890
-    cache = CSA2Cache.allocate(
-        layout, 1, {i: 1 for i in layout.kv_source_layer_ids}, torch.device("cpu")
+    assert (
+        sum(
+            (row_bytes(512, "main") + row_bytes(128, "index")) // layout.compress_ratios[i]
+            for i in layout.kv_source_layer_ids
+        )
+        == 890
     )
-    assert len(cache.main) == len(cache.index) == 4
-    assert len({pool.data_ptr() for pool in cache.swa.values()}) == 43
     assert layout.layer(39).kv_source == 20
     assert layout.layer(39).index_source == 36
     assert layout.layer(40).kv_source is None
@@ -95,39 +146,70 @@ def test_fp4_midpoint_rounding_and_rope_tail():
     )
 
 
-def test_candidates_pin_latest_block_and_mask_future():
-    scores = torch.tensor([[100.0, 90.0, 80.0, 70.0, 1.0, 1000.0]])
-    candidates = select_candidate_positions(scores, torch.tensor([5]), 1, 2)
-    assert candidates.tolist() == [[4, -1]]
-    chosen = select_topk_positions(
-        torch.tensor([[2.0, 100.0]]), candidates.int(), torch.tensor([5]), 3
+def _selection_state(queries, keys, visible, topk=3):
+    width = keys.shape[0]
+    layout = CSA2Layout(
+        (1, 1),
+        (0,),
+        (0, 1),
+        0,
+        candidate_topk_blocks=1,
+        candidate_block_size=2,
+        index_topk=topk,
+        window_size=1,
     )
-    assert chosen.tolist() == [[4, -1, -1]]
+    manager = _test_pools(
+        {
+            i: torch.zeros(max(queries, 1), row_bytes(128, "swa"), dtype=torch.uint8)
+            for i in range(2)
+        },
+        {0: torch.zeros(max(width, 1), row_bytes(128, "main"), dtype=torch.uint8)},
+        {0: torch.zeros(max(width, 1), row_bytes(128, "index"), dtype=torch.uint8)},
+    )
+    batch = CSA2Batch(
+        torch.arange(queries)[:, None],
+        torch.arange(queries),
+        torch.arange(width).expand(queries, -1),
+        visible,
+        torch.arange(width),
+    )
+    state = CSA2ForwardState(
+        cache_manager=manager,
+        batch=batch,
+        routing=CSA2Routing(),
+        swa_kv=torch.zeros(queries, 128, dtype=torch.bfloat16),
+        index_q=torch.ones(queries, 1, 128, dtype=torch.bfloat16),
+        index_weights=torch.ones(queries, 1),
+        main_kv=torch.zeros(width, 128, dtype=torch.bfloat16),
+        index_k=keys,
+    )
+    return layout, state
+
+
+def test_candidates_pin_latest_block_and_mask_future():
+    keys = torch.tensor([6.0, 4.0, 3.0, 2.0, 0.5, 6.0], dtype=torch.bfloat16)[:, None].expand(
+        -1, 128
+    )
+    layout, state = _selection_state(1, keys, torch.tensor([5]))
+    args = CSA2BackendForwardArgs(state=state)
+    predict_csa2_inputs(layout, 0, args, 1)
+    assert state.routing.candidates[0].tolist() == [[4, -1]]
+    state.main_kv = state.index_k = None
+    predict_csa2_inputs(layout, 1, args, 1)
+    assert state.routing.indices[1].tolist() == [[4, -1, -1]]
 
 
 @pytest.mark.parametrize("queries,width", [(0, 0), (0, 8), (2, 0), (2, 8)])
 def test_empty_visibility(queries, width):
-    lengths = torch.zeros(queries, dtype=torch.int32)
-    scores = torch.zeros(queries, width)
-    candidates = select_candidate_positions(scores, lengths, 2, 4)
-    assert torch.all(candidates == -1)
-    top = select_topk_positions(scores, torch.arange(width, dtype=torch.int32), lengths, 3)
-    assert top.shape == (queries, 3)
-    assert torch.all(top == -1)
-
-
-def test_index_scores_match_bf16_reference():
-    generator = torch.Generator().manual_seed(12)
-    q = torch.randn(2, 16, 128, generator=generator).bfloat16()
-    k = torch.randn(256, 128, generator=generator).bfloat16()
-    w = torch.randn(2, 16, generator=generator).bfloat16()
-    q = unpack_rows(pack_rows(q, "index"), 128, "index")
-    k = unpack_rows(pack_rows(k, "index"), 128, "index")
-    expected = (torch.einsum("qhd,kd->qhk", q, k).relu() * w.unsqueeze(-1)).sum(1)
-    torch.testing.assert_close(index_scores(q, k, w), expected.float(), atol=0, rtol=0)
-    torch.testing.assert_close(
-        index_scores(q, k.expand(2, -1, -1), w), expected.float(), atol=0, rtol=0
+    layout, state = _selection_state(
+        queries,
+        torch.zeros(width, 128, dtype=torch.bfloat16),
+        torch.zeros(queries, dtype=torch.int32),
     )
+    predict_csa2_inputs(layout, 0, CSA2BackendForwardArgs(state=state), queries)
+    assert state.routing.indices[0].shape == (queries, 3)
+    assert torch.all(state.routing.indices[0] == -1)
+    assert torch.all(state.routing.candidates[0] == -1)
 
 
 def _run_modes(device, graph_replay=False, paged=False):
@@ -142,7 +224,7 @@ def _run_modes(device, graph_replay=False, paged=False):
         window_size=1,
     )
     dim = 128
-    cache = CSA2Cache(
+    cache = _test_pools(
         {
             i: torch.zeros(1, row_bytes(dim, "swa"), dtype=torch.uint8, device=device)
             for i in range(3)
@@ -150,7 +232,6 @@ def _run_modes(device, graph_replay=False, paged=False):
         {0: torch.zeros(2, row_bytes(dim, "main"), dtype=torch.uint8, device=device)},
         {0: torch.zeros(2, row_bytes(dim, "index"), dtype=torch.uint8, device=device)},
     )
-    cache.validate(layout)
     batch = CSA2Batch(
         torch.tensor([[0]], device=device),
         torch.tensor([0], device=device),
@@ -182,8 +263,8 @@ def _run_modes(device, graph_replay=False, paged=False):
             if i == 0:
                 kwargs.update(main_kv=main, index_k=key)
             outputs.append(
-                DeepseekV41SparseAttention(layout, i).forward(
-                    q, swa * (i + 1), sink, cache, batch, routing, **kwargs
+                _prediction_reference(
+                    layout, i, q, swa * (i + 1), sink, cache, batch, routing, **kwargs
                 )
             )
         return outputs, routing
@@ -239,9 +320,7 @@ def test_full_reuse_reindex_private_swa_and_shared_sink(paged):
         routing.enter(layout.layer(0))
     q = torch.zeros(1, 1, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="source did not run"):
-        DeepseekV41SparseAttention(layout, 1).forward(
-            q, q[:, 0], torch.zeros(1), cache, batch, CSA2Routing()
-        )
+        _prediction_reference(layout, 1, q, q[:, 0], torch.zeros(1), cache, batch, CSA2Routing())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

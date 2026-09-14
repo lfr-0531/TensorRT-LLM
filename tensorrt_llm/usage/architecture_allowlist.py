@@ -30,6 +30,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "DeepSeekV2ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "DeepseekV4ForCausalLM",
         "EAGLE3LlamaForCausalLM",
         "Eagle3DeepSeekV3ForCausalLM",

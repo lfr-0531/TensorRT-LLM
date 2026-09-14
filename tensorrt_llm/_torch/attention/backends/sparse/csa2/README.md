@@ -3,105 +3,108 @@
 
 # Compressed Sparse Attention 2 (CSA2)
 
-This package contains the CSA2 attention component implementation. It is not
-registered as a complete `DeepseekV41ForCausalLM` model. Executor metadata and
-cache allocation integration are still required before serving the checkpoint.
+This package implements CSA2 attention backends, cache management and runtime
+metadata. It does not register a complete `DeepseekV41ForCausalLM` model or
+implement the model's full causal encoder/decoder scheduling.
 
-## Computation and ownership
+## Framework integration
 
-`CSA2Layout` separates SWA-only, Full, Reindex and Reuse layers. Ratio zero means
-SWA-only; ratios two and one describe encoder and decoder global caches. Only
-KV sources allocate main and index pools. Every attention layer has private
-SWA storage. `CSA2Cache.global_bytes_per_token` accounts for the published
-layout's 890 bytes per token of persistent main/index cache, excluding bounded
-SWA and compression state.
+`backend.py` defines three backends using the standard `TrtllmAttention`
+forward and sparse prediction contract:
 
-`DeepseekV41Attention.from_hf_config` accepts the model's text configuration.
-`load_hf_weights` validates global shapes before TP slicing, including grouped
-O-LoRA, and converts checkpoint FP8 block scales to the component's BF16/FP32
-weights. The indexer is replicated across TP ranks; attention heads and output
-projection are sharded using TRT-LLM `Linear`. PP and CP require shared-state
-transfer and are rejected.
+| Architecture | Backend | Computation |
+| --- | --- | --- |
+| SM100 family | `CSA2TrtllmAttention` | Native trtllm-gen dynamic sparse MLA |
+| SM120/121 | `CSA2FlashInferAttention` | FlashInfer BF16 FA2 |
+| SM90 | `CSA2FlashMLAAttention` | FlashMLA sparse BF16 |
 
-The module omits V4's projected-Q head normalization. `CSA2Compressor` reuses the
-V4 native non-overlap compressor, extended to ratio two, with FP32 projection
-and persistent state. Its zero APE is a constant buffer. Ratio one has no gate.
-Both paths return the normalized, unrotated main latent; index K is derived
-before main-KV RoPE and quantization. The grouped output projection and inverse
-RoPE reuse V4's implementation.
+The inherited forward owns output allocation, prediction-hook dispatch and
+FMHA selection. `prediction.py` prepares native sparse inputs.
+`attention/backends/fmha/csa2.py` supplies the FlashInfer/FlashMLA compute
+libraries. There is no separate attention controller or alternate backend
+forward API.
 
-Main KV stores E2M1 values with E4M3 scales per 16 channels. Index Q/K use
-UE8M0 scales per 32 channels. SWA uses E4M3 values with power-of-two scales per
-32 channels. All formats include the RoPE channels. The packing helpers are
-Torch implementations; their fusion and performance have not been evaluated.
+`CSA2SparseAttentionConfig(algorithm="csa2")` selects the cache manager through
+the existing sparse registry. Cache geometry comes from checkpoint text
+configuration rather than an independent set of LLM-argument overrides.
+`ModelConfig` selects CSA2 for `deepseek_v41`/`deepseek_v41_text` configurations.
 
-The hierarchical indexer pins the latest visible block and uses block maxima
-for candidate selection. Reindex gathers only candidate keys, then publishes
-logical positions. Reuse shares these logical positions and resolves physical
-slots afresh. `CSA2Routing` belongs to one packed forward; it must not survive
-into the next eager forward or be shared between concurrent batches.
+## Module and indexer
 
-For 512-dimensional heads, the module's automatic compute policy follows V4:
+`DeepseekV41Attention` owns projections, RoPE, compression and grouped output
+projection. Its forward consumes prepared `CSA2TrtllmMetadata` and directly
+calls the selected backend over bounded query tiles. The module omits V4's
+projected-Q head normalization. Index K is derived from the compressed main
+latent before main-KV RoPE and quantization. Ratio two reuses the native V4
+non-overlap compressor with FP32 state and zero APE; ratio one has no gate.
 
-| GPU architecture | CSA2 compute path |
-| --- | --- |
-| Hopper (SM90) | Repository-pinned FlashMLA sparse BF16 |
-| Blackwell datacenter (SM100 family) | TRTLLM backend and native trtllm-gen dynamic sparse MLA |
-| SM120/SM121 | FlashInfer BF16 ragged FA2 |
+Prediction uses the existing DSA `Indexer` class in projection-free mode.
+Its shared prepared-input QK-to-TopK flow is also used by DSA's existing prefill
+paths. Native MQA dispatch, exact TopK and output handling belong to that class.
+CSA2 adds its block-max candidate/latest-block rule, logical-position mapping
+and Full/Reindex/Reuse decisions. Shared layers consume logical selections and
+resolve physical pages afresh for their request view.
 
-`CSA2TrtllmAttention` inherits V4's sparse forward facade and uses its existing
-TRTLLM FMHA dispatch and native AttentionOp. The CSA2 controller supplies the
-selected, dequantized rows through bounded BF16 staging pools. Valid SWA and
-global rows are compacted together, then split at the native 128-row pool
-boundary; padding is outside the actual sparse length. The packed persistent
-FP4/FP8 caches retain their original CSA2 formats. This path does not imply
-native trtllm-gen support for reading CSA2 FP4 bytes directly.
+The selected main/SWA values are decoded into bounded BF16 compute pools.
+Native trtllm-gen does not consume CSA2 FP4 bytes directly. FlashInfer FA2 also
+avoids extra quantization into V4's different FP8 footer layout. FlashInfer and
+FlashMLA emit BF16 output; custom masks and scaled/quantized outputs are rejected.
 
-The SM120/SM121 implementation uses FlashInfer's 512-dimensional BF16 FA2 path.
-V4's dedicated FlashInfer sparse MLA kernel requires its different FP8 footer
-layout; repacking CSA2 into that layout would introduce extra quantization.
-The BF16 path preserves decoded values and includes the sink using FA2's
-returned softmax normalization statistics.
+## Cache ownership and lifecycle
 
-All paths compute one combined SWA/global attention with one sink. The explicit
-`compute_backend="torch"` option is available for component/reference testing.
-TRTLLM and FlashInfer own mutable staging/planning state and require serialized
-calls on one stream per instance. Warm up each query shape before CUDA Graph
-capture. Unsupported architectures fail explicitly.
+`CSA2CacheManager` specializes `KVCacheManagerV2`. It reuses the shared request
+allocation, commit, prefix reuse, copy-on-write, scratch, release and tier
+storage mechanisms. Only KV-source layers allocate global storage; every
+attention layer owns private SWA storage. Only ratio-two KV owners allocate
+FP32 KV/score compressor state.
 
-## Caller contracts still needing executor integration
+Each global record stores 288 main bytes and 68 index bytes together. Main
+uses E2M1/E4M3 scales per 16 channels; index uses E2M1/UE8M0 per 32 channels.
+The main/index views have a 356-byte row stride and share physical page numbers
+by construction. Copy-on-write and transfer operate on the complete record,
+including both sets of scales. The published layout requires 890 global bytes
+per original token, excluding bounded SWA and partial state.
 
-- Supply `CSA2Batch` pool-relative mappings and exact causal visible lengths.
-  Source and consumer query rows must have identical packed order.
-- Allocate distinct SWA write slots for a whole prefill chunk, including
-  staging storage. Mapping a long chunk directly to a circular cache would
-  overwrite history needed by earlier queries. Retire staging after use.
-- Allocate main/index pools exactly once per KV source and bind both to the
-  same physical slot mapping. Prefix reuse and transfer must preserve source
-  ownership, quantization scales and partial compressor state.
-- Supply completed-group positions at each group's first source token.
-  CUDA Graph padding rows require valid dummy positions and private write
-  slots; no uninitialized positions may reach RoPE.
-- For decoder SWA replay, `global_hidden_states` can contain the encoder rows
-  used to prepare global KV while query/SWA computation consumes fewer rows.
-  Full bounded-replay scheduling, cache-hit reconstruction and DSpark request
-  lifecycle are not implemented here.
-- Supply `CSA2GlobalPages` for paged source caches. Full selection resolves
-  page tables per query tile; Reindex resolves only selected candidate rows,
-  avoiding a persistent tokens-by-context mapping.
+SWA uses 528-byte E4M3/power-of-two-scale rows. All CSA2 formats include the
+RoPE channels. Long prefill reads scratch-aware page mappings instead of
+writing directly into a short circular window. Partial-state groups retain
+both FP32 values and scores. No separate cache container manages allocations
+or writes outside the cache manager.
 
-## Validation boundaries
+## Runtime metadata
 
-Tests in `tests/unittest/_torch/attention/sparse/csa2/` cover ownership,
-quantized layouts, candidate selection, all three reuse modes, weight loading,
-native ratio-2 compression, ratio-4/128 regression, hardware routing, and
-FlashMLA/TRTLLM/FlashInfer numerics and graph replay. Native TRTLLM tests also
-exercise multiple query tiles and Full/Reindex/Reuse layers.
-A synthetic ratio-two Full-module regression covers incomplete/completed
-compression groups, cache preservation and projected output against an unfused
-reference. These tests do not establish released-checkpoint parity, complete
-model inference, distributed execution, prefix-cache scheduling or performance
-parity.
+`CSA2TrtllmMetadata.prepare()` resolves scheduler request IDs, cached lengths
+and V2 page converters into layer-specific `CSA2Batch` and compression inputs.
+`CSA2Routing` belongs to one packed forward and cannot be recycled across eager
+forwards. Source and consumer queries retain the same packed order.
+
+Encoder source rows can be supplied independently of decoder query rows with
+`set_source_batch()` before prepare. Compression output capacity follows source
+rows. Incomplete groups produce zero-filled padding with position zero and
+write slot -1; the packed-row store skips invalid slots and respects strided
+views. Caller-provided source hidden states must match the prepared source batch.
+
+Runtime metadata owns fixed-shape compute views shared by serialized layers.
+Different query counts use independent native workspaces. Warm each view with
+the standard forward before capture and set `is_cuda_graph` for captured calls.
+Prepare refreshes persistent device metadata outside capture before replay.
+
+## Scope and validation
+
+Targeted tests exercise all CSA2 layer modes, quantized layouts, logical/paged
+selection, inherited backend dispatch, shared DSA indexer computation, real V2
+allocation/scratch/prefix reuse/COW, partial compressor state, changed graph
+replay inputs and an actual attention module against an unfused reference.
+Tests are under `tests/unittest/_torch/attention/sparse/csa2/`.
+
+PP/CP and disabled-layer masks are rejected by the current cache integration.
+Beam/speculative compressor-state rewind is rejected by runtime metadata.
+Disaggregation role mappings preserve byte layout, but do not establish full
+model disaggregation, CED scheduling or DSpark inference support. Whole-model
+checkpoint parity and performance remain separate validation work. Before
+whole-model serving, verify that profiling exercises every Full layer at the
+maximum query tile and configured global width: gathered index rows and dense
+logits workspace scale with those bounds.
 
 Numerical definitions follow the official
 [reference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)
