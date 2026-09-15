@@ -76,6 +76,25 @@ void KVCacheManagerConfig::validate() const
             layer);
     }
 
+    bool hasReconstructible = false;
+    bool hasPersistent = false;
+    for (auto const& layer : layers)
+    {
+        if (auto const* attn = std::get_if<AttentionLayerConfig>(&layer))
+        {
+            hasReconstructible |= attn->reconstructible;
+            hasPersistent |= !attn->reconstructible;
+        }
+        else
+        {
+            hasPersistent = true;
+        }
+    }
+    if (hasReconstructible && !hasPersistent)
+    {
+        throw std::invalid_argument("Reconstructible attention requires at least one persistent lifecycle");
+    }
+
     // SSM-specific validation.
     bool hasSSM = false;
     for (auto const& layer : layers)

@@ -76,6 +76,8 @@ inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
 using LifeCycleBlockPages = TypedVec<LifeCycleId, BlockPage>;
 using BeamBlockPages = TypedVec<BeamIndex, LifeCycleBlockPages>;
 
+bool blockPageIsReconstructible(BlockPage const& page);
+
 struct SeqBlock
 {
     BeamBlockPages pages;
@@ -95,7 +97,9 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg));
+                            TLLM_CHECK(!pg
+                                || (blockPageIsReconstructible(bp) ? dynamicPointerCast<UncommittedPage>(pg) != nullptr
+                                                                   : dynamicPointerCast<CommittedPage>(pg) != nullptr));
                         }
             }
             else
@@ -266,6 +270,26 @@ public:
     {
         return mBlocks.size();
     }
+
+    using ReconstructionRanges = std::map<LayerGroupId, std::pair<int, int>>;
+
+    ReconstructionRanges const& getReconstructionRanges() const noexcept
+    {
+        return mReconstructionRanges;
+    }
+
+    bool requiresReconstruction() const noexcept
+    {
+        return !mReconstructionRanges.empty();
+    }
+
+    ReconstructionRanges const& getReconstructedRanges() const noexcept
+    {
+        return mReconstructedRanges;
+    }
+
+    void markReconstructed(
+        LayerGroupId layerGroupId, std::optional<int> begin = std::nullopt, std::optional<int> end = std::nullopt);
 
     TypedVec<BlockOrdinal, SeqBlock> const& blocks() const noexcept
     {
@@ -599,6 +623,8 @@ private:
     BeamPageIndexBuffers mBasePageIndices;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
+    ReconstructionRanges mReconstructionRanges;
+    ReconstructionRanges mReconstructedRanges;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Resolved per-sequence text-only state after applying the manager default.

@@ -121,6 +121,11 @@ def _run_indexer(layout, layer_idx, state):
         manager.indexers[layer_idx] = CSA2Indexer(
             layout, layer_idx, state.index_q.shape[1], state.index_q.shape[-1]
         )
+    if not state.index_q.is_cuda:
+        from tensorrt_llm._torch.modules.top_k import TopKImplementation
+
+        manager.indexers[layer_idx].top_k.prefill_implementation = TopKImplementation.TORCH
+        manager.indexers[layer_idx].top_k.decode_implementation = TopKImplementation.TORCH
     return manager.indexers[layer_idx](state, 0, state.swa_kv.shape[0])
 
 

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import weakref
+from copy import copy
 from dataclasses import replace
 from enum import Enum
 
@@ -67,10 +69,26 @@ class CSA2CacheManager(KVCacheManagerV2):
         pretrained_config=None,
         sparse_attention_config=None,
         layout: CSA2Layout | None = None,
+        enable_swa_bounded_replay: bool = True,
         num_kv_heads: int = 1,
         head_dim: int = 512,
         **kwargs,
     ):
+        spec_config = kwargs.get("spec_config")
+        if spec_config is not None:
+            from tensorrt_llm._torch.speculative.utils import get_num_spec_layers
+
+            if not spec_config.is_linear_tree or getattr(spec_config, "use_dynamic_tree", False):
+                raise NotImplementedError(
+                    "CSA2 supports contiguous-prefix chain verification, not token trees"
+                )
+            if get_num_spec_layers(spec_config):
+                raise NotImplementedError(
+                    "CSA2 virtual draft layers require an explicit model-layer mapping"
+                )
+        self._csa2_linear_speculation = spec_config is not None
+        self._csa2_request_epoch_counter = 0
+        self._csa2_request_epochs = {}
         layer_mask = kwargs.get("layer_mask")
         if layer_mask is not None and not all(layer_mask):
             raise ValueError("CSA2 cache does not support disabled layers in layer_mask")
@@ -103,6 +121,13 @@ class CSA2CacheManager(KVCacheManagerV2):
                 else None
             ),
         )
+        self._reconstruction_enabled = enable_swa_bounded_replay and bool(
+            self.layout.kv_source_layer_ids
+        )
+        self._csa2_reconstruction_plans = {}
+        self._csa2_settled_replay_requests: set[int] = set()
+        self._csa2_prepared_replay_steps = {}
+        self._csa2_reconstruction_peers = {}
         self._global_buffers = {}
         super().__init__(
             kv_cache_config,
@@ -115,6 +140,285 @@ class CSA2CacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True
+        self._csa2_reconstruction_members = {}
+        self._csa2_reconstruction_roles = {}
+        if self._reconstruction_enabled:
+            for (layer, role), physical_layer in self._layer_roles.items():
+                if role == CSA2CacheRole.GLOBAL:
+                    continue
+                group = self.layer_to_pool_mapping_dict[physical_layer]
+                self._csa2_reconstruction_members.setdefault(group, set()).add(layer)
+                self._csa2_reconstruction_roles.setdefault(group, set()).add(role)
+
+    def _create_kv_cache(self, request_id, lora_task_id, input_tokens, **kwargs):
+        cache = super()._create_kv_cache(request_id, lora_task_id, input_tokens, **kwargs)
+        if cache is not None:
+            self._csa2_request_epoch_counter += 1
+            self._csa2_request_epochs[request_id] = self._csa2_request_epoch_counter
+        return cache
+
+    def request_epoch(self, request_id: int) -> int:
+        """Distinguish a recycled request ID from its previous cache lifetime."""
+        return self._csa2_request_epochs[request_id]
+
+    def free_resources(self, request, pin_on_release=False):
+        super().free_resources(request, pin_on_release=pin_on_release)
+        self._csa2_request_epochs.pop(request.py_request_id, None)
+        self._csa2_reconstruction_plans.pop(request.py_request_id, None)
+        self._csa2_settled_replay_requests.discard(request.py_request_id)
+        self._csa2_prepared_replay_steps.pop(request.py_request_id, None)
+        self._csa2_reconstruction_peers.pop(request.py_request_id, None)
+
+    def validate_verification(self, lengths: list[int], num_contexts: int, enabled: bool) -> None:
+        if not enabled:
+            return
+        if not self._csa2_linear_speculation:
+            raise ValueError("CSA2 verification requires configured chain rewind capacity")
+        if any(length > self.max_draft_len + 1 for length in lengths[num_contexts:]):
+            raise ValueError("CSA2 verification exceeds its reserved rewind window")
+
+    def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
+        # The generic relocation kernel assumes a uniform uncompressed KV pool.
+        # Linear acceptance counts need only V2 resize/history updates, whereas
+        # explicit token relocation would also require recomputing compressed pairs.
+        for request in scheduled_batch.generation_requests:
+            if request.py_num_accepted_draft_tokens_indices:
+                raise NotImplementedError(
+                    "CSA2 accepted-prefix updates do not support token relocation indices"
+                )
+        return super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+
+    def prepare_context_cache(self, request, reuse_limit=None):
+        reused = super().prepare_context_cache(request, reuse_limit)
+        if reused is not None:
+            cache = self.kv_cache_map[request.py_request_id]
+            if (
+                cache.requires_reconstruction
+                and request.py_request_id not in self._csa2_reconstruction_plans
+            ):
+                prefix = cache.num_committed_tokens
+                start = max(0, prefix - self.layout.window_size)
+                groups = cache.get_reconstruction_ranges()
+                members = set().union(
+                    *(self._csa2_reconstruction_members[group] for group in groups)
+                )
+                self._csa2_reconstruction_plans[request.py_request_id] = {
+                    "prefix": prefix,
+                    "start": start,
+                    "groups": set(groups),
+                    "progress": {layer: start for layer in members},
+                }
+        return reused
+
+    def apply_reconstruction_cursor(self, request, peer_manager=None) -> None:
+        cache = self.kv_cache_map[request.py_request_id]
+        if peer_manager is not None:
+            peer = peer_manager.kv_cache_map[request.py_request_id]
+            if cache.requires_reconstruction != getattr(peer, "requires_reconstruction", False):
+                raise ValueError(
+                    "Joint CSA2 reuse requires matching target/draft reconstruction policy"
+                )
+            if cache.requires_reconstruction and (
+                getattr(peer_manager, "layout", None) != self.layout
+                or peer.num_committed_tokens != cache.num_committed_tokens
+            ):
+                raise ValueError(
+                    "Joint CSA2 replay requires identical layouts and a common GLOBAL prefix"
+                )
+        if not cache.requires_reconstruction:
+            return
+        plan = self._csa2_reconstruction_plans[request.py_request_id]
+        if plan["prefix"] != cache.num_committed_tokens:
+            raise ValueError("CSA2 reconstruction plan does not match the settled GLOBAL prefix")
+        expected = min(plan["progress"].values(), default=plan["prefix"])
+        if peer_manager is not None:
+            peer_plan = peer_manager.automatic_replay_plan(request.py_request_id)
+            expected = min(
+                expected, min(peer_plan["progress"].values(), default=peer_plan["prefix"])
+            )
+            self._csa2_reconstruction_peers[request.py_request_id] = (
+                weakref.ref(peer_manager),
+                peer_manager.request_epoch(request.py_request_id),
+            )
+        request.py_csa2_global_reused_tokens = plan["prefix"]
+        request.py_csa2_replay_tokens = plan["prefix"] - plan["start"]
+        if request.context_current_position > expected and expected < plan["prefix"]:
+            request.context_current_position = expected
+            request.context_chunk_size = request.context_remaining_length
+        self._csa2_settled_replay_requests.add(request.py_request_id)
+
+    def has_settled_replay_prefix(self, request_id: int) -> bool:
+        """Whether this cache lifetime already settled its GLOBAL reuse prefix."""
+        return request_id in self._csa2_settled_replay_requests
+
+    def prepare_context(self, request) -> bool:
+        # Reaching P again after replay makes the native first-chunk predicate
+        # true again. Prefix settlement must stay complete even after replay ACK.
+        if self.has_settled_replay_prefix(request.py_request_id):
+            if self.prepare_context_cache(request) is None:
+                return False
+        elif not super().prepare_context(request):
+            return False
+        self.apply_reconstruction_cursor(request)
+        return True
+
+    def automatic_replay_plan(self, request_id: int):
+        cache = self.kv_cache_map[request_id]
+        if not cache.requires_reconstruction:
+            return None
+        plan = self._csa2_reconstruction_plans.get(request_id)
+        if plan is None:
+            raise ValueError("CSA2 GLOBAL reuse requires prepare_context before attention")
+        return plan
+
+    def register_replay_step(self, metadata) -> None:
+        for row, request_id in enumerate(metadata.request_ids):
+            plan = self.automatic_replay_plan(request_id)
+            if plan is None:
+                continue
+            start = metadata.csa2_request_start_positions[row]
+            end = start + metadata.csa2_request_lengths[row]
+            progress = min(plan["progress"].values(), default=plan["prefix"])
+            if row >= metadata.num_contexts or start < plan["start"] or start > progress:
+                raise ValueError("CSA2 request skipped its required SWA reconstruction interval")
+            self._csa2_prepared_replay_steps[request_id] = (
+                weakref.ref(metadata),
+                metadata._csa2_forward_serial,
+                start,
+                end,
+            )
+
+    def validate_ready_query(self, request_id: int, start: int, replay: bool) -> None:
+        cache = self.kv_cache_map[request_id]
+        if cache.requires_reconstruction and not replay:
+            raise ValueError("CSA2 cannot run ordinary attention before SWA reconstruction")
+        if replay:
+            return
+        for group, (begin, _) in cache.get_reconstructed_ranges().items():
+            roles = self._csa2_reconstruction_roles.get(group, set())
+            if CSA2CacheRole.SWA in roles and max(0, start - self.layout.window_size + 1) < begin:
+                raise ValueError("CSA2 query precedes the reconstructed SWA horizon")
+            if (
+                roles.intersection((CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE))
+                and start % 2
+                and start - 1 < begin
+            ):
+                raise ValueError("CSA2 query precedes the reconstructed compressor-state horizon")
+
+    def try_allocate_generation(self, request) -> bool:
+        cache = self.kv_cache_map.get(request.py_request_id)
+        if cache is not None and cache.requires_reconstruction:
+            raise ValueError("CSA2 generation requires completed SWA reconstruction")
+        return super().try_allocate_generation(request)
+
+    def _completed_replay_step(self, request_id: int) -> tuple[int, int, torch.cuda.Event]:
+        plan = self._csa2_reconstruction_plans[request_id]
+        step = self._csa2_prepared_replay_steps.get(request_id)
+        if step is None:
+            raise ValueError(
+                "CSA2 reconstruction cannot be acknowledged without a prepared forward"
+            )
+        reference, serial, start, end = step
+        metadata = reference()
+        receipt = None if metadata is None else metadata.reconstruction_step_receipt(self)
+        if receipt is None or receipt[0] != serial:
+            raise ValueError("CSA2 reconstruction forward receipt is stale")
+        _, layers, event = receipt
+        if event is None or not set(plan["progress"]).issubset(layers):
+            raise ValueError("CSA2 reconstruction requires every configured lifecycle member layer")
+        return start, end, event
+
+    def update_context_resources(self, scheduled_batch):
+        pending = set()
+        for request in scheduled_batch.context_requests:
+            request_id = request.py_request_id
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or not cache.requires_reconstruction:
+                continue
+            # Overlap scheduling may suspend iteration N's cache before its
+            # post-forward update. Its transient pages are no longer writable:
+            # retain the unadvanced plan and replay that interval after resume.
+            if not cache.is_active:
+                pending.add(request_id)
+                continue
+            peer = None
+            peer_state = self._csa2_reconstruction_peers.get(request_id)
+            if peer_state is not None:
+                reference, epoch = peer_state
+                peer = reference()
+                if peer is None or peer._csa2_request_epochs.get(request_id) != epoch:
+                    raise ValueError("Joint CSA2 reconstruction peer cache lifetime changed")
+                if not peer.kv_cache_map[request_id].is_active:
+                    pending.add(request_id)
+                    continue
+            start, end, event = self._completed_replay_step(request_id)
+            # Both engines share the retry cursor. Validate the peer before
+            # publishing any progress or suffix while it still needs replay.
+            if peer is not None and peer.kv_cache_map[request_id].requires_reconstruction:
+                peer_start, peer_end, _ = peer._completed_replay_step(request_id)
+                if (start, end) != (peer_start, peer_end):
+                    raise ValueError(
+                        "Joint CSA2 reconstruction requires matching forward intervals"
+                    )
+            plan = self._csa2_reconstruction_plans[request_id]
+            self._stream.wait_event(event)
+            for layer in plan["progress"]:
+                plan["progress"][layer] = max(plan["progress"][layer], min(end, plan["prefix"]))
+            for group in tuple(plan["groups"]):
+                members = self._csa2_reconstruction_members[group]
+                if all(plan["progress"][layer] >= plan["prefix"] for layer in members):
+                    begin = (
+                        plan["start"]
+                        if CSA2CacheRole.SWA in self._csa2_reconstruction_roles[group]
+                        else plan["prefix"] - plan["prefix"] % 2
+                    )
+                    cache.mark_reconstructed(group, begin, plan["prefix"])
+                    plan["groups"].remove(group)
+            if cache.requires_reconstruction:
+                pending.add(request_id)
+            else:
+                self._csa2_reconstruction_plans.pop(request_id, None)
+            # A partially rebuilt peer validates this same receipt when its
+            # post-forward update follows ours. The next prepare replaces it.
+            if peer is None or not cache.requires_reconstruction:
+                self._csa2_prepared_replay_steps.pop(request_id, None)
+        # Partial replay does not advance global history or recommit cached P.
+        ready = copy(scheduled_batch)
+        ready.context_requests_chunking = [
+            r for r in scheduled_batch.context_requests_chunking if r.py_request_id not in pending
+        ]
+        ready.context_requests_last_chunk = [
+            r for r in scheduled_batch.context_requests_last_chunk if r.py_request_id not in pending
+        ]
+        return super().update_context_resources(ready)
+
+    def get_swa_replay_ranges(
+        self,
+        cached_prefix_lengths: list[int],
+        suffix_lengths: list[int] | None = None,
+        *,
+        decoder: bool = False,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return required writable query intervals for bounded reconstruction.
+
+        The GLOBAL prefix must already be restored by the caller. Native V2
+        matching is unchanged. Ordinary W-token next-query retention may omit
+        the first replay token at C-W; allocate every row in the returned range
+        explicitly rather than assuming the restored trailing window suffices.
+        """
+        suffix_lengths = (
+            [0] * len(cached_prefix_lengths) if suffix_lengths is None else suffix_lengths
+        )
+        if len(suffix_lengths) != len(cached_prefix_lengths):
+            raise ValueError("CSA2 replay prefixes and suffixes must have matching request counts")
+        result = []
+        for prefix, suffix in zip(cached_prefix_lengths, suffix_lengths):
+            if prefix < 0 or suffix < 0 or prefix + suffix > self.max_seq_len:
+                raise ValueError("CSA2 replay range exceeds its admitted context")
+            if decoder and suffix:
+                raise ValueError("Decoder SWA replay requires the complete prompt GLOBAL cache")
+            result.append((max(0, prefix - self.layout.window_size), prefix + suffix))
+        return tuple(result)
 
     def _window(self, base: int) -> int:
         return base + self.max_draft_len + self.reuse_match_backoff
@@ -123,7 +427,9 @@ class CSA2CacheManager(KVCacheManagerV2):
         sizes, windows = [], []
         for layer in self.pp_layers:
             sizes.append(528)
-            windows.append(self._window(self.layout.window_size))
+            windows.append(
+                self._window(self.layout.window_size + int(self._reconstruction_enabled))
+            )
             if layer in self.layout.kv_source_layer_ids:
                 ratio = self.layout.compress_ratios[layer]
                 sizes.append(356 // ratio)
@@ -160,11 +466,17 @@ class CSA2CacheManager(KVCacheManagerV2):
                     ],
                     sliding_window_size=window,
                     num_sink_tokens=None,
+                    reconstructible=self._reconstruction_enabled and window is not None,
                 )
             )
 
         for layer in self.pp_layers:
-            add(layer, [CSA2CacheRole.SWA], [528], self._window(self.layout.window_size))
+            add(
+                layer,
+                [CSA2CacheRole.SWA],
+                [528],
+                self._window(self.layout.window_size + int(self._reconstruction_enabled)),
+            )
             if layer in self.layout.kv_source_layer_ids:
                 ratio = self.layout.compress_ratios[layer]
                 add(layer, [CSA2CacheRole.GLOBAL], [356 // ratio], None)
@@ -181,7 +493,16 @@ class CSA2CacheManager(KVCacheManagerV2):
                 self._layer_roles[layer, CSA2CacheRole.GLOBAL] = self._layer_roles[
                     owner, CSA2CacheRole.GLOBAL
                 ]
-        return replace(config, layers=layers)
+        scratch = config.swa_scratch_reuse
+        if scratch is not None:
+            # Linear verification may reject every draft token. Context
+            # lookahead (num_extra_kv_tokens) can be one smaller than this.
+            scratch = copy(scratch)
+            scratch.max_rewind_len = max(scratch.max_rewind_len, self.max_draft_len)
+        config = copy(config)
+        config.layers = layers
+        config.swa_scratch_reuse = scratch
+        return config
 
     def get_buffers(self, layer_idx: int, role: CSA2CacheRole = CSA2CacheRole.SWA):
         layer_id = self._layer_roles[layer_idx, role]
@@ -443,7 +764,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             ]
         ):
             sizes.append(528)
-            windows.append(layout.window_size + reserve)
+            windows.append(layout.window_size + int(bool(layout.kv_source_layer_ids)) + reserve)
             if layer in layout.kv_source_layer_ids:
                 sizes.append(356 // ratio)
                 windows.append(None)

@@ -895,7 +895,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         if draft_manager is None:
             return self.kv_cache_manager.prepare_context(req)
 
-        if not req.is_first_context_chunk:
+        settled_replay = []
+        for manager in (self.kv_cache_manager, draft_manager):
+            callback = getattr(manager, "has_settled_replay_prefix", None)
+            settled_replay.append(callback is not None and callback(req.py_request_id))
+        if settled_replay[0] != settled_replay[1]:
+            raise ValueError("Joint CSA2 reuse requires matching prefix settlement state")
+        # Replay reaches the reused prefix again after reconstruction ACK, when
+        # the native first-chunk predicate becomes true a second time.
+        if not req.is_first_context_chunk or settled_replay[0]:
             if self.kv_cache_manager.prepare_context(req) and draft_manager.prepare_context(req):
                 return True
             self._suspend_request(req)
@@ -940,6 +948,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             # than a previous attempt's has to be rewound by hand.
             req.context_current_position = common_reuse
         req.set_prepopulated_prompt_len(common_reuse, self.kv_cache_manager.tokens_per_block)
+        # Reconstructible caches retain the true GLOBAL hit but may need an
+        # earlier compute cursor in both settled target/draft claims.
+        for manager, peer in (
+            (self.kv_cache_manager, draft_manager),
+            (draft_manager, self.kv_cache_manager),
+        ):
+            callback = getattr(manager, "apply_reconstruction_cursor", None)
+            if callback is not None:
+                callback(req, peer)
         return True
 
     def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -11,8 +13,11 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor
@@ -21,6 +26,18 @@ from .params import CSA2BackendForwardArgs, CSA2ForwardState, CSA2Layout, CSA2Mo
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    if (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x.shape[0] > 0
+    ):
+        from tensorrt_llm._torch.custom_ops import flashinfer_rmsnorm
+
+        # The native kernel multiplies normalized FP32 values by the FP32
+        # weight before its single BF16 output cast, matching CSA2's boundary.
+        return flashinfer_rmsnorm(x.contiguous(), weight.contiguous(), eps)
     values = x.float()
     return (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps) * weight.float()).to(
         x.dtype
@@ -33,8 +50,8 @@ class DeepseekV41Attention(nn.Module):
     The model supplies packed query positions, cache mappings, and RoPE
     parameters (plain SWA versus compressed YaRN). Decoder global projection
     can consume encoder states independently of the decoder's query/SWA rows.
-    FP8 checkpoint weights are dequantized to BF16 here; FP8 GEMM execution
-    is separate from the cache quantization contract.
+    Native MXFP8 projections preserve checkpoint FP8 values and block scales.
+    BF16 projections remain the default; cache quantization is independent.
     """
 
     def __init__(
@@ -54,6 +71,9 @@ class DeepseekV41Attention(nn.Module):
         eps: float = 1e-20,
         mapping: Mapping | None = None,
         compute_backend: str = "auto",
+        sparse_params: CSA2Params | None = None,
+        projection_quantization: Literal["bf16", "mxfp8"] = "bf16",
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         if num_heads % num_groups or head_dim <= rope_head_dim:
@@ -65,6 +85,39 @@ class DeepseekV41Attention(nn.Module):
             )
         if num_heads % mapping.tp_size or num_groups % mapping.tp_size:
             raise ValueError("CSA2 heads and output groups must be divisible by TP size")
+        if projection_quantization not in ("bf16", "mxfp8"):
+            raise ValueError("CSA2 projection quantization must be bf16 or mxfp8")
+        if sparse_params is not None and sparse_params.layout != layout:
+            raise ValueError("CSA2 module and sparse parameters must use the same layout")
+        sparse_params = sparse_params or CSA2Params(layout=layout, compute_backend=compute_backend)
+        self.projection_quantization = projection_quantization
+        self.dtype = torch.bfloat16
+        self.aux_stream = aux_stream
+        self._prepare_start = torch.cuda.Event() if aux_stream is not None else None
+        self._prepare_done = torch.cuda.Event() if aux_stream is not None else None
+        self._fuse_index_q = sparse_params.fuse_index_q
+        if sparse_params.fuse_packed_output_rope and pos_embd_params.is_neox:
+            raise ValueError("CSA2 packed output RoPE requires interleaved rotary channels")
+        quant_config = None
+        if projection_quantization == "mxfp8":
+            if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+                (10, 0),
+                (10, 3),
+            ):
+                raise ValueError("CSA2 native MXFP8 projections require SM100/SM103")
+            if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
+                raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
+            quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)
+        if self._fuse_index_q and (
+            projection_quantization != "mxfp8"
+            or index_head_dim != 128
+            or rope_head_dim != 64
+            or pos_embd_params.is_neox
+            or q_lora_rank % 128
+        ):
+            raise ValueError(
+                "Fused CSA2 index Q requires native MXFP8, 128-aligned Q rank and interleaved 128D/64D RoPE"
+            )
         self.mapping = mapping
         self.num_groups = num_groups
         self.layer = layout.layer(layer_idx)
@@ -84,11 +137,22 @@ class DeepseekV41Attention(nn.Module):
             self.num_heads_tp,
             head_dim,
             num_kv_heads=1,
-            sparse_params=CSA2Params(layout=layout, compute_backend=compute_backend),
+            sparse_params=sparse_params,
+        )
+        from .backend import CSA2FlashInfer, CSA2FlashMLA
+
+        self._flash_attention = (
+            CSA2FlashMLA(self.backend)
+            if self.backend.compute_backend == "flash_mla"
+            else CSA2FlashInfer(self.backend)
+            if self.backend.compute_backend == "flashinfer"
+            else None
         )
         self.index_heads = index_heads
         self.index_head_dim = index_head_dim
-        self.wq_a = nn.Linear(hidden_size, q_lora_rank, bias=False, dtype=torch.bfloat16)
+        self.wq_a = Linear(
+            hidden_size, q_lora_rank, bias=False, dtype=torch.bfloat16, quant_config=quant_config
+        )
         self.wq_b = Linear(
             q_lora_rank,
             num_heads * head_dim,
@@ -96,8 +160,11 @@ class DeepseekV41Attention(nn.Module):
             dtype=torch.bfloat16,
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=quant_config,
         )
-        self.wkv = nn.Linear(hidden_size, head_dim, bias=False, dtype=torch.bfloat16)
+        self.wkv = Linear(
+            hidden_size, head_dim, bias=False, dtype=torch.bfloat16, quant_config=quant_config
+        )
         self.q_norm_weight = nn.Parameter(torch.ones(q_lora_rank, dtype=torch.bfloat16))
         self.kv_norm_weight = nn.Parameter(torch.ones(head_dim, dtype=torch.bfloat16))
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads_tp, dtype=torch.float32))
@@ -107,9 +174,14 @@ class DeepseekV41Attention(nn.Module):
                 self.n_local_groups,
                 o_lora_rank,
                 num_heads * head_dim // num_groups,
-                dtype=torch.bfloat16,
-            )
+                dtype=torch.float8_e4m3fn if quant_config is not None else torch.bfloat16,
+            ),
+            requires_grad=False,
         )
+        self._o_a_fp8_block128 = False
+        self.o_a_proj_dequant = None
+        self.register_buffer("o_a_proj_scale", None)
+        self.register_buffer("_fp8_alpha", torch.ones(1, dtype=torch.float32), persistent=False)
         self.o_b_proj = Linear(
             num_groups * o_lora_rank,
             hidden_size,
@@ -117,6 +189,7 @@ class DeepseekV41Attention(nn.Module):
             dtype=torch.bfloat16,
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=quant_config,
         )
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope, head_dim=rope_head_dim, is_neox=pos_embd_params.is_neox
@@ -135,8 +208,12 @@ class DeepseekV41Attention(nn.Module):
                 torch.ones(index_head_dim, dtype=torch.bfloat16)
             )
         if self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX):
-            self.index_wq_b = nn.Linear(
-                q_lora_rank, index_heads * index_head_dim, bias=False, dtype=torch.bfloat16
+            self.index_wq_b = Linear(
+                q_lora_rank,
+                index_heads * index_head_dim,
+                bias=False,
+                dtype=torch.bfloat16,
+                quant_config=quant_config,
             )
             self.index_weights_proj = nn.Linear(
                 hidden_size, index_heads, bias=False, dtype=torch.bfloat16
@@ -144,7 +221,14 @@ class DeepseekV41Attention(nn.Module):
 
     @classmethod
     def from_hf_config(
-        cls, config: PretrainedConfig, layer_idx: int, mapping: Mapping | None = None
+        cls,
+        config: PretrainedConfig,
+        layer_idx: int,
+        mapping: Mapping | None = None,
+        *,
+        sparse_params: CSA2Params | None = None,
+        projection_quantization: Literal["bf16", "mxfp8"] = "bf16",
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> DeepseekV41Attention:
         """Construct an attention component from the published text configuration.
 
@@ -191,6 +275,9 @@ class DeepseekV41Attention(nn.Module):
             config.index_head_dim,
             config.rms_norm_eps,
             mapping=mapping,
+            sparse_params=sparse_params,
+            projection_quantization=projection_quantization,
+            aux_stream=aux_stream,
         )
 
     def load_hf_weights(self, weights: dict[str, torch.Tensor], prefix: str = "") -> None:
@@ -224,6 +311,105 @@ class DeepseekV41Attention(nn.Module):
         )
         return x
 
+    def _prepare_auxiliary(
+        self, hidden_states, global_hidden_states, compression, compressed_positions
+    ):
+        index_weights = main_kv = index_k = None
+        if self.compressor is not None:
+            if compressed_positions is None:
+                raise ValueError("Full CSA2 mode requires compressed positions")
+            global_input = hidden_states if global_hidden_states is None else global_hidden_states
+            if global_input.shape[0] == 0:
+                if compressed_positions.numel() != 0:
+                    raise ValueError("An empty CSA2 global source cannot publish compressed rows")
+                # Pure replay reuses existing global/index caches. Do not
+                # project cached prefix rows merely to discard their outputs.
+                main_kv = global_input.new_empty((0, self.qk_head_dim))
+                index_k = global_input.new_empty((0, self.index_head_dim))
+            else:
+                # An odd ratio-two replay boundary includes its last cached
+                # raw token so this same compressor can rebuild partial state.
+                latent = self.compressor(global_input, compression)
+                # Index K consumes the latent before its in-place main-KV RoPE.
+                index_k = _rms_norm(self.index_wk(latent), self.index_k_norm_weight, self.eps)
+                index_k = self._rope(index_k.unsqueeze(1), compressed_positions, 1).squeeze(1)
+                main_kv = self._rope(latent.unsqueeze(1), compressed_positions, 1).squeeze(1)
+        if self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX):
+            index_weights = self.index_weights_proj(hidden_states) * (
+                self.index_head_dim**-0.5 * self.index_heads**-0.5
+            )
+        return index_weights, main_kv, index_k
+
+    def _project_index_q(self, qr, positions):
+        if self.layer.mode not in (CSA2Mode.FULL, CSA2Mode.REINDEX):
+            return None, None
+        if self._fuse_index_q and qr.shape[0] <= 16:
+            if qr.shape[0] == 0:
+                return (
+                    torch.empty((0, self.index_heads, 64), dtype=torch.int8, device=qr.device),
+                    torch.empty((0, self.index_heads), dtype=torch.int32, device=qr.device),
+                )
+            from .kernel import csa2_indexer_q_gemm_rope_fp4
+
+            packed, scale = csa2_indexer_q_gemm_rope_fp4(
+                qr,
+                self.index_wq_b.weight,
+                self.index_wq_b.weight_scale,
+                positions.reshape(-1),
+                self.rotary_emb.rotary_cos_sin.view(-1, 64),
+                self._fp8_alpha,
+            )
+            return packed.view(-1, self.index_heads, 64), scale.view(-1, self.index_heads)
+        query = self.index_wq_b(qr).reshape(-1, self.index_heads, self.index_head_dim)
+        return self._rope(query, positions, self.index_heads), None
+
+    def _project_output(self, output, positions, *, inverse_rope_applied: bool = False):
+        if self._o_a_fp8_block128 and inverse_rope_applied:
+            raise ValueError("Grouped 128-block FP8 owns its fused inverse-RoPE/quantization")
+        if self.projection_quantization == "bf16":
+            if not inverse_rope_applied:
+                return project_sparse_attn_output(self, [output.flatten(1)], positions)
+            grouped = output.reshape(output.shape[0], self.n_local_groups, -1)
+            latent = output.new_empty((output.shape[0], self.n_local_groups, self.o_lora_rank))
+            torch.ops.trtllm.bmm_out(
+                grouped.transpose(0, 1), self.o_a_proj.transpose(1, 2), latent.transpose(0, 1)
+            )
+            return self.o_b_proj(latent.flatten(1))
+        if self._o_a_fp8_block128:
+            # Preserve the existing inverse-RoPE/quantization/BMM path when
+            # its 128-block contract fits; the packed reducer does not rotate.
+            return project_sparse_attn_output(self, [output.flatten(1)], positions)
+        if self.o_a_proj_scale is None:
+            raise RuntimeError("Load CSA2 native grouped projection scales before forward")
+        if output.shape[0] == 0:
+            return output.new_empty((0, self.o_b_proj.out_features))
+        if not inverse_rope_applied:
+            torch.ops.trtllm.mla_rope_inplace(
+                output,
+                positions.reshape(-1),
+                self.inverse_rotary_emb.rotary_cos_sin,
+                self.num_heads_tp,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                True,
+                self.inverse_rotary_emb.is_neox,
+            )
+        grouped = output.reshape(output.shape[0], self.n_local_groups, -1)
+        projections = []
+        for group in range(self.n_local_groups):
+            data, scales = torch.ops.trtllm.mxfp8_quantize(grouped[:, group].contiguous(), True)
+            projections.append(
+                torch.ops.trtllm.mxfp8_mxfp8_gemm(
+                    data,
+                    scales,
+                    self.o_a_proj[group],
+                    self.o_a_proj_scale[group],
+                    self._fp8_alpha,
+                    self.dtype,
+                )
+            )
+        return self.o_b_proj(torch.cat(projections, dim=-1))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -245,8 +431,33 @@ class DeepseekV41Attention(nn.Module):
             if self.layer.mode == CSA2Mode.FULL
             else None
         )
+        global_source = (
+            attn_metadata.select_global_source(
+                self.layer.layer_idx, hidden_states, global_hidden_states
+            )
+            if self.compressor is not None
+            else None
+        )
+        overlap = (
+            self.aux_stream is not None
+            and do_multi_stream()
+            and self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
+        )
+        if overlap:
+            if self.aux_stream.device != hidden_states.device:
+                raise ValueError("CSA2 auxiliary stream must use the input CUDA device")
+            self._prepare_start.record()
+            with torch.cuda.stream(self.aux_stream):
+                self._prepare_start.wait()
+                for tensor in (hidden_states, global_source, compressed_positions):
+                    if tensor is not None:
+                        tensor.record_stream(self.aux_stream)
+                auxiliary = self._prepare_auxiliary(
+                    hidden_states, global_source, compression, compressed_positions
+                )
+                self._prepare_done.record()
         qr = _rms_norm(self.wq_a(hidden_states), self.q_norm_weight, self.eps)
-        # Unlike V4, CSA2 does not normalize individual projected Q heads.
+        # CSA2 never applies V4's projected-Q per-head normalization.
         q = self._rope(
             self.wq_b(qr).reshape(-1, self.num_heads_tp, self.qk_head_dim),
             positions,
@@ -254,51 +465,82 @@ class DeepseekV41Attention(nn.Module):
         )
         swa = _rms_norm(self.wkv(hidden_states), self.kv_norm_weight, self.eps)
         swa = self._rope(swa.unsqueeze(1), positions, 1).squeeze(1)
-        index_q = index_weights = main_kv = index_k = None
-        if self.compressor is not None:
-            if compressed_positions is None:
-                raise ValueError("Full CSA2 mode requires compressed positions")
-            global_input = hidden_states if global_hidden_states is None else global_hidden_states
-            latent = self.compressor(global_input, compression)
-            # Derive index K before mutating the main latent with RoPE.
-            index_k = _rms_norm(self.index_wk(latent), self.index_k_norm_weight, self.eps)
-            index_k = self._rope(index_k.unsqueeze(1), compressed_positions, 1).squeeze(1)
-            main_kv = self._rope(latent.unsqueeze(1), compressed_positions, 1).squeeze(1)
-        if self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX):
-            index_q = self._rope(
-                self.index_wq_b(qr).reshape(-1, self.index_heads, self.index_head_dim),
-                positions,
-                self.index_heads,
+        index_q, index_q_scale = self._project_index_q(qr, positions)
+        if overlap:
+            self._prepare_done.wait()
+            current = torch.cuda.current_stream(hidden_states.device)
+            for tensor in auxiliary:
+                if tensor is not None:
+                    tensor.record_stream(current)
+        else:
+            auxiliary = self._prepare_auxiliary(
+                hidden_states, global_source, compression, compressed_positions
             )
-            index_weights = self.index_weights_proj(hidden_states) * (
-                self.index_head_dim**-0.5 * self.index_heads**-0.5
-            )
+        index_weights, main_kv, index_k = auxiliary
         from tensorrt_llm._torch.attention.backends.interface import (
             AttentionForwardArgs,
             AttentionInputType,
         )
 
+        # Only the actual packed path can consume these fields. Keep the
+        # established grouped128 inverse-RoPE/FP8 quantizer preferred.
+        inverse_rope_applied = (
+            self.backend.sparse_params.fuse_packed_output_rope
+            and self.backend.sparse_params.use_packed_sparse_attention
+            and not self.inverse_rotary_emb.is_neox
+            and not self._o_a_fp8_block128
+        )
         state = CSA2ForwardState(
             metadata=attn_metadata,
             swa_kv=swa,
             index_q=index_q,
+            index_q_scale=index_q_scale,
             index_weights=index_weights,
             main_kv=main_kv,
             index_k=index_k,
+            output_position_ids=positions if inverse_rope_applied else None,
+            output_rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin
+            if inverse_rope_applied
+            else None,
         )
         output = torch.empty_like(q)
         tile_size = self.backend.sparse_params.max_query_tokens
-        for start in range(0, q.shape[0], tile_size):
-            tile = q[start : start + tile_size]
+        start = 0
+        while start < q.shape[0]:
+            phase_end = (
+                attn_metadata.num_ctx_tokens if start < attn_metadata.num_ctx_tokens else q.shape[0]
+            )
+            end = min(start + tile_size, phase_end)
+            tile = q[start:end]
             metadata = attn_metadata.get_query_tile_metadata(
-                tile, 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
+                tile,
+                0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk,
+                query_start=start,
             )
             args = AttentionForwardArgs(
-                attention_input_type=AttentionInputType.generation_only,
+                attention_input_type=(
+                    AttentionInputType.context_only
+                    if metadata.num_contexts
+                    else AttentionInputType.generation_only
+                ),
                 attention_sinks=self.attn_sink,
                 sparse_backend_args=CSA2BackendForwardArgs(state=state, query_start=start),
             )
-            output[start : start + tile_size] = self.backend.forward(
-                tile.flatten(1), None, None, metadata, forward_args=args
-            ).view_as(tile)
-        return project_sparse_attn_output(self, [output.flatten(1)], positions)
+            if self.backend.sparse_params.use_packed_sparse_attention:
+                computed = self.backend.forward_packed(tile.flatten(1), metadata, args)
+            elif self._flash_attention is not None:
+                compute = (
+                    self._flash_attention.forward_context
+                    if metadata.num_contexts
+                    else self._flash_attention.forward_generation
+                )
+                computed = compute(tile.flatten(1), metadata, args)
+            else:
+                computed = self.backend.forward(
+                    tile.flatten(1), None, None, metadata, forward_args=args
+                )
+            output[start:end] = computed.view_as(tile)
+            start = end
+        result = self._project_output(output, positions, inverse_rope_applied=inverse_rope_applied)
+        attn_metadata.record_layer_completion(self.layer.layer_idx)
+        return result

@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.csa2 import FlashInferCSA2, pack_query_masks
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer
 
 
 def test_segmented_mask_packing():
@@ -15,7 +15,7 @@ def test_segmented_mask_packing():
             [False, True, False, False, False, False, False, False, False],
         ]
     )
-    assert pack_query_masks(mask).tolist() == [133, 1, 2, 0]
+    assert CSA2FlashInfer.pack_query_masks(mask).tolist() == [133, 1, 2, 0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -23,7 +23,7 @@ def test_segmented_mask_packing():
 @torch.inference_mode()
 def test_flashinfer_bf16_and_graph(heads, width):
     torch.manual_seed(544)
-    attn = FlashInferCSA2()
+    attn = CSA2FlashInfer()
     q = torch.randn(2, heads, 512, dtype=torch.bfloat16, device="cuda")
     kv = torch.randn(2, width, 512, dtype=torch.bfloat16, device="cuda")
     valid = torch.ones(2, width, dtype=torch.bool, device="cuda")
@@ -68,7 +68,7 @@ def test_fixed_plan_ignores_dirty_workspace_padding(monkeypatch):
         return tensor
 
     monkeypatch.setattr(torch, "empty", dirty_workspace)
-    attn = FlashInferCSA2()
+    attn = CSA2FlashInfer()
     result = attn(q, kv, valid, sink, 512**-0.5)
     torch.cuda.synchronize()
     torch.testing.assert_close(result, torch.zeros_like(q), atol=0, rtol=0)

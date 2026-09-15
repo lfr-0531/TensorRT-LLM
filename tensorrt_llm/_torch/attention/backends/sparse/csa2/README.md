@@ -3,141 +3,216 @@
 
 # Compressed Sparse Attention 2 (CSA2)
 
-This package implements CSA2 attention backends, cache management and runtime
-metadata. It does not register a complete `DeepseekV41ForCausalLM` model or
-implement the model's full causal encoder/decoder scheduling.
+This package implements DeepSeek-V4.1 CSA2 attention modules, backends,
+indexing, cache ownership and runtime metadata. Complete model registration
+and causal encoder/decoder (CED) execution remain separate integration work.
 
-## Framework integration
+## Backend and hardware routing
 
-`backend.py` defines three backends using the standard `TrtllmAttention`
-forward and sparse prediction contract:
+`CSA2TrtllmAttention` owns the shared cache/indexer preparation. On the default
+SM100 path it inherits `TrtllmAttention.forward`, including output allocation
+and native FMHA selection. The module directly invokes its composed Flash
+helper on other hardware; there is no CSA2 FMHA registration or controller.
 
-| Architecture | Backend | Computation |
+| Architecture | Module compute path | Computation |
 | --- | --- | --- |
-| SM100 family | `CSA2TrtllmAttention` | Native trtllm-gen dynamic sparse MLA |
-| SM120/121 | `CSA2FlashInferAttention` | FlashInfer BF16 FA2 |
-| SM90 | `CSA2FlashMLAAttention` | FlashMLA sparse BF16 |
+| SM100 family | `CSA2TrtllmAttention.forward` | Native trtllm-gen dynamic sparse MLA |
+| SM120/121 | `CSA2FlashInfer` | FlashInfer BF16 FA2 |
+| SM90 | `CSA2FlashMLA` | FlashMLA sparse BF16 |
 
-The inherited forward owns output allocation, prediction-hook dispatch and
-FMHA selection. Its sparse hook coordinates cache publication and native
-sparse inputs; metadata owns the selected-row staging buffers.
-`attention/backends/fmha/csa2.py` supplies the FlashInfer/FlashMLA compute
-libraries. There is no separate attention controller or alternate backend
-forward API.
+`backend.py` contains the single sparse backend and both plain Flash helper
+classes. The opt-in packed path uses the backend's explicit `forward_packed`
+method. Every path invokes the same sparse preparation once per tile;
+CSA2-specific GPU kernels are collected in `kernel.py`.
+
+The default compute path decodes selected SWA/main rows into bounded BF16
+staging pools. Native trtllm-gen does not consume the persistent CSA2 FP4
+format directly. FlashInfer likewise avoids requantizing into V4's different
+FP8 footer cache format. The library adapters return BF16; unsupported custom
+masks and scaled/quantized output contracts are rejected.
+
+Eager native context preserves real request query groups. Its virtual staged
+KV coordinates prevent the native causal mask from clipping already selected
+rows; actual source causality remains encoded in selection and visibility.
+Generation and fixed-shape context graphs use independent-query generation
+staging. A tile contains only one compute phase.
 
 `CSA2SparseAttentionConfig(algorithm="csa2")` selects the cache manager through
-the existing sparse registry. Cache geometry comes from checkpoint text
-configuration rather than an independent set of LLM-argument overrides.
-`ModelConfig` selects CSA2 for `deepseek_v41`/`deepseek_v41_text` configurations.
+the existing sparse registry. Geometry comes from the checkpoint text
+configuration. `ModelConfig` recognizes `deepseek_v41`/`deepseek_v41_text` for
+this attention configuration; this does not register a complete causal LM.
 
-## Module and indexer
+## Projections, compression and indexing
 
-`DeepseekV41Attention` owns projections, RoPE, compression and grouped output
-projection. Its forward consumes prepared `CSA2TrtllmMetadata` and directly
-calls the selected backend over bounded query tiles. The module omits V4's
-projected-Q head normalization. Index K is derived from the compressed main
-latent before main-KV RoPE and quantization. Ratio two reuses the native V4
-non-overlap compressor with FP32 state and zero APE; ratio one has no gate.
+`DeepseekV41Attention` owns projections, normalization, RoPE, compression and
+grouped output projection. It consumes prepared `CSA2TrtllmMetadata`, retains
+CSA2's omission of projected-Q head normalization, and derives index K from
+the compressed main latent before main-KV RoPE. Ratio-two compression reuses
+the native V4 non-overlap compressor with FP32 value/gate state and zero APE.
+Ratio one has an uncompressed global cache and no compression gate.
 
-`CSA2Indexer` subclasses the existing DSA `Indexer` in projection-free mode.
-Its `sparse_attn_indexer()` override adapts the model's cache and phase
-semantics once per complete layer batch, before attention tiles consume the
-results. CSA2 logical mapping and paged staging stay in this subclass and its
-metadata. DSA keeps its own prefill flow; CSA2 owns candidate loading, logits
-workspace limits and candidate-output synchronization. Both use the same
-pure TP query-partition calculation, existing allgather operation, inherited
-MQA kernels and the shared
-`modules/top_k.py::TopK` module. Final index selection uses the inherited
-`Indexer.top_k`; hierarchical block selection reuses a `TopK` instance with
-the candidate block count. Prefill and decode select the corresponding module
-entry path; temporal GVR state is not enabled. Full
-prefill gathers each request prefix once per chunk, including cached keys.
-Candidate-restricted layers gather bounded query tiles after TP partitioning;
-both selected indices and candidate-source outputs are gathered across ranks.
+BF16 projection execution is the default. Optional
+`projection_quantization="mxfp8"` uses native MXFP8 linear/grouped output
+operations on SM100/SM103, with checkpoint scale validation and support for
+the admitted 32/128-block weight layouts. Eligible small-query MXFP8 index-Q
+projection can fuse GEMM, interleaved RoPE and CSA2 nearest-even FP4 conversion
+with `fuse_index_q`; larger queries retain the unfused native projection path.
+An optional auxiliary stream overlaps compression/index preparation with Q
+work when the existing multi-stream policy is enabled.
 
-Unrestricted decode uses the shared native paged MQA path on SM100 with 32 or
-64 index heads. Metadata stages exact index bytes into the native page-footer
-format and masks missing pages before selection. SM90/SM120/121, other head
-counts and restricted candidates use CSA2 bounded gathering with inherited MQA; decode
-still uses decode TopK semantics. CSA2 supplies block-max/latest-block selection
-and logical-position mapping. Reuse layers consume prior logical selections
-without running the indexer and resolve physical pages afresh.
+`CSA2Indexer` subclasses DSA `Indexer` in projection-free mode and reuses its
+MQA kernels and `TopK` module. CSA2-specific phase orchestration, candidate
+loading and logical mapping remain local. Indexing runs once for the complete
+layer batch before attention tiles consume the results. Full prefill gathers
+cached and new keys once per request chunk; bounded query tiling limits
+logits workspace. TP query splitting uses the shared partition/allgather
+primitives and synchronizes candidate-source outputs as well as selections.
 
-The selected main/SWA values are decoded into bounded BF16 compute pools.
-Native trtllm-gen does not consume CSA2 FP4 bytes directly. FlashInfer FA2 also
-avoids extra quantization into V4's different FP8 footer layout. FlashInfer and
-FlashMLA emit BF16 output; custom masks and scaled/quantized outputs are rejected.
+Unrestricted SM100 decode uses native paged FP4 MQA for supported index-head
+geometry, including padding smaller head counts into native specializations.
+Metadata repacks exact index bytes into native 64-entry footer pages. Missing
+pages map to a zero page and are excluded from logical selection. Restricted
+candidates and other hardware use bounded gathering with inherited MQA;
+decode retains decode TopK semantics. Reuse layers consume logical selections
+from their index source and resolve current physical pages without recomputing
+indexer logits.
 
-## Cache ownership and lifecycle
+Exact CUDA TopK is the default; short sequences whose keys all fit can
+enumerate visible positions without logits or TopK. Internal `CSA2Params` also exposes eligible CuTe DSL exact
+TopK, self-sampling/temporal GVR, and CuTe paged MQA/emission options. Temporal
+priors use request allocation epochs and logical positions, seed first decode
+from accepted prefill, and follow request identity across reordering. Rewind
+and multi-query verification invalidate unsafe hints. Emission state resets
+before replay when row ownership changes and on target/draft transitions. Candidate-restricted Reindex does not consume temporal hints from
+an incompatible selection domain.
 
-`CSA2CacheManager` specializes `KVCacheManagerV2`. It reuses the shared request
-allocation, commit, prefix reuse, copy-on-write, scratch, release and tier
-storage mechanisms. Only KV-source layers allocate global storage; every
-attention layer owns private SWA storage. Only ratio-two KV owners allocate
-FP32 KV/score compressor state.
+## Cache lifecycle and speculation
 
-Each global record stores 288 main bytes and 68 index bytes together. Main
-uses E2M1/E4M3 scales per 16 channels; index uses E2M1/UE8M0 per 32 channels.
-The main/index views have a 356-byte row stride and share physical page numbers
-by construction. Copy-on-write and transfer operate on the complete record,
-including both sets of scales. The published layout requires 890 global bytes
-per original token, excluding bounded SWA and partial state.
+`CSA2CacheManager` specializes `KVCacheManagerV2` and reuses allocation,
+commit, prefix reuse, copy-on-write, scratch, release and tier storage. Every
+attention layer has private SWA storage; only KV-source layers own global
+main/index storage, and only ratio-two owners allocate FP32 compressor state.
 
-SWA uses 528-byte E4M3/power-of-two-scale rows. All CSA2 formats include the
-RoPE channels. Long prefill reads scratch-aware page mappings instead of
-writing directly into a short circular window. Partial-state groups retain
-both FP32 values and scores. No separate cache container manages allocations
-or writes outside the cache manager.
+Each global record combines 288 main bytes and 68 index bytes. Main uses
+NVFP4 E2M1 values with E4M3 scales per 16 channels; index uses E2M1 values
+with UE8M0 scales per 32 channels. Their
+views retain a 356-byte row stride and identical physical page numbering, so
+copy-on-write and transfer preserve both payloads and scales together. The
+published layout uses 890 global bytes per original token, excluding SWA,
+compressor state and compute workspace. SWA uses 528-byte E4M3/power-of-two
+rows. All formats include their RoPE channels.
+These persistent formats are part of CSA2's cache contract and do not require
+a generic NVFP4 KV-cache flag. Projection precision and the selected attention
+compute path do not change the persistent main-cache encoding.
 
-## Runtime metadata
+Long prefill uses scratch-aware page mappings. Partial groups retain raw FP32
+values and scores. CUDA BF16 cache publication on SM100 uses fused exact-byte
+quantize/scatter; other paths retain the existing encoder and masked scatter.
+Invalid slots, including padding slot -1, never write a cache row.
+The default staged attention path also uses fused gather/dequantization on
+SM100 to read selected packed rows directly into BF16, including strided
+main/index views. Invalid read slots produce zero rows. The packing and
+unpacking helpers in `quantization.py` remain the reference fallback for
+unsupported gather layouts or hardware.
 
-`CSA2TrtllmMetadata.prepare()` resolves scheduler request IDs, cached lengths
-and V2 page converters into its own layer-specific SWA/visibility tensors,
-owner-specific global page tables/write slots and compression inputs. Routing
-indices and candidates are direct metadata fields, reset for each packed
-forward. Source and consumer queries retain the same packed order. The
-`global_slot_tile()` method resolves owner pages without an additional carrier
-object or a persistent tokens-by-context mapping.
+Attention-local contiguous chain verification supports accepted-prefix rewind
+through V2 resource updates. SWA/state windows and scratch rewind capacity
+cover the configured draft tail; continuation recomputes incomplete groups
+and cannot expose rejected compressed rows. Target/draft metadata hooks
+support identical explicit layer layouts and independent cache-dependent
+state. Non-linear trees, beams, explicit token relocation indices and implicit
+virtual draft-layer mappings remain rejected. These local mechanisms do not
+establish complete model-level MTP drafting or generation.
 
-Encoder source rows can be supplied independently of decoder query rows with
-`set_source_batch()` before prepare. Compression output capacity follows source
-rows. Incomplete groups produce zero-filled padding with position zero and
-write slot -1; the packed-row store skips invalid slots and respects strided
-views. Caller-provided source hidden states must match the prepared source batch.
+## SWA bounded replay
 
-Runtime metadata owns fixed-shape compute views shared by serialized layers.
-Different query counts use independent native workspaces. Warm each view with
-the standard forward before capture and set `is_cuda_graph` for captured calls.
-Prepare refreshes persistent device metadata outside capture before replay.
-For native indexer decode, set the source metadata's `is_cuda_graph` before
-warmup as well as capture. This reserves the admitted context bound. Eager
-paged staging grows geometrically and replaces its previous arena; graph
-arenas retain stable storage. Every captured forward repacks the current owner
-pages and refreshes the paged schedule. Gathered decode also uses a fixed scan
-bound so replay can expose new keys through updated device visibility.
+After an authoritative cached GLOBAL prefix of length C, the caller can use
+`get_swa_replay_ranges()` to plan writable query intervals and
+`set_swa_bounded_replay()` to prepare their reconstruction. Encoder replay
+starts at `max(0, C - window_size)` and may include an uncached suffix. Each
+query's SWA is restricted to the replay segment. This reconstruction is
+approximate across layers; its reference is truncated replay, not a complete
+historical forward.
 
-Graph metadata follows the framework's shallow-clone convention: routing resets
-create independent Python dictionaries, while same-geometry staging/device
-buffers can be shared. Calls and replays must remain serialized.
+Cached main/index records remain read-only. Only uncached source rows produce
+new GLOBAL entries. At an odd ratio-two boundary, the last cached raw token
+is included to reconstruct partial compressor state before continuation.
+Pure replay with no required source rows skips global projection. Decoder
+replay reconstructs only the final window and requires prompt GLOBAL entries
+to be already prepared.
 
-## Scope and validation
+Replay preparation is one-shot. The caller supplies the declared query inputs
+and provisions every writable row in the returned interval; an ordinary
+retained SWA window may omit its first reconstruction token. Captured replay
+can refresh same-geometry positions and page mappings, while changes to replay
+mode or source geometry require fresh metadata and recapture.
 
-Targeted tests exercise all CSA2 layer modes, quantized layouts, logical/paged
-selection, inherited backend dispatch, shared DSA indexer computation, real V2
-allocation/scratch/prefix reuse/COW, partial compressor state, changed graph
-replay inputs and an actual attention module against an unfused reference.
-Tests are under `tests/unittest/_torch/attention/sparse/csa2/`.
+Automatic GLOBAL-only reuse is enabled by default when the layout has a
+GLOBAL owner. Native and Python V2 prefix matching use persistent GLOBAL
+coverage; private SWA and compressor-state pages are reconstructed instead of
+being published into the reuse trie. SWA-only layouts retain ordinary matching.
+The manager can explicitly disable this policy with
+`enable_swa_bounded_replay=False`.
 
-PP/CP and disabled-layer masks are rejected by the current cache integration.
-Beam/speculative compressor-state rewind is rejected by runtime metadata.
-Disaggregation role mappings preserve byte layout, but do not establish full
-model disaggregation, CED scheduling or DSpark inference support. Whole-model
-checkpoint parity and performance remain separate validation work. Before
-whole-model serving, verify that profiling exercises every Full layer at the
-maximum request count and admitted global width: native index staging, logical
-masks and gathered logits workspace require coverage in memory profiling.
-Indexer query TP splitting does not enable PP/CP, GVR temporal state or
-speculative compressor rewind.
+For a GLOBAL hit at C, request preparation preserves C as the reused-prefix
+length and rewinds the compute cursor to `max(0, C - window_size)`. Metadata
+prepares replay intervals from actual request IDs, including partial chunks.
+Physical SWA retention includes one extra row for the first replay query.
+The manager acknowledges reconstruction only after every member layer has
+completed its forward and its CUDA event has completed; pending reconstruction
+cannot be committed. Target and draft claims settle a common replay cursor.
+Reaching C again after replay does not repeat initial prefix settlement.
+
+Automatic reconstruction runs eagerly, including a final context token promoted
+to generation. Normal CUDA Graph eligibility resumes after acknowledgement.
+The explicit fixed-geometry replay interface above retains its separate graph
+contract. These runtime mechanisms do not supply the complete V4.1 model's
+encoder-to-decoder activation handoff.
+
+## Metadata, graphs and workspace
+
+`CSA2TrtllmMetadata.prepare()` resolves real request IDs, cached lengths and V2
+page converters. Layer-specific SWA/visibility, owner page tables/write slots,
+compression inputs, candidates and routing results live directly on metadata.
+`global_slot_tile()` resolves pages without a persistent token-by-context map.
+
+`set_source_batch()` permits encoder source lengths to differ from decoder
+query lengths. Compressor output capacity follows source rows; incomplete
+outputs are zero-filled with position zero and write slot -1. Supplied source
+hidden states must match that prepared source batch. Full CED scheduling is
+not supplied by this interface.
+
+Set outer metadata's `is_cuda_graph` before warmup, and warm the standard
+forward before capture. Host prepare refreshes persistent device metadata
+before replay. Calls and replays sharing metadata must remain serialized.
+Eager buffers replace obsolete geometry; native indexer staging uses one
+configured maximum graph arena per device/topk across graph batch sizes and
+serialized owners. Replays refresh packed pages, visibility and scheduling.
+
+`workspace_reservation_bytes()` reports one retained native index arena from
+explicit serving capacities. `get_workspace_bytes()` deduplicates retained
+metadata/frame/arena/prior storage separately from manager pools. Cache-gather
+component estimates exclude query-dependent logits and other temporaries;
+the optional packed kernel has its own workspace-size helper. A resolved cap
+that cannot cover the admitted graph arena is rejected before allocation.
+These attention-local APIs do not install generic executor admission or a
+complete serving-memory reserve. Model integration must account for fixed
+arenas, projection/provider/native workspace and measured transient peaks at
+the actual serving geometry.
+
+## Optional packed attention and remaining scope
+
+`use_packed_sparse_attention` enables an eligible SM100 BF16-Q kernel that
+reads packed SWA/main rows directly, bypassing BF16 selected-KV staging. It
+uses split-KV partial workspace. `fuse_packed_output_rope` additionally fuses
+inverse interleaved RoPE into the output reduction. Both are off by default;
+select them with workload-specific numerical validation and profiling.
+
+PP/CP and disabled-layer masks are unsupported. Disaggregation role mappings
+preserve cache bytes but do not establish whole-model disaggregation, CED or
+DSpark execution. Whole-model checkpoint parity, model/executor integration
+and whole-model performance remain outside this package's validated scope.
+Component/runtime tests live in `tests/unittest/_torch/attention/sparse/csa2/`.
 
 Numerical definitions follow the official
 [reference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py)

@@ -142,8 +142,8 @@ UncommittedPage::~UncommittedPage()
     //  - part of an SSM lifecycle (different rules),
     //  - at an ordinal beyond the current block list (block already removed),
     //  - the slot at this position is null, CommittedPage, or this page itself (self-destruction).
-    // The "p == this" condition is C++-specific: std::variant destroys the old value before
-    // switching to monostate, so during destruction the slot still references this page.
+    // std::variant destroys the old value before switching to monostate. During
+    // destruction its lock may still reference this page or already be unlocked.
     if (TLLM_UNLIKELY(gDebug))
     {
         auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
@@ -155,9 +155,9 @@ UncommittedPage::~UncommittedPage()
             if (!blockRemoved)
             {
                 auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
-                auto page = blockPageGetPage(bp);
-                pageOk
-                    = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
+                // The slot may be releasing its last owner of this page. Observe it without copying ownership.
+                auto const* page = blockPageGetPage(bp).get();
+                pageOk = page == nullptr || page == this || page->isCommitted();
             }
             TLLM_CHECK_WITH_INFO(
                 blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
@@ -391,8 +391,9 @@ void SharedPageLock::releasePageIndex()
 {
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
-    // Mirrors Python assertion: old base index must match this page's slot ID.
-    TLLM_CHECK_DEBUG(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
+    // SSM locks have no per-block index entry; other locks must release their page's slot ID.
+    TLLM_CHECK_DEBUG(oldBaseIndex
+        == (mUser.ordinal == kBadBlockOrdinal ? kBadPageIndex.value() : slotIdToPageIndexValue(page()->slotId())));
     (void) oldBaseIndex;
 }
 
@@ -537,7 +538,7 @@ void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
-    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, std::move(mSlot));
+    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, detachSlot());
     TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 

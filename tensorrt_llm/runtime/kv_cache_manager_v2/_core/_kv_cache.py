@@ -108,7 +108,12 @@ class SeqBlock:
             NDEBUG
             or not ret
             or all(
-                p is None or isinstance(p.page, CommittedPage)
+                p is None
+                or isinstance(p.page, CommittedPage)
+                or (
+                    isinstance(p.page, UncommittedPage)
+                    and p.page.manager.life_cycles.is_reconstructible(p.page.life_cycle)
+                )
                 for p in chain.from_iterable(self.pages)
             )
         )
@@ -252,6 +257,8 @@ class _KVCache:
         "_scratch_slots",
         "_enable_request_stats",
         "_pending_stats",
+        "_reconstruction_ranges",
+        "_reconstructed_ranges",
         "__rawref__",
     )
 
@@ -338,6 +345,8 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._reconstruction_ranges: dict[LifeCycleId, tuple[int, int]] = {}
+        self._reconstructed_ranges: dict[LifeCycleId, tuple[int, int]] = {}
         self._num_reusable_tokens_before_hybrid_pruning = (
             reuse_match.num_reusable_tokens_before_hybrid_pruning if reuse_match is not None else 0
         )
@@ -374,6 +383,40 @@ class _KVCache:
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
         assert NDEBUG or self._check_sanity()
+
+    @property
+    def requires_reconstruction(self) -> bool:
+        return bool(self._reconstruction_ranges)
+
+    def get_reconstruction_ranges(self) -> dict[LifeCycleId, tuple[int, int]]:
+        """Unready request-private history, in original token coordinates."""
+        return dict(self._reconstruction_ranges)
+
+    def get_reconstructed_ranges(self) -> dict[LifeCycleId, tuple[int, int]]:
+        """Last acknowledged replay intervals; ordinary later appends are not tracked here."""
+        return dict(self._reconstructed_ranges)
+
+    def mark_reconstructed(
+        self, layer_group_id: LifeCycleId, begin: int | None = None, end: int | None = None
+    ) -> None:
+        """Acknowledge initialized history after its writes are ordered on the cache stream."""
+        if not self.is_active:
+            raise LogicError("Reconstruction can only be acknowledged on an active cache")
+        if layer_group_id not in self._reconstruction_ranges:
+            raise LogicError("The lifecycle does not require reconstruction")
+        required_begin, required_end = self._reconstruction_ranges[layer_group_id]
+        if (begin is None) != (end is None):
+            raise ValueError("Reconstructed history bounds must be provided together")
+        if begin is None:
+            begin, end = required_begin, required_end
+        assert begin is not None and end is not None
+        if end != required_end or begin < required_begin or begin > end:
+            raise ValueError(
+                "Reconstructed history must end at the reused prefix within its reserved range"
+            )
+        self._reconstructed_ranges[layer_group_id] = (begin, end)
+        del self._reconstruction_ranges[layer_group_id]
+        self._refresh_generation_alloc_ready()
 
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -1040,6 +1083,8 @@ class _KVCache:
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
     ):
+        if self.requires_reconstruction:
+            raise LogicError("Reconstruct request-private history before committing new tokens")
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
         if not accepted_input_tokens:
@@ -1164,7 +1209,7 @@ class _KVCache:
         pages_to_drop: list[CommittedPage] = []
         for lc_idx, lc in self.manager._life_cycles.items():
             if isinstance(lc, AttnLifeCycle):
-                if lc.window_size is None:
+                if lc.window_size is None or lc.reconstructible:
                     continue
                 stale_range = _KVCache._get_stale_range(
                     self.tokens_per_block, self.num_committed_tokens, lc
@@ -1261,17 +1306,39 @@ class _KVCache:
         )
         assert all(len(s) == 0 for s in excess_scratch_slots)
 
+        fresh_pages: list[tuple[BlockOrdinal, BeamIndex, LifeCycleId]] = []
+        fresh_counts = filled_list(0, num_life_cycles)
+        if self._never_resumed:
+            for lc_idx, lc in life_cycles.attention_life_cycles():
+                if not lc.reconstructible:
+                    continue
+                stale_start, stale_end = self._get_stale_range(
+                    self.tokens_per_block, self.history_length, lc
+                )
+                scratch_range = self._get_scratch_range(lc)
+                for ordinal in chain(
+                    typed_range(stale_start), typed_range(stale_end, typed_len(self._blocks))
+                ):
+                    if ordinal in scratch_range:
+                        continue
+                    for beam_idx, beam_block in typed_enumerate(self._blocks[ordinal].pages):
+                        assert beam_block[lc_idx] is None
+                        fresh_pages.append((ordinal, beam_idx, lc_idx))
+                        fresh_counts[lc_idx] += 1
+        fresh_slots = make_typed(lambda _: list[Slot](), num_life_cycles)
         num_slots = filled_list(0, num_life_cycles)
         has_partial = False
         if self._never_resumed:
             assert self.beam_width == 1
             has_partial = self.num_committed_tokens % self.tokens_per_block != 0
             for lc_idx, lc in life_cycles.items():
-                if type(lc) is SsmLifeCycle or has_partial:
+                if type(lc) is SsmLifeCycle or (
+                    has_partial and not life_cycles.is_reconstructible(lc_idx)
+                ):
                     num_slots[lc_idx] += 1
 
         for lc_idx in typed_range(num_life_cycles):
-            num_slots[lc_idx] += delta_scratch_slots[lc_idx]
+            num_slots[lc_idx] += delta_scratch_slots[lc_idx] + fresh_counts[lc_idx]
 
         if any(c > 0 for c in num_slots):
             try:
@@ -1285,9 +1352,12 @@ class _KVCache:
             scratch_slots_to_add = make_typed(lambda _: list[Slot](), num_life_cycles)
             for lc_idx, slot_lst in zip(typed_range(num_life_cycles), tmp_slots, strict=True):
                 if self._never_resumed and (
-                    type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
+                    type(life_cycles[lc_idx]) is SsmLifeCycle
+                    or (has_partial and not life_cycles.is_reconstructible(lc_idx))
                 ):
                     deferred_slots[lc_idx] = slot_lst.pop()
+                for _ in range(fresh_counts[lc_idx]):
+                    fresh_slots[lc_idx].append(slot_lst.pop())
                 scratch_slots_to_add[lc_idx] = slot_lst
 
             stream_wait_events(
@@ -1317,6 +1387,9 @@ class _KVCache:
             for lc_idx, slot in typed_enumerate(deferred_slots):
                 if slot is not None:
                     storage.release_slot(lc_idx, GPU_LEVEL, slot)
+            for lc_idx, slots in typed_enumerate(fresh_slots):
+                for slot in slots:
+                    storage.release_slot(lc_idx, GPU_LEVEL, slot)
             return False
 
         # Replace all holders with locks.
@@ -1329,6 +1402,32 @@ class _KVCache:
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             assert page is lock.page
             beam_block[lc_idx] = lock
+
+        # GLOBAL holders are locked successfully. Only now attach fresh private
+        # transient pages, so a failed resume never leaves partial reconstruction.
+        stream_wait_events(
+            self.cuda_stream, (slot.ready_event for slots in fresh_slots for slot in slots)
+        )
+        for ordinal, beam_idx, lc_idx in fresh_pages:
+            slot = fresh_slots[lc_idx].pop()
+            page = UncommittedPage(self, ordinal, lc_idx, GPU_LEVEL, slot, beam_idx)
+            self._block(ordinal, beam_idx)[lc_idx] = page.lock(
+                self, beam_idx, ordinal, lc_idx, skip_wait=True
+            )
+            record_manager_stats = self._should_record_manager_stats()
+            record_request_stats = self._should_record_request_stats()
+            if record_manager_stats or record_request_stats:
+                changed = self._pending_stats.record_allocation_range(
+                    lc_idx,
+                    ordinal,
+                    BlockOrdinal(ordinal + 1),
+                    beam_width=1,
+                    count_as_missed=True,
+                    record_manager_stats=record_manager_stats,
+                    record_request_stats=record_request_stats,
+                )
+                if changed:
+                    self.manager.mark_stats_dirty(self.id)
 
         # Deferred copy: for partial blocks and SSM, copy from now-locked source pages
         # to pre-allocated GPU slots, then unlock sources and replace with new pages.
@@ -1501,6 +1600,12 @@ class _KVCache:
                 block = self._blocks[ordinal]
                 for beam_idx, beam_block in typed_enumerate(block.pages):
                     is_scratch = ordinal in scratch_range
+                    if (
+                        self._never_resumed
+                        and (isinstance(lc, AttnLifeCycle) and lc.reconstructible)
+                        and beam_block[lc_idx] is None
+                    ):
+                        continue
                     assert is_scratch == (beam_block[lc_idx] is None)
                     if not is_scratch:
                         yield ordinal, beam_idx, lc_idx
@@ -1547,6 +1652,8 @@ class _KVCache:
         src_page: Page,
         num_tokens_in_block: int,
     ) -> CommittedPage | None:
+        if self.manager._life_cycles.is_reconstructible(lc_idx):
+            return None
         if not tree_block.can_replace_page(lc_idx, num_tokens_in_block):
             return tree_block.get_page(lc_idx)
 
@@ -1634,7 +1741,9 @@ class _KVCache:
         # the partial attention pages to it is still correct because each page records the
         # token span it covers, and prefix matching honours that span.
         attached_lcs = list[LifeCycleId]()
-        for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
+        for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
+            if lc.reconstructible:
+                continue
             holder = beam_block[lc_idx]
             if holder is None or tree_block.page_coverage(lc_idx) >= num_tokens:
                 continue
@@ -1711,7 +1820,13 @@ class _KVCache:
         did_commit = False
         if is_new:
             # We are the only writer to padding. Other _KVCache reusing it should make copies.
-            skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
+            skip_lcs = {
+                lc_id
+                for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+                if lc.reconstructible
+            }
+            if ssm_lc_id is not None:
+                skip_lcs.add(ssm_lc_id)
             uncommitted_pages = self._take_uncommitted_page(ordinal, beam_idx, skip_lcs)
             # convert uncommitted pages to committed pages and create a new block in the radix tree.
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
@@ -1734,8 +1849,8 @@ class _KVCache:
             # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):
-                if lc == ssm_lc_id:
-                    continue  # SSM pages are not rebased
+                if lc == ssm_lc_id or self.manager._life_cycles.is_reconstructible(lc):
+                    continue  # Recurrent and reconstructible pages remain request-private
                 if beam_block[lc] is None:
                     continue
                 # A page covering fewer tokens than this block spans (moved in from a
@@ -1848,6 +1963,7 @@ class _KVCache:
                     is_committed = block.is_committed
                     hold_for_commit = (
                         not self.manager.commit_min_snapshot
+                        and not self.manager._life_cycles.is_reconstructible(lc_idx)
                         and not is_committed
                         and self._commit_state == self.CommitState.ALLOWED
                     )
@@ -1940,7 +2056,7 @@ class _KVCache:
             for lc, b in typed_enumerate(self._block(ordinal, DEFAULT_BEAM_INDEX)):
                 if lc == ssm_lc_id:
                     assert b is None  # SSM pages live in _ssm_blocks
-                elif b is not None:
+                elif b is not None and not self.manager._life_cycles.is_reconstructible(lc):
                     # b.page.block() may differ from `ret`: a page can be moved to a longer
                     # sibling block, or replaced there by one with larger token coverage.
                     assert isinstance(b.page, CommittedPage)
@@ -2001,7 +2117,13 @@ class _KVCache:
                     start, end = stale_ranges[lc]
                     lc_obj = self.manager._life_cycles[lc]
                     if start <= ordinal < end:
-                        if is_committed or self._commit_state != self.CommitState.ALLOWED:
+                        if (
+                            self.manager._life_cycles.is_reconstructible(lc)
+                            or is_committed
+                            or self._commit_state != self.CommitState.ALLOWED
+                        ):
+                            # Private history is never retained for a later
+                            # radix-tree commit once it leaves its window.
                             assert holder is None
                         elif ordinal in self._get_scratch_range(lc_obj, 0):
                             # It is uncertain whether this block should hold a page: it may
@@ -2022,11 +2144,20 @@ class _KVCache:
                         if is_scratch:
                             assert holder is None
                         else:
+                            if (
+                                self._never_resumed
+                                and self.manager._life_cycles.is_reconstructible(lc)
+                                and holder is None
+                            ):
+                                continue
                             assert isinstance(
                                 holder, (_SharedPageLock if self.is_active else _PageHolder)
                             )
                     if holder is not None:
-                        assert is_committed == isinstance(holder.page, CommittedPage)
+                        if self.manager._life_cycles.is_reconstructible(lc):
+                            assert isinstance(holder.page, UncommittedPage)
+                        else:
+                            assert is_committed == isinstance(holder.page, CommittedPage)
         # Check SSM blocks
         if ssm_lc_id is not None:
             for beam_block in self._ssm_blocks:
@@ -2147,6 +2278,13 @@ class _KVCache:
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
+            if isinstance(lc, AttnLifeCycle) and lc.reconstructible:
+                if num_tokens:
+                    window = unwrap_optional(lc.window_size)
+                    begin = max(0, num_tokens - window + 1)
+                    if begin < num_tokens:
+                        self._reconstruction_ranges[lc_idx] = (begin, num_tokens)
+                continue
             stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
             full_reused_blocks = 0
             partial_reused_blocks = 0
@@ -2211,6 +2349,8 @@ class _KVCache:
             self._scratch_slots[lc].clear()
 
     def _clear_blocks(self) -> None:
+        self._reconstruction_ranges.clear()
+        self._reconstructed_ranges.clear()
         # drop the last block first
         while self._blocks:
             self._blocks.pop()

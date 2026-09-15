@@ -12,7 +12,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
     _QueryChunk,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2ForwardState, CSA2Layout
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+    CSA2ForwardState,
+    CSA2Layout,
+    CSA2Params,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 from tensorrt_llm._torch.modules.top_k import TopK
 from tensorrt_llm.mapping import Mapping
@@ -139,6 +143,8 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
     )
     packed_keys = pack_rows(torch.randn(512, 128, device="cuda", dtype=torch.bfloat16), "index")
     manager = _StridedOwner(layout, packed_keys)
+    # One request carries two verification queries; declare that arena width.
+    manager.max_total_draft_tokens = 1
     q, _, weights = _projected(3)
     metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=3)
     metadata.kv_cache_manager = manager
@@ -385,10 +391,12 @@ def test_gathered_decode_graph_grows_past_warmup_prefix(monkeypatch):
         return original(owner, slots)
 
     monkeypatch.setattr(manager, "gather_indexer_keys", gather)
+    # Exercise the bounded fallback independently of native head coverage.
+    monkeypatch.setattr(metadata, "prepare_indexer", lambda layer: None)
     monkeypatch.setattr(
         indexer,
         "_call_paged_mqa_logits",
-        lambda *a, **kw: pytest.fail("Eight-head decode must use bounded gathered fallback"),
+        lambda *a, **kw: pytest.fail("Unavailable native staging requires gathered fallback"),
     )
     for _ in range(3):
         output = indexer(state, 0, 1)
@@ -488,3 +496,275 @@ def test_native_graph_switches_ratio_two_and_one_owner():
                 binding.csa2_indexer_scheduler_metadata.data_ptr(),
             )
     assert len(metadata._csa2_indexer_workspaces) == 1
+
+
+@pytest.mark.parametrize("heads", [2, 8, 16, 32, 64])
+@pytest.mark.parametrize("use_dsl", [False, True])
+@torch.inference_mode()
+def test_native_paged_head_coverage_and_optional_dsl(monkeypatch, heads, use_dsl):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Native FP4 paged variants require SM100")
+    layout, _, metadata, state = _single_request_state(heads=heads)
+    metadata.is_cuda_graph = True
+    metadata.csa2_visible_lengths[0].fill_(96)
+    indexer = CSA2Indexer(
+        layout, 0, heads, 128, options=CSA2Params(use_cute_dsl_paged_mqa_logits=use_dsl)
+    )
+    calls = []
+    native = indexer._paged_mqa_logits
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_paged_mqa_logits", record)
+    for _ in range(3):
+        output = indexer(state, 0, 1)
+    assert len(calls) == 3
+    _assert_state_selection(output, state, 0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = indexer(state, 0, 1)
+    for length, page in ((65, 1), (96, 2), (0, -1)):
+        metadata.csa2_visible_lengths[0].fill_(length)
+        metadata.csa2_global_page_tables[0][0, 1] = page
+        graph.replay()
+        _assert_state_selection(output, state, 0)
+
+
+def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_source=False):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Temporal GVR requires SM100")
+    torch.manual_seed(7302)
+    width, heads = 65536, 64
+    layout = CSA2Layout(
+        (1,),
+        (0,),
+        (0,),
+        index_topk=512,
+        candidate_source_layer_id=0 if candidate_source else None,
+        candidate_topk_blocks=4,
+    )
+    manager = _StridedOwner(
+        layout, pack_rows(torch.randn(width, 128, device="cuda", dtype=torch.bfloat16), "index")
+    )
+    manager.epoch = 1
+    manager.request_epoch = lambda request: manager.epoch
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=1)
+    metadata.kv_cache_manager = manager
+    metadata.mapping = Mapping()
+    metadata.request_ids = [13]
+    metadata._num_ctx_tokens = 0
+    metadata._num_contexts = 0
+    metadata._num_tokens = 1
+    metadata._num_generations = 1
+    metadata.csa2_kv_sources = {0: 0}
+    metadata.csa2_num_context_requests = 0
+    metadata.csa2_request_query_ranges = [(0, 1)]
+    metadata.csa2_request_start_positions = [32767]
+    metadata.csa2_request_lengths = [1]
+    metadata.csa2_global_max_positions = {0: width}
+    metadata.csa2_global_page_sizes = {0: 128}
+    metadata.csa2_global_page_tables = {
+        0: torch.arange(width // 128, device="cuda", dtype=torch.int32)[None, :]
+    }
+    if page_holes:
+        metadata.csa2_global_page_tables[0][0, 2] = -1
+    metadata.csa2_visible_lengths = {0: torch.tensor([32768], device="cuda", dtype=torch.int32)}
+    metadata.csa2_token_requests = torch.zeros(1, device="cuda", dtype=torch.int64)
+    metadata.csa2_indices = {}
+    metadata.csa2_candidates = {}
+    metadata.indexer_max_chunk_size = 16
+    metadata.indexer_q_split_threshold = -1
+    metadata._csa2_forward_serial = 0
+    state = CSA2ForwardState(
+        metadata=metadata,
+        swa_kv=torch.zeros(1, 512, device="cuda", dtype=torch.bfloat16),
+        index_q=torch.randn(1, heads, 128, device="cuda", dtype=torch.bfloat16),
+        index_weights=torch.rand(1, heads, device="cuda") / heads,
+    )
+    if page_holes:
+        state.index_weights.neg_()
+    indexer = CSA2Indexer(
+        layout,
+        0,
+        heads,
+        128,
+        options=CSA2Params(
+            enable_heuristic_topk=True,
+            use_self_sampling_topk=False,
+            use_cute_dsl_paged_mqa_logits=emission,
+            use_gvr_emission=emission,
+        ),
+    )
+    assert indexer.top_k.needs_gvr_prior
+    resets, emitted = [], []
+    original_reset, original_logits = indexer._reset_emission, indexer._paged_mqa_logits
+
+    def reset():
+        resets.append(True)
+        original_reset()
+
+    def logits(*args, **kwargs):
+        emitted.append(bool(kwargs.get("emission_kwargs")))
+        return original_logits(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_reset_emission", reset)
+    monkeypatch.setattr(indexer, "_paged_mqa_logits", logits)
+    metadata.is_cuda_graph = True
+    for _ in range(3):
+        output = indexer(state, 0, 1)
+    _assert_state_selection(output, state, 0)
+    assert any(emitted) == emission
+    metadata.is_cuda_graph = True
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = indexer(state, 0, 1)
+    graph.replay()
+    for start, epoch, expect_hint in ((32768, 1, True), (32769, 2, False), (511, 2, False)):
+        metadata.csa2_request_start_positions = [start]
+        metadata.csa2_visible_lengths[0].fill_(start + 1)
+        manager.epoch = epoch
+        metadata._csa2_forward_serial += 1
+        resets_before = len(resets)
+        prior = metadata.prepare_indexer_prior(0, 512)
+        assert bool((prior >= 0).any()) == expect_hint
+        if not expect_hint:
+            assert len(resets) > resets_before
+        state.index_q.copy_(torch.randn_like(state.index_q))
+        if page_holes:
+            metadata.csa2_global_page_tables[0][0, 2] = 2 if expect_hint else -1
+        graph.replay()
+        _assert_state_selection(output, state, 0)
+        if candidate_source:
+            candidates = metadata.csa2_candidates[0]
+            assert candidates.shape == (1, 32)
+            slots = metadata.global_slot_tile(0, 0, 1, candidates)
+            assert bool(((candidates < 0) | (slots >= 0)).all())
+
+
+@pytest.mark.parametrize("emission", [False, True])
+@torch.inference_mode()
+def test_temporal_gvr_prior_rewind_epoch_and_graph(monkeypatch, emission):
+    _temporal_gvr_case(monkeypatch, emission)
+
+
+@pytest.mark.parametrize("candidate_source", [False, True])
+@torch.inference_mode()
+def test_emission_masks_page_holes_and_signed_scores(monkeypatch, candidate_source):
+    _temporal_gvr_case(monkeypatch, True, page_holes=True, candidate_source=candidate_source)
+
+
+@torch.inference_mode()
+def test_packed_query_state_avoids_requantization(monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Packed-query native integration requires SM100")
+    layout, _, metadata, state = _single_request_state(heads=64)
+    metadata.is_cuda_graph = True
+    metadata.csa2_visible_lengths[0].fill_(96)
+    indexer = CSA2Indexer(layout, 0, 64, 128)
+    expected = indexer(state, 0, 1)
+    packed = pack_rows(state.index_q, "index")
+    state.index_q = packed[..., :64].contiguous().view(torch.int8)
+    state.index_q_scale = packed[..., 64:].contiguous().view(torch.int32).squeeze(-1)
+    calls = []
+    native_pack = pack_rows
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return native_pack(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.sparse.csa2.indexer.pack_rows", record
+    )
+    for _ in range(3):
+        actual = indexer(state, 0, 1)
+    torch.testing.assert_close(actual, expected)
+    assert not calls
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = indexer(state, 0, 1)
+    graph.replay()
+    torch.testing.assert_close(actual, expected)
+    assert not calls
+
+
+@pytest.mark.parametrize("mode", ["eager", "bounded_graph", "growing_graph"])
+@torch.inference_mode()
+def test_decode_short_skip_respects_graph_admission(monkeypatch, mode):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Native decode routing check requires SM100")
+    layout, manager, metadata, state = _single_request_state(heads=64)
+    metadata.is_cuda_graph = mode != "eager"
+    if mode == "bounded_graph":
+        metadata.csa2_global_max_positions[0] = 16
+    metadata.csa2_visible_lengths[0].fill_(12)
+    metadata.csa2_request_start_positions = [23]
+    indexer = CSA2Indexer(layout, 0, 64, 128)
+    calls = []
+    native = indexer._paged_mqa_logits
+
+    def record(*args, **kwargs):
+        if mode != "growing_graph":
+            pytest.fail("Eligible short decode must skip paged MQA")
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_paged_mqa_logits", record)
+    if mode != "growing_graph":
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("Eligible short decode must not gather/repack indexer cache")
+
+        monkeypatch.setattr(manager, "gather_indexer_pages", unexpected)
+        monkeypatch.setattr(manager, "gather_indexer_keys", unexpected)
+        monkeypatch.setattr(indexer, "_call_mqa_logits", unexpected)
+    for _ in range(3):
+        output = indexer(state, 0, 1)
+    _assert_state_selection(output, state, 0)
+    if mode == "eager":
+        metadata.csa2_global_page_tables[0][0, 0] = -1
+        output = indexer(state, 0, 1)
+        assert bool((output == -1).all())
+        return
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = indexer(state, 0, 1)
+    metadata.csa2_visible_lengths[0].fill_(96 if mode == "growing_graph" else 16)
+    graph.replay()
+    _assert_state_selection(output, state, 0)
+    assert bool(calls) == (mode == "growing_graph")
+
+
+@torch.inference_mode()
+def test_short_candidate_source_still_computes_block_scores(monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Native candidate-source routing check requires SM100")
+    _, manager, metadata, state = _single_request_state(heads=64)
+    layout = CSA2Layout(
+        (1,),
+        (0,),
+        (0,),
+        candidate_source_layer_id=0,
+        candidate_topk_blocks=2,
+        candidate_block_size=4,
+        index_topk=32,
+    )
+    manager.layout = layout
+    metadata.csa2_global_page_sizes[0] = 128
+    metadata.csa2_global_max_positions[0] = 16
+    metadata.csa2_visible_lengths[0].fill_(4)
+    metadata.csa2_request_start_positions = [3]
+    indexer = CSA2Indexer(layout, 0, 64, 128)
+    calls = []
+    native = indexer._paged_mqa_logits
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_paged_mqa_logits", record)
+    output = indexer(state, 0, 1)
+    assert len(calls) == 1
+    assert metadata.csa2_candidates[0].shape == (1, 8)
+    _assert_state_selection(output, state, 0)

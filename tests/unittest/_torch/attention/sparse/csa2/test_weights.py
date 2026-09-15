@@ -73,3 +73,32 @@ def test_invalid_fp8_scale_shape_rejected():
     weights["wo_a.weight_scale_inv"] = torch.ones(3, 2)
     with pytest.raises(ValueError, match="scale geometry"):
         load_attention_weights(module, weights, "", 2, 128, 2, 0)
+
+
+@pytest.mark.parametrize("block", [32, 128])
+@pytest.mark.parametrize("storage", ["bytes", "float"])
+def test_native_scale_expansion_preserves_checkpoint_values(block, storage):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import expand_mxfp8_scales
+
+    exponents = (
+        torch.arange((256 // block) * (256 // block)).reshape(256 // block, 256 // block) % 7 - 3
+    )
+    scales = (
+        (exponents + 127).to(torch.uint8) if storage == "bytes" else torch.exp2(exponents.float())
+    )
+    expanded = expand_mxfp8_scales(scales, (256, 256), block)
+    assert expanded.shape == (256, 8)
+    actual = torch.exp2(expanded.float() - 127).repeat_interleave(32, 1)
+    expected = torch.exp2(exponents.float()).repeat_interleave(block, 0).repeat_interleave(block, 1)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # A column-parallel slice and a row-parallel slice retain exact boundaries.
+    torch.testing.assert_close(actual[128:], expected[128:], atol=0, rtol=0)
+    torch.testing.assert_close(actual[:, 128:], expected[:, 128:], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan"), 1.5])
+def test_native_scale_expansion_rejects_lossy_conversion(value):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import expand_mxfp8_scales
+
+    with pytest.raises(ValueError, match="scales"):
+        expand_mxfp8_scales(torch.full((1, 1), value), (32, 32), 32)

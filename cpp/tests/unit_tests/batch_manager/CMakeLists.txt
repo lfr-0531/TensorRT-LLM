@@ -54,6 +54,12 @@ add_gtest(kvCacheManagerV2StagingBufferTest
 target_include_directories(
   kvCacheManagerV2StagingBufferTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ReconstructibleTest
+          kvCacheManagerV2ReconstructibleTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ReconstructibleTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 add_gtest(kvCacheManagerV2StatsTest kvCacheManagerV2StatsTest.cpp)
 target_include_directories(
   kvCacheManagerV2StatsTest

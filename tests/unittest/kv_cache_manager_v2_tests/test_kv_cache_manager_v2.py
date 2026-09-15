@@ -2741,6 +2741,22 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
+    def test_ssm_only_attention_diagnostic_preserves_raw_match_depth(self) -> None:
+        """Disabling snapshot pruning for diagnostics must not erase an SSM-only match."""
+        self.manager = KVCacheManager(self._make_ssm_config(num_attn_layers=0, num_ssm_layers=1))
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        source = self.manager.create_kv_cache()
+        self.assertTrue(source.resume(stream))
+        self.assertTrue(source.resize(64))
+        tokens = [self.next_token() for _ in range(64)]
+        source.commit(tokens)
+        source.close()
+        probe = self.manager.create_kv_cache(input_tokens=tokens)
+        self.assertEqual(probe.num_committed_tokens, 64)
+        self.assertEqual(probe._get_num_reusable_tokens_before_hybrid_pruning(), 64)
+        probe.close()
+
     def test_num_reusable_tokens_before_hybrid_pruning_isolates_recurrent_truncation(
         self,
     ) -> None:

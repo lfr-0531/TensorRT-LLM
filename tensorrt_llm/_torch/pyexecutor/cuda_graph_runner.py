@@ -541,6 +541,15 @@ class CUDAGraphRunner:
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
+        # Reconstructible cache hits need their context forward before normal
+        # decode graphs are eligible, including promoted final-context rows.
+        cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        cache_map = getattr(cache_manager, "kv_cache_map", {})
+        if any(
+                getattr(cache_map.get(request.py_request_id),
+                        "requires_reconstruction", False)
+                for request in batch.all_requests()):
+            can_run_cuda_graph = False
         batch_size = batch.batch_size
         # The sampling tier joins the graph key, so it has to agree across the
         # attention-DP ranks or they would replay different graphs -- the same

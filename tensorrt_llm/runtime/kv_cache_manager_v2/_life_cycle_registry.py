@@ -23,17 +23,23 @@ from ._utils import HalfOpenRange, TypedIndexList, div_up, intersect, typed_enum
 class AttnLifeCycle(NamedTuple):
     window_size: SlidingWindowSize
     num_sink_blocks: int  # div_up(num_sink_tokens, tokens_per_block)
+    reconstructible: bool = False
 
     @staticmethod
     def make(
-        window_size: SlidingWindowSize, num_sink_tokens: int | None, tokens_per_block: int
+        window_size: SlidingWindowSize,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        reconstructible: bool = False,
     ) -> "AttnLifeCycle":
         assert tokens_per_block > 0
         assert window_size is None or window_size > 0
         assert num_sink_tokens is None or num_sink_tokens >= 0
         assert num_sink_tokens in (None, 0) or window_size is not None
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
-        return AttnLifeCycle(window_size, num_sink_blocks)
+        if reconstructible and (window_size is None or num_sink_blocks):
+            raise ValueError("Reconstructible attention requires a finite window without sinks")
+        return AttnLifeCycle(window_size, num_sink_blocks, reconstructible)
 
     def get_stale_range(
         self, history_length: int, tokens_per_block: int
@@ -73,7 +79,9 @@ def make_life_cycle(layer: LayerConfig, tokens_per_block: int) -> LifeCycle:
         return ssm_life_cycle
     else:
         assert isinstance(layer, AttentionLayerConfig)
-        return AttnLifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
+        return AttnLifeCycle.make(
+            layer.window_size, layer.num_sink_tokens, tokens_per_block, layer.reconstructible
+        )
 
 
 class LifeCycleRegistry:
@@ -92,6 +100,10 @@ class LifeCycleRegistry:
                 )
                 self._life_cycle_list.append(details)
                 self._life_cycle_id_dict[details] = LifeCycleId(len(self._life_cycle_list) - 1)
+
+    def is_reconstructible(self, id: LifeCycleId) -> bool:
+        life_cycle = self._life_cycle_list[id]
+        return isinstance(life_cycle, AttnLifeCycle) and life_cycle.reconstructible
 
     def get_life_cycle(self, id: LifeCycleId) -> LifeCycle:
         return self._life_cycle_list[id]

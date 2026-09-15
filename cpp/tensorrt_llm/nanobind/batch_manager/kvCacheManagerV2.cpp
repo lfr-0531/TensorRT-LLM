@@ -1307,9 +1307,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size"), nb::arg("num_sink_blocks"))
+        .def(nb::init<std::optional<int>, int, bool>(), nb::arg("window_size"), nb::arg("num_sink_blocks"),
+            nb::arg("reconstructible") = false)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def_ro("reconstructible", &kv::AttnLifeCycle::reconstructible)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1521,13 +1523,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
+        .def(
+            "__init__",
+            [](kv::AttentionLayerConfig* self, kv::LayerId layerId, std::vector<kv::BufferConfig> buffers,
+                std::optional<int> window, std::optional<int> sinks, bool reconstructible)
+            {
+                kv::AttentionLayerConfig config{layerId, std::move(buffers), window, sinks, reconstructible};
+                // Preserve ordinary construction; the new opt-in policy has
+                // the same eager validation as its Python configuration.
+                if (reconstructible)
+                {
+                    config.validate();
+                }
+                new (self) kv::AttentionLayerConfig(std::move(config));
+            },
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reconstructible") = false)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
+        .def_rw("reconstructible", &kv::AttentionLayerConfig::reconstructible)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -1725,6 +1741,33 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
             nb::arg("is_end") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("requires_reconstruction", &kv::KvCache::requiresReconstruction)
+        .def("get_reconstruction_ranges",
+            [](kv::KvCache const& self)
+            {
+                nb::dict result;
+                for (auto const& [id, range] : self.getReconstructionRanges())
+                {
+                    result[nb::int_(id.value())] = nb::make_tuple(range.first, range.second);
+                }
+                return result;
+            })
+        .def("get_reconstructed_ranges",
+            [](kv::KvCache const& self)
+            {
+                nb::dict result;
+                for (auto const& [id, range] : self.getReconstructedRanges())
+                {
+                    result[nb::int_(id.value())] = nb::make_tuple(range.first, range.second);
+                }
+                return result;
+            })
+        .def(
+            "mark_reconstructed",
+            [](kv::KvCache& self, int id, std::optional<int> begin, std::optional<int> end)
+            { self.markReconstructed(kv::LayerGroupId{id}, begin, end); },
+            nb::arg("layer_group_id"), nb::arg("begin") = std::nullopt, nb::arg("end") = std::nullopt)
+
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)

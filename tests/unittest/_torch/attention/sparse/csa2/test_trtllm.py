@@ -46,7 +46,7 @@ def _reference(q, swa, extra, swa_valid, extra_valid, sink):
     return torch.einsum("qhk,qkd->qhd", probs, kv.float()).to(q.dtype)
 
 
-def _backend(heads, layer_idx=20, layout=None, compute_backend="auto"):
+def _backend(heads, layer_idx=20, layout=None, compute_backend="auto", use_packed=False):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import get_csa2_backend
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
@@ -54,7 +54,12 @@ def _backend(heads, layer_idx=20, layout=None, compute_backend="auto"):
 
     if compute_backend in ("auto", "trtllm") and not is_sm_100f():
         pytest.skip("TRTLLM dynamic sparse MLA requires SM100-family")
-    params = CSA2Params(max_query_tokens=16, layout=layout, compute_backend=compute_backend)
+    params = CSA2Params(
+        max_query_tokens=16,
+        layout=layout,
+        compute_backend=compute_backend,
+        use_packed_sparse_attention=use_packed,
+    )
     assert get_attention_backend("TRTLLM", params) is get_csa2_backend(params)
     attn = create_attention(
         "TRTLLM",
@@ -75,6 +80,26 @@ def _backend(heads, layer_idx=20, layout=None, compute_backend="auto"):
     assert type(attn).forward is TrtllmAttention.forward
     assert "forward_selected" not in type(attn).__dict__
     return attn
+
+
+def _helper_forward(attn, q, metadata, args):
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        CSA2FlashInfer,
+        CSA2FlashMLA,
+    )
+
+    if attn.sparse_params.use_packed_sparse_attention:
+        return attn.forward_packed(q, metadata, args)
+    if not hasattr(attn, "_test_flash_helper"):
+        helper = CSA2FlashMLA if attn.compute_backend == "flash_mla" else CSA2FlashInfer
+        attn._test_flash_helper = helper(attn)
+    compute = (
+        attn._test_flash_helper.forward_context
+        if args.attention_input_type == AttentionInputType.context_only
+        else attn._test_flash_helper.forward_generation
+    )
+    return compute(q, metadata, args)
 
 
 def _inputs(q, swa, extra, swa_valid, extra_valid, sink):
@@ -400,8 +425,9 @@ def test_cold_metadata_rejects_capture():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
+@pytest.mark.parametrize("context", [False, True])
 @torch.inference_mode()
-def test_alternative_backend_standard_forward(implementation, monkeypatch):
+def test_alternative_helper_dispatch(implementation, context, monkeypatch):
     from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
@@ -421,14 +447,23 @@ def test_alternative_backend_standard_forward(implementation, monkeypatch):
     sink = torch.linspace(-2, 2, 8, device="cuda")
     metadata = CSA2TrtllmMetadata.for_query_tile(q, 17)
     args = _inputs(q, swa, main, swa_valid, main_valid, sink)
-    actual = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+    if context:
+        from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+
+        metadata._bind_context_tile([q.shape[0]])
+        args.attention_input_type = AttentionInputType.context_only
+    args.output = torch.empty_like(q).flatten(1)
+    actual = _helper_forward(attn, q.flatten(1), metadata, args).view_as(q)
+    assert actual.data_ptr() == args.output.data_ptr()
     torch.testing.assert_close(
         actual, _decoded_reference(q, args, swa_valid, main_valid, sink), atol=0.03, rtol=0.03
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("option", ["custom_mask", "out_scale", "output_sf"])
+@pytest.mark.parametrize(
+    "option", ["custom_mask", "out_scale", "output_sf", "output_shape", "output_dtype"]
+)
 @torch.inference_mode()
 def test_alternative_backend_rejects_unsupported_options(option):
     from tensorrt_llm._torch.attention.backends.interface import CustomAttentionMask
@@ -443,17 +478,21 @@ def test_alternative_backend_rejects_unsupported_options(option):
         args.attention_mask = CustomAttentionMask.CUSTOM
     elif option == "out_scale":
         args.out_scale = torch.ones(1, device="cuda")
+    elif option == "output_shape":
+        args.output = torch.empty(2, q.shape[1] * 512, device=q.device, dtype=q.dtype)
+    elif option == "output_dtype":
+        args.output = torch.empty_like(q, dtype=torch.float32).flatten(1)
     else:
         args.output = torch.empty_like(q).flatten(1)
         args.output_sf = torch.empty(1, device="cuda", dtype=torch.uint8)
     metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
-    with pytest.raises(RuntimeError, match="No TRT-LLM attention FMHA library supports"):
-        attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+    with pytest.raises(ValueError, match="(do not support.*mask/output format|output must match)"):
+        _helper_forward(attn, q.flatten(1), metadata, args)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_alternative_backend_cache_hit_rejects_output_scale():
+def test_alternative_helper_revalidates_output_scale():
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     attn = _backend(8, compute_backend="flashinfer")
@@ -462,8 +501,260 @@ def test_alternative_backend_cache_hit_rejects_output_scale():
     valid = torch.ones(1, 1, device="cuda", dtype=torch.bool)
     args = _inputs(q, swa, None, valid, None, torch.zeros(8, device="cuda"))
     metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
-    attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+    _helper_forward(attn, q.flatten(1), metadata, args)
     torch.cuda.synchronize()
     args.out_scale = torch.ones(1, device="cuda")
-    with pytest.raises(RuntimeError, match="do not support.*mask/output format"):
+    with pytest.raises(ValueError, match="do not support.*mask/output format"):
+        _helper_forward(attn, q.flatten(1), metadata, args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("extra_width", [0, 17, 512])
+@pytest.mark.parametrize("prefix", [0, 1024])
+@pytest.mark.parametrize("tile_start", [0, 2])
+@torch.inference_mode()
+def test_native_context_preserves_real_query_groups(extra_width, prefix, tile_start, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    torch.manual_seed(459)
+    heads, count = 64, 5
+    attn = _backend(heads)
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    swa_valid[0, 1::2] = False
+    swa_valid[2] = False
+    extra = (
+        torch.randn(count, extra_width, 512, device="cuda", dtype=torch.bfloat16)
+        if extra_width
+        else None
+    )
+    extra_valid = (
+        torch.ones(count, extra_width, device="cuda", dtype=torch.bool) if extra_width else None
+    )
+    if extra_valid is not None:
+        extra_valid[1, ::3] = False
+        extra_valid[2] = False
+    sink = torch.randn(heads, device="cuda")
+    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=count + tile_start)
+    source._num_contexts = 2
+    source._num_ctx_tokens = source._num_tokens = count + tile_start
+    source.csa2_num_context_requests = 2
+    source.csa2_request_query_ranges = ((0, 3 + tile_start), (3 + tile_start, count + tile_start))
+    source.csa2_request_start_positions = (prefix, prefix * 2)
+    source.csa2_request_lengths = (3 + tile_start, 2)
+    metadata = source.get_query_tile_metadata(q, extra_width, query_start=tile_start)
+    assert metadata.num_contexts == 2
+    assert metadata.num_ctx_tokens == count
+    assert metadata.num_generations == 0
+    torch.testing.assert_close(
+        metadata.cu_q_seqlens.cpu(), torch.tensor([0, 3, 5], dtype=torch.int32)
+    )
+    # Native context's causal mask sees a virtual compacted K domain. Every
+    # physical selected row was already filtered by source logical causality.
+    topk = metadata.num_sparse_topk
+    torch.testing.assert_close(
+        metadata.kv_lens_runtime.cpu(), torch.tensor([topk + 2, topk + 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.cu_kv_seqlens.cpu(), torch.tensor([0, topk + 2, 2 * topk + 3], dtype=torch.int32)
+    )
+    calls = []
+    original = FallbackFmha.forward
+
+    def record(provider, query, key, value, meta, forward_args):
+        calls.append((meta.num_contexts, meta.num_ctx_tokens, forward_args.attention_input_type))
+        assert forward_args.latent_cache is None
+        return original(provider, query, key, value, meta, forward_args)
+
+    monkeypatch.setattr(FallbackFmha, "forward", record)
+    args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    args.attention_input_type = AttentionInputType.context_only
+    output = attn.forward(q.flatten(1), None, None, metadata, forward_args=args).view_as(q)
+    torch.cuda.synchronize()
+    assert calls == [(2, count, AttentionInputType.context_only)]
+    torch.testing.assert_close(
+        output, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
+    )
+
+    monkeypatch.setattr(FallbackFmha, "forward", original)
+    generation = CSA2TrtllmMetadata.for_query_tile(q, extra_width)
+    generation_args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    reference_generation = attn.forward(
+        q.flatten(1), None, None, generation, forward_args=generation_args
+    ).view_as(q)
+    torch.testing.assert_close(output, reference_generation, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("extra_width", [0, 17])
+@torch.inference_mode()
+def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    torch.manual_seed(460)
+    heads, count = 32, 3
+    attn = _backend(heads, use_packed=True)
+    assert not any(isinstance(provider, FallbackFmha) for provider in attn._fmha_manager.fmha_libs)
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    swa_valid[0, 1::2] = False
+    swa_valid[1] = False
+    extra = (
+        torch.randn(count, extra_width, 512, device="cuda", dtype=torch.bfloat16)
+        if extra_width
+        else None
+    )
+    extra_valid = (
+        torch.ones(count, extra_width, device="cuda", dtype=torch.bool) if extra_width else None
+    )
+    if extra_valid is not None:
+        extra_valid[1] = False
+    sink = torch.randn(heads, device="cuda")
+    args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    if extra is not None:
+        packed = args.sparse_backend_args.main_pool
+        records = torch.full((packed.shape[0], 356), 73, dtype=torch.uint8, device="cuda")
+        records[:, :288].copy_(packed)
+        args.sparse_backend_args.main_pool = records[:, :288]
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, extra_width)
+    monkeypatch.setattr(
+        metadata, "stage_selected", lambda *a: pytest.fail("Packed FMHA staged BF16 rows")
+    )
+    output = _helper_forward(attn, q.flatten(1), metadata, args).view_as(q)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
+    )
+    if extra is not None:
+        assert bool((records[:, 288:] == 73).all())
+    # Reusing the selected library must revalidate unsupported output options.
+    args.out_scale = torch.ones(1, device="cuda")
+    with pytest.raises(
+        ValueError, match="(Packed CSA2 does not support|do not support.*mask/output format)"
+    ):
+        _helper_forward(attn, q.flatten(1), metadata, args)
+
+    args.out_scale = None
+    args.sparse_backend_args.output_position_ids = torch.arange(
+        count, device="cuda", dtype=torch.int32
+    )
+    with pytest.raises(
+        ValueError, match="(Packed CSA2 does not support|do not support.*mask/output format)"
+    ):
+        _helper_forward(attn, q.flatten(1), metadata, args)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "implementation,packed", [("trtllm", False), ("flashinfer", False), ("trtllm", True)]
+)
+def test_csa2_quant_update_rebuilds_local_provider_policy(implementation, packed):
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+
+    attn = _backend(32, compute_backend=implementation, use_packed=packed)
+    native = implementation == "trtllm" and not packed
+    first = attn._fmha_manager
+    assert bool(first.fmha_libs) == native
+    assert all(type(provider) is FallbackFmha for provider in first.fmha_libs)
+    attn.update_quant_config(attn.quant_config)
+    assert attn._fmha_manager is not first
+    assert bool(attn._fmha_manager.fmha_libs) == native
+    assert all(type(provider) is FallbackFmha for provider in attn._fmha_manager.fmha_libs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_native_backend_rejects_disabled_fallback(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    with pytest.raises(ValueError, match="requires the FallbackFmha"):
+        _backend(32, compute_backend="trtllm")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_context_graph_uses_fixed_generation_frame():
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    torch.manual_seed(461)
+    heads, count, extra_width = 64, 5, 17
+    attn = _backend(heads)
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    extra = torch.randn(count, extra_width, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    extra_valid = torch.ones(count, extra_width, device="cuda", dtype=torch.bool)
+    sink = torch.randn(heads, device="cuda")
+    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=count)
+    source._num_contexts = 2
+    source._num_ctx_tokens = source._num_tokens = count
+    source.csa2_num_context_requests = 2
+    source.csa2_request_query_ranges = ((0, 3), (3, 5))
+    source.csa2_request_start_positions = (1024, 2048)
+    source.csa2_request_lengths = (3, 2)
+    source.is_cuda_graph = True
+    metadata = source.get_query_tile_metadata(q, extra_width, query_start=0)
+    assert metadata.num_contexts == 0
+    assert metadata.num_generations == count
+    args = _inputs(q, swa, extra, swa_valid, extra_valid, sink)
+    args.attention_input_type = (
+        AttentionInputType.context_only
+        if metadata.num_contexts
+        else AttentionInputType.generation_only
+    )
+    for _ in range(3):
+        attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
+    pointers = (
+        metadata.swa_pool.data_ptr(),
+        metadata.extra_pool.data_ptr(),
+        metadata.workspace.data_ptr(),
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = source.get_query_tile_metadata(q, extra_width, query_start=0)
+        assert captured is metadata
+        output = attn.forward(q.flatten(1), None, None, captured, forward_args=args).view_as(q)
+    swa_ids = torch.arange(count * 128, device="cuda").reshape(count, 128)
+    main_ids = torch.arange(count * extra_width, device="cuda").reshape(count, extra_width)
+    for active in (1, 0, 17):
+        q.neg_()
+        swa_valid.fill_(True)
+        swa_valid[0, 1::2] = False
+        swa_valid[1] = False
+        extra_valid.copy_(torch.arange(extra_width, device="cuda")[None, :] < active)
+        extra_valid[1] = False
+        args.sparse_backend_args.swa_indices.copy_(torch.where(swa_valid, swa_ids, -1))
+        args.sparse_backend_args.topk_indices.copy_(torch.where(extra_valid, main_ids, -1))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output, _decoded_reference(q, args, swa_valid, extra_valid, sink), atol=0.03, rtol=0.03
+        )
+        assert pointers == (
+            metadata.swa_pool.data_ptr(),
+            metadata.extra_pool.data_ptr(),
+            metadata.workspace.data_ptr(),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("implementation,packed", [("flashinfer", False), ("trtllm", True)])
+@torch.inference_mode()
+def test_direct_compute_rejects_native_forward_misuse(implementation, packed):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    attn = _backend(32, compute_backend=implementation, use_packed=packed)
+    q = torch.zeros(1, 32, 512, device="cuda", dtype=torch.bfloat16)
+    values = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+    valid = torch.ones(1, 1, device="cuda", dtype=torch.bool)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0)
+    args = _inputs(q, values, None, valid, None, torch.zeros(32, device="cuda"))
+    with pytest.raises(ValueError, match="explicit module helper"):
         attn.forward(q.flatten(1), None, None, metadata, forward_args=args)

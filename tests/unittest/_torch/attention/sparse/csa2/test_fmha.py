@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.csa2 import run_flash_mla
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashMLA
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -24,7 +24,7 @@ def test_flash_mla_combined_pool_and_sink(heads):
     scores.masked_fill_(~valid[:, None, :], -torch.inf)
     weights = torch.cat((scores, sink[None, :, None].expand(3, -1, -1)), -1).softmax(-1)
     expected = torch.einsum("qhk,qkd->qhd", weights[..., :-1], kv.float()).bfloat16()
-    actual = run_flash_mla(q, kv, valid, sink, 512**-0.5)
+    actual = CSA2FlashMLA.run(q, kv, valid, sink, 512**-0.5)
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
@@ -35,14 +35,14 @@ def test_flash_mla_cuda_graph_changes_selection():
     valid = torch.ones(2, 128, device="cuda", dtype=torch.bool)
     sink = torch.zeros(64, device="cuda")
     for _ in range(3):
-        run_flash_mla(q, kv, valid, sink, 512**-0.5)
+        CSA2FlashMLA.run(q, kv, valid, sink, 512**-0.5)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = run_flash_mla(q, kv, valid, sink, 512**-0.5)
+        actual = CSA2FlashMLA.run(q, kv, valid, sink, 512**-0.5)
     for end in (128, 3, 64):
         valid.zero_()
         valid[:, :end] = True
         kv.mul_(-1)
         graph.replay()
-        expected = run_flash_mla(q, kv, valid, sink, 512**-0.5)
+        expected = CSA2FlashMLA.run(q, kv, valid, sink, 512**-0.5)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -154,10 +154,27 @@ class CSA2Params(SparseParams):
     max_query_tokens: int = 16
     layout: CSA2Layout | None = None
     compute_backend: str = "auto"
+    skip_indexer_for_short_seqs: bool = True
+    use_cute_dsl_topk: bool = False
+    enable_heuristic_topk: bool = False
+    use_self_sampling_topk: bool = True
+    use_cute_dsl_paged_mqa_logits: bool = False
+    use_gvr_emission: bool = False
+    fuse_index_q: bool = False
+    use_packed_sparse_attention: bool = False
+    fuse_packed_output_rope: bool = False
 
     def __post_init__(self) -> None:
         if self.max_query_tokens <= 0:
             raise ValueError("CSA2 query workspace capacity must be positive")
+        if self.fuse_packed_output_rope and not self.use_packed_sparse_attention:
+            raise ValueError("Packed output RoPE fusion requires packed sparse attention")
+        if self.use_gvr_emission and (
+            not self.enable_heuristic_topk
+            or self.use_self_sampling_topk
+            or not self.use_cute_dsl_paged_mqa_logits
+        ):
+            raise ValueError("CSA2 emission requires temporal GVR and CuTe DSL paged MQA")
 
 
 def select_csa2_backend(sm_version: int) -> str:
@@ -185,6 +202,8 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     main_pool: torch.Tensor | None = None
     state: CSA2ForwardState | None = None
     query_start: int = 0
+    output_position_ids: torch.Tensor | None = None
+    output_rotary_cos_sin: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -194,9 +213,12 @@ class CSA2ForwardState:
     metadata: CSA2TrtllmMetadata
     swa_kv: torch.Tensor
     index_q: torch.Tensor | None = None
+    index_q_scale: torch.Tensor | None = None
     index_weights: torch.Tensor | None = None
     main_kv: torch.Tensor | None = None
     index_k: torch.Tensor | None = None
+    output_position_ids: torch.Tensor | None = None
+    output_rotary_cos_sin: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

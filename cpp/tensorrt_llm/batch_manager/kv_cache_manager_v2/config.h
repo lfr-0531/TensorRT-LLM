@@ -149,6 +149,9 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
+    // Request-private state that must be rebuilt after persistent prefix reuse.
+    bool reconstructible = false;
+
     std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
@@ -157,6 +160,11 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        if (reconstructible
+            && (!slidingWindowSize.has_value() || *slidingWindowSize <= 0 || numSinkTokens.value_or(0) != 0))
+        {
+            throw std::invalid_argument("Reconstructible attention requires a finite positive window and no sinks");
+        }
     }
 };
 

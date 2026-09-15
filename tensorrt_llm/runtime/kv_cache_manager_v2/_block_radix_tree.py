@@ -736,7 +736,21 @@ class BlockRadixTree:
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
-        attn_life_cycles = list(self._life_cycles.attention_life_cycles())
+        attn_life_cycles = [
+            (lc_id, lc)
+            for lc_id, lc in self._life_cycles.attention_life_cycles()
+            if not lc.reconstructible
+        ]
+
+        if (
+            not attn_life_cycles
+            and not self._life_cycles.has_ssm
+            and any(lc.reconstructible for _, lc in self._life_cycles.attention_life_cycles())
+        ):
+            # Token hashes without any required cached state do not establish a cache hit.
+            # Do not alter SSM-only attention diagnostics when their snapshot
+            # constraint is deliberately disabled through ssm_lc_id=None.
+            return []
 
         # Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
         # shorten the match to the coverage of a required page. Every retry strictly

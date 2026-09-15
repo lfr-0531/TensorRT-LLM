@@ -7,10 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
-from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Params
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-from tensorrt_llm._torch.modules.top_k import TopK
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 
 
 # Independent mathematical references live only in this test module.
@@ -99,6 +99,9 @@ def _indexer(heads=32, topk=32):
 
 
 def _prepared(indexer, q, keys, weights, lengths, positions, hook=None):
+    if not q.is_cuda:
+        indexer.top_k.prefill_implementation = TopKImplementation.TORCH
+        indexer.top_k.decode_implementation = TopKImplementation.TORCH
     count = q.shape[0]
     width = keys.shape[-2]
     starts = torch.arange(count, dtype=torch.int32, device=q.device)
@@ -175,7 +178,23 @@ def test_prepared_packed_selection(per_query, heads):
 
 
 def test_prepared_hierarchy_and_graph():
-    indexer = _indexer()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    indexer = CSA2Indexer(
+        CSA2Layout(
+            (1,),
+            (0,),
+            (0,),
+            candidate_source_layer_id=0,
+            candidate_topk_blocks=3,
+            candidate_block_size=32,
+            index_topk=32,
+        ),
+        0,
+        32,
+        128,
+    )
+    indexer._configure_candidate_topk(257)
     torch.manual_seed(59)
     q = pack_rows(torch.randn(3, 32, 128, device="cuda"), "index")
     keys = pack_rows(torch.randn(3, 257, 128, device="cuda"), "index")
@@ -194,7 +213,7 @@ def test_prepared_hierarchy_and_graph():
         )
         selected = torch.empty((3, 3), dtype=torch.int32, device="cuda")
         indexer.select_prepared_scores(
-            blocks, selected, torch.zeros_like(lengths), torch.full_like(lengths, 9)
+            blocks, selected, torch.zeros_like(lengths), torch.full_like(lengths, 9), candidate=True
         )
         values = selected.long()[:, :, None] * 32 + torch.arange(32, device="cuda")
         valid = (values < lengths[:, None, None]) & (values < 257)
@@ -326,6 +345,8 @@ def test_csa2_specializes_shared_indexer():
         assert list(indexer.parameters()) == []
         assert isinstance(indexer.top_k, TopK)
     indexer = CSA2Indexer(layout, 0, 8, 128)
+    indexer.top_k.prefill_implementation = TopKImplementation.TORCH
+    indexer._configure_candidate_topk(9)
     scores = torch.tensor(
         [
             [99.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.1],
@@ -341,3 +362,135 @@ def test_csa2_specializes_shared_indexer():
     torch.testing.assert_close(results[0].sort(-1).values, expected.sort(-1).values)
     with pytest.raises(ValueError, match="full-query shape"):
         indexer._publish_candidates(scores[1:], visible[1:], {}, 1, 2)
+
+
+@pytest.mark.parametrize("has_hook", [False, True])
+def test_short_sequence_skip_preserves_candidate_scores(monkeypatch, has_hook):
+    layout = CSA2Layout((1,), (0,), (0,), index_topk=8)
+    indexer = CSA2Indexer(layout, 0, 8, 128)
+    indexer.top_k.prefill_implementation = TopKImplementation.TORCH
+    indexer.top_k.decode_implementation = TopKImplementation.TORCH
+    q = pack_rows(torch.randn(2, 8, 128), "index")
+    k = pack_rows(torch.randn(4, 128), "index")
+    weights = torch.rand(2, 8)
+    positions = torch.tensor([[0, -1, 2, 3], [0, 1, 2, 3]])
+    visible = torch.tensor([3, 0], dtype=torch.int32)
+    calls = []
+    native = indexer._call_mqa_logits
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "_call_mqa_logits", record)
+    hook_scores = []
+    output = torch.empty(2, 8, dtype=torch.int32)
+    indexer.forward_prepared(
+        q[..., :64].contiguous().view(torch.int8),
+        k[:, :64].contiguous().view(torch.int8),
+        k[:, 64:].contiguous(),
+        weights,
+        torch.zeros(2, dtype=torch.int32),
+        torch.full((2,), 4, dtype=torch.int32),
+        output,
+        q[..., 64:].contiguous(),
+        logical_positions=positions,
+        visible_lengths=visible,
+        score_hook=hook_scores.append if has_hook else None,
+    )
+    assert len(calls) == int(has_hook)
+    assert len(hook_scores) == int(has_hook)
+    torch.testing.assert_close(
+        output,
+        torch.tensor(
+            [[0, 2, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32
+        ),
+    )
+
+
+@pytest.mark.parametrize("implementation", ["dsl", "self_sampling"])
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_topk_opt_in_native_and_graph(implementation, is_prefill):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("TopK optimizations require SM100")
+    torch.manual_seed(6301)
+    options = CSA2Params(
+        use_cute_dsl_topk=implementation == "dsl",
+        enable_heuristic_topk=implementation == "self_sampling",
+    )
+    indexer = CSA2Indexer(CSA2Layout((1,), (0,), (0,), index_topk=512), 0, 64, 128, options)
+    scores = torch.rand(2, 4096, device="cuda")
+    starts = torch.zeros(2, dtype=torch.int32, device="cuda")
+    ends = torch.tensor([4096, 2048], dtype=torch.int32, device="cuda")
+    output = torch.empty(2, 512, dtype=torch.int32, device="cuda")
+    aux_indices = torch.empty(2, 10, 512, dtype=torch.int32, device="cuda")
+    aux_logits = torch.empty_like(aux_indices, dtype=torch.float32)
+    selector = indexer.top_k
+    expected_impl = (
+        TopKImplementation.CUTE_DSL_RADIX
+        if implementation == "dsl"
+        else TopKImplementation.CUTE_DSL_GVR
+    )
+    assert (
+        selector.prefill_implementation if is_prefill else selector.decode_implementation
+    ) == expected_impl
+
+    def run():
+        return indexer.select_prepared_scores(
+            scores,
+            output,
+            starts,
+            ends,
+            is_prefill=is_prefill,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lengths in ([4096, 2048], [512, 1024]):
+        ends.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+        scores.copy_(torch.rand_like(scores))
+        graph.replay()
+        for row, length in enumerate(lengths):
+            expected = scores[row, :length].topk(512).indices
+            # These deterministic, continuous scores have no boundary ties.
+            torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
+
+
+def test_self_sampling_mqa_selection_and_graph():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Self-sampling GVR requires SM100")
+    torch.manual_seed(7303)
+    indexer = CSA2Indexer(
+        CSA2Layout((1,), (0,), (0,), index_topk=512),
+        0,
+        64,
+        128,
+        options=CSA2Params(enable_heuristic_topk=True),
+    )
+    q = pack_rows(torch.randn(2, 64, 128, device="cuda"), "index")
+    k = pack_rows(torch.randn(2, 4096, 128, device="cuda"), "index")
+    weights = torch.rand(2, 64, device="cuda") / 64
+    positions = torch.arange(4096, device="cuda").expand(2, -1).clone()
+    positions[:, 7::11] = -1
+    lengths = torch.tensor([4096, 3072], dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        _prepared(indexer, q, k, weights, lengths, positions)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _prepared(indexer, q, k, weights, lengths, positions)
+    for visible in ([4096, 3072], [0, 256], [2048, 4096]):
+        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="cuda"))
+        weights.mul_(0.99)
+        graph.replay()
+        scores = _reference_index_scores(
+            unpack_rows(q, 128, "index", torch.float32),
+            unpack_rows(k, 128, "index", torch.float32),
+            weights,
+        )
+        expected = _reference_select_topk_positions(scores, positions, lengths, 512)
+        torch.testing.assert_close(actual, expected)

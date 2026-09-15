@@ -9,6 +9,7 @@ uses the tensor-wide scaling factor of the generic NVFP4 weight quantizer.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Literal
 
 import torch
@@ -98,22 +99,69 @@ def unpack_rows(
 def gather_rows(
     pool: torch.Tensor, slots: torch.Tensor, dim: int, cache_format: CacheFormat
 ) -> torch.Tensor:
-    # Every pool includes at least one allocated padding row. Mask invalid
-    # values after gathering so uninitialized padding never enters a matmul.
-    rows = pool[slots.clamp_min(0).long()]
+    """Gather/dequantize rows; invalid physical slots yield zero BF16 rows."""
+    if pool.ndim != 2 or pool.dtype != torch.uint8 or pool.shape[1] != row_bytes(dim, cache_format):
+        raise ValueError("CSA2 gathered cache has the wrong row shape or dtype")
+    if slots.dtype not in (torch.int32, torch.int64) or slots.device != pool.device:
+        raise ValueError("CSA2 gather slots must be integer tensors on the pool device")
+    if (
+        pool.is_cuda
+        and pool.stride(1) == 1
+        and slots.ndim in (1, 2)
+        and dim > 0
+        and _fused_gather_supported(pool.device.index)
+    ):
+        from .kernel import gather_dequant_rows
+
+        return gather_dequant_rows(pool, slots, dim, cache_format)
+    valid = (slots >= 0) & (slots < pool.shape[0])
+    if pool.shape[0] == 0:
+        return torch.zeros((*slots.shape, dim), dtype=torch.bfloat16, device=pool.device)
+    rows = pool[torch.where(valid, slots, 0).long()]
     values = unpack_rows(rows, dim, cache_format)
-    return torch.where((slots >= 0).unsqueeze(-1), values, 0)
+    return torch.where(valid.unsqueeze(-1), values, 0)
+
+
+@lru_cache(maxsize=None)
+def _fused_gather_supported(device_index: int) -> bool:
+    # Retain the reference route on other architectures until validated there.
+    return torch.cuda.get_device_capability(device_index)[0] == 10
+
+
+@lru_cache(maxsize=None)
+def _fused_store_supported(device_index: int) -> bool:
+    major, _ = torch.cuda.get_device_capability(device_index)
+    # Exact-byte parity (including nonfinite values) is validated on SM100.
+    return major == 10
 
 
 def store_rows(
     pool: torch.Tensor, slots: torch.Tensor, values: torch.Tensor, cache_format: CacheFormat
 ) -> None:
     """Publish quantized rows into a packed, possibly strided cache view."""
-    packed = pack_rows(values, cache_format)
-    if slots.numel() != packed.shape[0] or pool.shape[1] != packed.shape[1]:
+    if values.ndim != 2 or slots.ndim != 1 or pool.ndim != 2:
+        raise ValueError("CSA2 publication requires row matrices and one-dimensional slots")
+    if slots.numel() != values.shape[0] or pool.shape[1] != row_bytes(
+        values.shape[1], cache_format
+    ):
         raise ValueError("CSA2 publication requires one slot per packed row")
+    if (
+        values.is_cuda
+        and values.dtype == torch.bfloat16
+        and pool.device == values.device
+        and slots.device == values.device
+        and pool.dtype == torch.uint8
+        and pool.stride(1) == 1
+        and values.stride(1) == 1
+        and _fused_store_supported(values.device.index)
+    ):
+        from .kernel import quantize_scatter_rows
+
+        quantize_scatter_rows(pool, slots, values, cache_format)
+        return
+    packed = pack_rows(values, cache_format)
     if slots.is_cuda:
-        from .kernels import scatter_packed_rows
+        from .kernel import scatter_packed_rows
 
         scatter_packed_rows(pool, slots, packed)
     else:

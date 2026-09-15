@@ -828,6 +828,18 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
+    bool hasRequiredAttention = false;
+    for (auto const& entry : attnLcs)
+    {
+        hasRequiredAttention |= !entry.second->reconstructible;
+    }
+    // The attention-only diagnostic deliberately passes no SSM id even
+    // for SSM models. Preserve that diagnostic; reject only truly transient
+    // attention-only trees, which have no persistent page authority.
+    if (!mLifeCycles.hasSSM() && !attnLcs.empty() && !hasRequiredAttention)
+    {
+        return {};
+    }
 
     // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
     // shorten the match to the coverage of a required page. Every retry strictly
@@ -869,6 +881,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
+            if (attn->reconstructible)
+            {
+                continue;
+            }
             auto const staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();

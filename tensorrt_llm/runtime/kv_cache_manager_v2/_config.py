@@ -112,12 +112,22 @@ class AttentionLayerConfig:
     # Note that we use None to represent "no sliding window". Sink tokens are excluded.
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    # Request-private history rebuilt after a prefix hit, never stored in the radix tree.
+    reconstructible: bool = False
 
     @property
     def window_size(self) -> int | None:
         return self.sliding_window_size
 
     def __post_init__(self) -> None:
+        if self.reconstructible and (
+            self.sliding_window_size is None
+            or self.sliding_window_size <= 0
+            or self.num_sink_tokens not in (None, 0)
+        ):
+            raise ValueError(
+                "Reconstructible attention requires a finite positive window without sinks"
+            )
         assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
             "duplicate buffer role"
         )
@@ -285,6 +295,11 @@ class KVCacheManagerConfig:
             for layer in self.layers
             for buffer in layer.buffers
         )
+        if self.layers and all(
+            isinstance(layer, AttentionLayerConfig) and layer.reconstructible
+            for layer in self.layers
+        ):
+            raise ValueError("Reconstructible caching requires at least one persistent lifecycle")
         if any(layer.type == LayerType.SSM for layer in self.layers):
             assert self.commit_min_snapshot, (
                 "commit_min_snapshot must be True when SSM layers are present"
