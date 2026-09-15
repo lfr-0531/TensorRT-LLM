@@ -12,6 +12,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -74,6 +75,7 @@ class DeepseekV41Attention(nn.Module):
         sparse_params: CSA2Params | None = None,
         projection_quantization: Literal["bf16", "mxfp8"] = "bf16",
         aux_stream: torch.cuda.Stream | None = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ) -> None:
         super().__init__()
         if num_heads % num_groups or head_dim <= rope_head_dim:
@@ -190,6 +192,7 @@ class DeepseekV41Attention(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
+            allreduce_strategy=allreduce_strategy,
         )
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope, head_dim=rope_head_dim, is_neox=pos_embd_params.is_neox
@@ -229,6 +232,7 @@ class DeepseekV41Attention(nn.Module):
         sparse_params: CSA2Params | None = None,
         projection_quantization: Literal["bf16", "mxfp8"] = "bf16",
         aux_stream: torch.cuda.Stream | None = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ) -> DeepseekV41Attention:
         """Construct an attention component from the published text configuration.
 
@@ -278,6 +282,7 @@ class DeepseekV41Attention(nn.Module):
             sparse_params=sparse_params,
             projection_quantization=projection_quantization,
             aux_stream=aux_stream,
+            allreduce_strategy=allreduce_strategy,
         )
 
     def load_hf_weights(self, weights: dict[str, torch.Tensor], prefix: str = "") -> None:

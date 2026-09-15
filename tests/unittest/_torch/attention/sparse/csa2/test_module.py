@@ -236,6 +236,7 @@ def _native_model(
     sparse_options=None,
     mapping=None,
     num_groups=2,
+    allreduce_strategy=None,
 ):
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
@@ -269,6 +270,9 @@ def _native_model(
             sparse_params=CSA2Params(layout=layout, **options),
             projection_quantization=projection_quantization,
             aux_stream=aux_stream,
+            **(
+                {"allreduce_strategy": allreduce_strategy} if allreduce_strategy is not None else {}
+            ),
         )
     aliases = {
         "q_norm_weight": "q_norm.weight",
@@ -1140,3 +1144,26 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         torch.testing.assert_close(captured, expected, atol=0.03, rtol=0.03)
         torch.testing.assert_close(manager.get_main_buffer(0)[slots], old_main, atol=0, rtol=0)
         torch.testing.assert_close(manager.get_index_buffer(0)[slots], old_index, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("strategy", [None, "NCCL"], ids=["default-auto", "explicit-nccl"])
+def test_tp_output_projection_uses_requested_allreduce_strategy(strategy):
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+    from tensorrt_llm.mapping import Mapping
+
+    if mpi_world_size() != 2:
+        pytest.skip("Requires two MPI ranks")
+    torch.cuda.set_device(mpi_rank())
+    requested = None if strategy is None else AllReduceStrategy.NCCL
+    model, _ = _native_model(
+        fused=False,
+        projection_quantization="bf16",
+        mapping=Mapping(world_size=2, rank=mpi_rank(), tp_size=2),
+        allreduce_strategy=requested,
+    )
+    assert model.o_b_proj.all_reduce is not None
+    assert model.o_b_proj.all_reduce.strategy == (
+        AllReduceStrategy.AUTO if requested is None else requested
+    )
+    assert not model.o_b_proj.use_fused_gemm_allreduce
