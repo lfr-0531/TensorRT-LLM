@@ -165,3 +165,39 @@ def test_partial_page_copy_on_write_and_state(manager):
     left.suspend()
     assert manager._resume_and_restore(31, left)
     assert manager.get_cache_indices(31, 1, CSA2CacheRole.GLOBAL)[1] >= 0
+
+
+@pytest.mark.parametrize("enable_scratch", [False, True])
+def test_cache_manager_preserves_disabled_or_enabled_scratch_config(enable_scratch):
+    if not torch.cuda.is_available():
+        pytest.skip("CSA2 runtime cache storage requires CUDA")
+    manager = CSA2CacheManager(
+        KvCacheConfig(
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=enable_scratch,
+        ),
+        CacheType.SELFKONLY,
+        num_layers=2,
+        tokens_per_block=128,
+        max_seq_len=512,
+        max_batch_size=1,
+        max_num_tokens=256,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        vocab_size=8192,
+        layout=CSA2Layout((0, 2), (1,), (1,)),
+    )
+    try:
+        # Exercise the real runtime config conversion and allocator, including
+        # the native optional-property setter used by full model construction.
+        assert manager.impl.enable_swa_scratch_reuse == enable_scratch
+        cache = allocate(manager, 91, [], 129)
+        assert cache.enable_swa_scratch_reuse == enable_scratch
+        for role in (CSA2CacheRole.SWA, CSA2CacheRole.GLOBAL, CSA2CacheRole.COMPRESSOR_KV):
+            assert manager.get_cache_indices(91, 1, role)
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()

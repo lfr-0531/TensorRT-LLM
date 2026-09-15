@@ -501,7 +501,10 @@ class CSA2CacheManager(KVCacheManagerV2):
             scratch.max_rewind_len = max(scratch.max_rewind_len, self.max_draft_len)
         config = copy(config)
         config.layers = layers
-        config.swa_scratch_reuse = scratch
+        # The native optional property's setter rejects None. The copied
+        # configuration already preserves its disabled/default state.
+        if scratch is not None:
+            config.swa_scratch_reuse = scratch
         return config
 
     def get_buffers(self, layer_idx: int, role: CSA2CacheRole = CSA2CacheRole.SWA):
